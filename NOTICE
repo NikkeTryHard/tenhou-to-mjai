@@ -1,0 +1,40 @@
+NOTICE
+
+This project includes scripts and datasets related to the conversion of Tenhou
+mahjong game logs into the mjai format for use with Mortal AI and related tools.
+
+-------------------------------------------------------------------------------
+Project Components and Licenses
+-------------------------------------------------------------------------------
+- Project code: Licensed under the Apache License 2.0
+- Dataset (converted logs): Licensed under Creative Commons Attribution 4.0
+  International (CC BY 4.0)
+
+-------------------------------------------------------------------------------
+Third-Party Tools Used
+-------------------------------------------------------------------------------
+- houou-logs (MIT License)
+  https://github.com/Equim-chan/houou-logs
+
+- mjlog2json (Apache License 2.0 / MIT License)
+  https://github.com/Equim-chan/mjlog2json
+
+- mjai-reviewer (Apache License 2.0)
+  https://github.com/mjai-community/mjai-reviewer
+
+- Mortal (AGPL-3.0 License)
+  https://github.com/mjai-community/mortal
+
+These tools were used for data conversion, log preprocessing, and AI model
+integration. Each retains its original license and attribution requirements.
+
+-------------------------------------------------------------------------------
+Attribution and Disclaimer
+-------------------------------------------------------------------------------
+This repository and dataset are not affiliated with or endorsed by Tenhou.net.
+Original Tenhou logs and gameplay data are the property of their respective
+owners. Redistribution or public release of derived logs should comply with
+Tenhou’s terms of service.
+
+© 2025 Nikketryhard. All rights reserved under their respective
+licenses.
