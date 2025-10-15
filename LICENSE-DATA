@@ -1,0 +1,29 @@
+Creative Commons Attribution 4.0 International (CC BY 4.0)
+https://creativecommons.org/licenses/by/4.0/
+
+You are free to:
+- Share — copy and redistribute the material in any medium or format
+- Adapt — remix, transform, and build upon the material for any purpose, even commercially
+
+Under the following terms:
+- Attribution — You must give appropriate credit, provide a link to the license, and indicate if changes were made.
+  You may do so in any reasonable manner, but not in any way that suggests the licensor endorses you or your use.
+- No additional restrictions — You may not apply legal terms or technological measures that legally restrict others from doing anything the license permits.
+
+-------------------------------------------------------------------------------
+Attribution and Source Notice
+-------------------------------------------------------------------------------
+This dataset was prepared using converted Tenhou game logs for research and AI
+training purposes.
+
+Conversion and preprocessing utilized the following open-source tools:
+- houou-logs (MIT License)
+- mjlog2json (Apache 2.0 / MIT)
+- mjai-reviewer (Apache 2.0)
+
+This dataset is not affiliated with or endorsed by Tenhou.net.
+Original Tenhou logs and gameplay data are property of their respective owners.
+Ensure compliance with Tenhou’s terms of service before redistributing or using
+derived data.
+
+© 2025 [Your Name or Organization]. Licensed under CC BY 4.0.
