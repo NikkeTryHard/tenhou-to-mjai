@@ -19,7 +19,7 @@ It also includes preprocessed yearly datasets and Tenhou database files for AI r
 
 ## Dataset Overview
 
-Each release contains data for **2015–2024** in two parts per year:
+Each release contains data for **2009–2025** in two parts per year:
 
 | File Type | Example    | Description                                                         |
 | --------- | ---------- | ------------------------------------------------------------------- |
@@ -57,7 +57,7 @@ Each release also includes a corresponding `YYYY.db` file containing Tenhou game
 | --------- | ------------- | ------------ | ----------------------------------- |
 | 2024      | ~1.2 GB       | ~1.54 GB     | Example year                        |
 | 2021      | ~819 MB       | varies       | Example year                        |
-| 2015–2024 | varies        | varies       | Each year has both `.zip` and `.db` |
+| 2009–2025 | varies        | varies       | Each year has both `.zip` and `.db` |
 
 > [!IMPORTANT]
 > Compression ratios differ slightly by year.
@@ -65,7 +65,7 @@ Each release also includes a corresponding `YYYY.db` file containing Tenhou game
 
 > [!NOTE]
 > The provided `2024.zip` and `2024.db` are **examples**.
-> Each year from **2015 to 2024** includes its own `.zip` and `.db` files following the same structure.
+> Each year from **2009 to 2025** includes its own `.zip` and `.db` files following the same structure.
 
 ---
 
