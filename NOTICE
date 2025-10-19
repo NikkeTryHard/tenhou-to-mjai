@@ -14,16 +14,16 @@ Project Components and Licenses
 Third-Party Tools Used
 -------------------------------------------------------------------------------
 - houou-logs (MIT License)
-  https://github.com/Equim-chan/houou-logs
+  https://github.com/Apricot-S/houou-logs
 
 - mjlog2json (Apache License 2.0 / MIT License)
-  https://github.com/Equim-chan/mjlog2json
+  https://github.com/tsubakisakura/mjlog2json
 
 - mjai-reviewer (Apache License 2.0)
-  https://github.com/mjai-community/mjai-reviewer
+  https://github.com/Equim-chan/mjai-reviewer
 
 - Mortal (AGPL-3.0 License)
-  https://github.com/mjai-community/mortal
+  https://github.com/Equim-chan/Mortal
 
 These tools were used for data conversion, log preprocessing, and AI model
 integration. Each retains its original license and attribution requirements.
