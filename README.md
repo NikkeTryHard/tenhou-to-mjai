@@ -1,4 +1,4 @@
-![Total Downloads](https://img.shields.io/github/downloads/NikkeTryHard/tenhou-to-mjai/v1.2.0/total?label=Downloads&color=blue)
+![Total Downloads](https://img.shields.io/github/downloads/NikkeTryHard/tenhou-to-mjai/total?label=Total%20Downloads&color=success)
 
 # Tenhou to MJAI
 
