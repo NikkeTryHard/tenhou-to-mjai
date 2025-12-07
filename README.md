@@ -1,3 +1,5 @@
+![Total Downloads](https://img.shields.io/github/downloads/NikkeTryHard/tenhou-to-mjai/v1.2.0/total?label=Downloads&color=blue)
+
 # Tenhou to MJAI
 
 This repository provides tools and datasets for converting **Tenhou mahjong game logs** into the **MJAI** format.
