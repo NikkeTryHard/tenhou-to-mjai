@@ -232,7 +232,10 @@ pub fn parse_chi_peng_gang(data: &[u8]) -> Result<ChiPengGang> {
                     0 => ChiPengGangType::Chi,
                     1 => ChiPengGangType::Pon,
                     2 => ChiPengGangType::Daiminkan,
-                    _ => ChiPengGangType::Chi,
+                    n => {
+                        tracing::warn!("Unknown ChiPengGang type: {}, defaulting to Chi", n);
+                        ChiPengGangType::Chi
+                    }
                 };
             }
             (3, 2) => tiles.push(tile_str_to_mjai(&extract_string(field.data))?),
@@ -263,7 +266,11 @@ pub fn parse_an_gang_add_gang(data: &[u8]) -> Result<AnGangAddGang> {
                 let t = extract_varint(field.data)? as u32;
                 gang_type = match t {
                     3 => AnGangAddGangType::Kakan,
-                    _ => AnGangAddGangType::Ankan,
+                    2 => AnGangAddGangType::Ankan,
+                    n => {
+                        tracing::warn!("Unknown AnGangAddGang type: {}, defaulting to Ankan", n);
+                        AnGangAddGangType::Ankan
+                    }
                 };
             }
             (3, 2) => tiles = tile_str_to_mjai(&extract_string(field.data))?,

@@ -140,6 +140,8 @@ impl MajsoulConverter {
 
         // Track state for reach_accepted
         let mut pending_reach: Option<u32> = None;
+        // Track last discarder for ron target calculation
+        let mut last_discarder: Option<u32> = None;
 
         for event in events {
             match event {
@@ -193,6 +195,9 @@ impl MajsoulConverter {
                 }
 
                 GameEvent::DiscardTile(dt) => {
+                    // Track last discarder for ron target calculation
+                    last_discarder = Some(dt.seat);
+
                     // Check for riichi declaration
                     if dt.is_liqi || dt.is_wliqi {
                         mjai_events.push(json!({
@@ -256,18 +261,19 @@ impl MajsoulConverter {
                 GameEvent::AnGangAddGang(ag) => {
                     match ag.gang_type {
                         AnGangAddGangType::Ankan => {
+                            let consumed = generate_ankan_tiles(&ag.tiles);
                             mjai_events.push(json!({
                                 "type": "ankan",
                                 "actor": ag.seat,
-                                "consumed": [&ag.tiles, &ag.tiles, &ag.tiles, &ag.tiles],
+                                "consumed": consumed,
                             }));
                         }
                         AnGangAddGangType::Kakan => {
+                            // Kakan: only the added tile, the pon is already on the table
                             mjai_events.push(json!({
                                 "type": "kakan",
                                 "actor": ag.seat,
-                                "pai": ag.tiles,
-                                "consumed": [&ag.tiles, &ag.tiles, &ag.tiles],
+                                "pai": &ag.tiles,
                             }));
                         }
                     }
@@ -291,10 +297,8 @@ impl MajsoulConverter {
                                 "pai": hule.hu_tile,
                             }));
                         } else {
-                            // Ron - need to find who discarded
-                            // The target is the previous player who discarded
-                            // For simplicity, we calculate based on seat
-                            let target = (hule.seat + num_players as u32 - 1) % num_players as u32;
+                            // Ron - use the tracked last discarder as target
+                            let target = last_discarder.unwrap_or(0);
                             mjai_events.push(json!({
                                 "type": "hora",
                                 "actor": hule.seat,
@@ -374,6 +378,23 @@ impl MajsoulConverter {
 
         Ok(mjai_events)
     }
+}
+
+/// Generate 4 tiles for ankan, including one red 5 if applicable
+fn generate_ankan_tiles(tile: &str) -> Vec<String> {
+    // If it's a 5 of a numbered suit, include one red variant
+    if tile.len() >= 2 {
+        let chars: Vec<char> = tile.chars().collect();
+        let num = chars[0];
+        let suit = chars[1];
+
+        if num == '5' && (suit == 'm' || suit == 'p' || suit == 's') {
+            let regular = format!("5{}", suit);
+            let red = format!("5{}r", suit);
+            return vec![red, regular.clone(), regular.clone(), regular];
+        }
+    }
+    vec![tile.to_string(); 4]
 }
 
 #[cfg(test)]
