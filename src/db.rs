@@ -59,6 +59,8 @@ impl Database {
                 player_id INTEGER NOT NULL,
                 start_time INTEGER NOT NULL,
                 mode_id INTEGER,
+                num_players INTEGER,
+                is_hanchan INTEGER,
                 is_downloaded INTEGER DEFAULT 0,
                 is_converted INTEGER DEFAULT 0,
                 raw_data BLOB,
@@ -69,6 +71,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_majsoul_logs_converted ON majsoul_logs(is_converted);
             ",
         )?;
+
+        // Schema migration: add columns if they don't exist (for existing databases)
+        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN num_players INTEGER", []);
+        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN is_hanchan INTEGER", []);
+
         Ok(())
     }
 
@@ -280,19 +287,30 @@ impl Database {
     }
 
     /// Get unconverted Majsoul logs (downloaded but not yet converted)
-    pub fn get_majsoul_unconverted(&self, limit: Option<usize>) -> Result<Vec<(String, Vec<u8>)>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT uuid, raw_data FROM majsoul_logs
-                 WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL
-                 ORDER BY start_time LIMIT {}",
-                n
-            ),
-            None => "SELECT uuid, raw_data FROM majsoul_logs
-                     WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL
-                     ORDER BY start_time"
-                .to_string(),
-        };
+    pub fn get_majsoul_unconverted(
+        &self,
+        limit: Option<usize>,
+        num_players: Option<i32>,
+        hanchan_only: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut sql = String::from(
+            "SELECT uuid, raw_data FROM majsoul_logs
+             WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL",
+        );
+
+        if let Some(players) = num_players {
+            sql.push_str(&format!(" AND num_players = {}", players));
+        }
+
+        if hanchan_only {
+            sql.push_str(" AND is_hanchan = 1");
+        }
+
+        sql.push_str(" ORDER BY start_time");
+
+        if let Some(n) = limit {
+            sql.push_str(&format!(" LIMIT {}", n));
+        }
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
