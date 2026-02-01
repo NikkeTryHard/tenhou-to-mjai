@@ -178,6 +178,14 @@ enum MajsoulCommands {
         /// Maximum logs to convert (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
+
+        /// Filter by player count (e.g., 4 for 4-player games)
+        #[arg(short, long)]
+        players: Option<i32>,
+
+        /// Only convert hanchan (full games)
+        #[arg(long)]
+        hanchan: bool,
     },
 }
 
@@ -257,9 +265,11 @@ async fn main() -> Result<()> {
                 if results.is_empty() {
                     println!("No players found for '{}'", nickname);
                 } else {
-                    for p in results {
-                        let level = p.level.map_or(0, |l| l.id);
-                        println!("{} (ID: {}, Level: {})", p.nickname, p.id, level);
+                    for p in &results {
+                        let level_id = p.level.as_ref().map(|l| l.id);
+                        println!("{} (ID: {}, Level: {})", p.nickname, p.id, level_id.unwrap_or(0));
+                        // Store player in database
+                        let _ = db.insert_majsoul_player(p.id, &p.nickname, level_id);
                     }
                 }
             }
@@ -319,9 +329,9 @@ async fn main() -> Result<()> {
                 let (success, failed) = downloader.download_logs(&db, &token, limit).await?;
                 info!("Downloaded {} records ({} failed)", success, failed);
             }
-            MajsoulCommands::Convert { output, limit } => {
+            MajsoulCommands::Convert { output, limit, players, hanchan } => {
                 let converter = majsoul::MajsoulConverter::new(&output)?;
-                let (success, failed) = converter.convert_logs(&db, limit)?;
+                let (success, failed) = converter.convert_logs(&db, limit, players, hanchan)?;
                 info!("Converted {} Majsoul logs ({} failed)", success, failed);
             }
         },

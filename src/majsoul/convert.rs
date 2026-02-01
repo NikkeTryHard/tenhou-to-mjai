@@ -31,8 +31,14 @@ impl MajsoulConverter {
     }
 
     /// Convert all unconverted Majsoul logs from database
-    pub fn convert_logs(&self, db: &Database, limit: Option<usize>) -> Result<(usize, usize)> {
-        let logs = db.get_majsoul_unconverted(limit)?;
+    pub fn convert_logs(
+        &self,
+        db: &Database,
+        limit: Option<usize>,
+        num_players: Option<i32>,
+        hanchan_only: bool,
+    ) -> Result<(usize, usize)> {
+        let logs = db.get_majsoul_unconverted(limit, num_players, hanchan_only)?;
 
         if logs.is_empty() {
             tracing::info!("No Majsoul logs to convert");
