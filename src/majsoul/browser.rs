@@ -162,21 +162,57 @@ pub async fn fetch_game_record_via_browser(
 
     // Wait for game to load and check if logged in
     info!("Waiting for game to initialize...");
+    info!("Please login in the browser if not already logged in.");
     let uuid_owned = uuid.to_string();
 
-    let result = timeout(Duration::from_secs(120), async {
-        // Wait for app to be ready
+    let result = timeout(Duration::from_secs(300), async {
+        // Wait for lobby to be ready
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let check = page.evaluate(r#"typeof app !== 'undefined' && app.NetMgr && app.NetMgr.Lobby"#).await;
+
+            // Check if we're in the lobby (uiscript.UI_Lobby visible or app ready)
+            let check = page.evaluate(r#"
+                (function() {
+                    // Check multiple indicators of being in lobby
+                    if (typeof app === 'undefined') return false;
+                    if (!app.NetMgr) return false;
+                    // Check if Lobby RPC is available
+                    if (app.NetMgr.Lobby && typeof app.NetMgr.Lobby.fetchGameRecord === 'function') {
+                        return true;
+                    }
+                    // Alternative: check if we have account data
+                    if (app.account_data && app.account_data.account_id) {
+                        return true;
+                    }
+                    return false;
+                })()
+            "#).await;
+
             if let Ok(val) = check {
                 if val.value().and_then(|v| v.as_bool()) == Some(true) {
+                    info!("Lobby detected!");
                     break;
+                }
+            }
+
+            // Debug: show what's available
+            let debug = page.evaluate(r#"
+                JSON.stringify({
+                    hasApp: typeof app !== 'undefined',
+                    hasNetMgr: typeof app !== 'undefined' && !!app.NetMgr,
+                    hasLobby: typeof app !== 'undefined' && app.NetMgr && !!app.NetMgr.Lobby,
+                    hasFetch: typeof app !== 'undefined' && app.NetMgr && app.NetMgr.Lobby && typeof app.NetMgr.Lobby.fetchGameRecord === 'function',
+                    token: localStorage.getItem('ssssoooodd') ? 'exists' : 'none'
+                })
+            "#).await;
+            if let Ok(d) = debug {
+                if let Some(s) = d.value().and_then(|v| v.as_str()) {
+                    debug!("App state: {}", s);
                 }
             }
         }
 
-        info!("Game loaded, fetching record...");
+        info!("Fetching record...");
 
         // Call fetchGameRecord
         let script = format!(
@@ -230,6 +266,7 @@ pub async fn fetch_game_record_via_browser(
 }
 
 /// Capture access token by grabbing localStorage after login completes
+/// Also intercepts WebSocket to see actual auth flow
 pub async fn capture_token_interactive(server: &str) -> Result<CachedToken> {
     let url = server_url(server);
     info!("Launching Chrome for Majsoul authentication ({} server)...", server);
@@ -246,55 +283,140 @@ pub async fn capture_token_interactive(server: &str) -> Result<CachedToken> {
         }
     });
 
-    // Navigate to Majsoul
+    // Inject JS hook BEFORE navigation to intercept token the moment it's set
+    let inject_script = r#"
+        (function() {
+            // Hook localStorage.setItem to capture ssssoooodd the moment it's set
+            const originalSetItem = localStorage.setItem.bind(localStorage);
+            localStorage.setItem = function(key, value) {
+                if (key === 'ssssoooodd') {
+                    window._capturedLiqiToken = value;
+                    console.log('[HOOK] Captured ssssoooodd on setItem:', value);
+                }
+                return originalSetItem(key, value);
+            };
+            console.log('[HOOK] localStorage.setItem interceptor installed');
+        })();
+    "#;
+
+    // Create page but don't navigate yet
     let page = browser
-        .new_page(url)
+        .new_page("about:blank")
         .await
-        .context("Failed to open Majsoul page")?;
+        .context("Failed to create page")?;
+
+    // Add script to run on every new document (before page scripts)
+    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
+    page.execute(AddScriptToEvaluateOnNewDocumentParams::new(inject_script.to_string()))
+        .await
+        .context("Failed to inject interceptor script")?;
+    info!("Injected WebSocket interceptor for liqi_access_token capture");
+
+    // Clear localStorage and cookies to force fresh login (otherwise auto-login skips oauth2Auth)
+    use chromiumoxide::cdp::browser_protocol::storage::ClearDataForOriginParams;
+    let clear_params = ClearDataForOriginParams::new(
+        url.trim_end_matches('/').to_string(),
+        "cookies,local_storage".to_string(),
+    );
+    if let Err(e) = page.execute(clear_params).await {
+        warn!("Failed to clear storage (non-fatal): {}", e);
+    }
+    info!("Cleared cookies/localStorage to force fresh login");
+
+    // NOW navigate to Majsoul - hook will be active
+    page.goto(url).await.context("Failed to navigate to Majsoul")?;
+
+    // Enable network interception to see WebSocket frames
+    page.execute(NetworkEnable::default()).await?;
 
     info!("Waiting for login... (timeout: 5 minutes)");
     info!("Login in the browser, then wait for token capture.");
 
-    // Poll localStorage for ssssoooodd token
+    // Poll for token - check window._capturedLiqiToken (CN) or localStorage (EN/JP)
     let server_owned = server.to_string();
+    let mut attempts = 0;
     let token = timeout(Duration::from_secs(300), async {
         loop {
             tokio::time::sleep(Duration::from_secs(2)).await;
+            attempts += 1;
 
-            // Debug: dump all localStorage keys on first iteration
-            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                if let Ok(keys) = page.evaluate(r#"JSON.stringify(Object.keys(localStorage))"#).await {
-                    if let Some(k) = keys.value().and_then(|v| v.as_str()) {
-                        debug!("localStorage keys: {}", k);
+            // Check for captured liqi_access_token from WebSocket hook (CN/TW/HK)
+            if let Ok(captured) = page.evaluate(r#"window._capturedLiqiToken || null"#).await {
+                if let Some(liqi_token) = captured.value().and_then(|v| v.as_str()) {
+                    if liqi_token.len() == 36 && liqi_token.contains('-') {
+                        info!("Captured liqi_access_token from WebSocket hook!");
+                        return CachedToken {
+                            access_token: liqi_token.to_string(),
+                            uid: 0,
+                            captured_at: chrono::Utc::now().timestamp(),
+                            server: server_owned.clone(),
+                        };
                     }
                 }
-                // Also dump values for relevant keys
-                if let Ok(all) = page.evaluate(r#"JSON.stringify({
-                    ssssoooodd: localStorage.getItem('ssssoooodd'),
-                    lq_uid: localStorage.getItem('lq_uid'),
-                    access_token: localStorage.getItem('access_token'),
-                    account_id: localStorage.getItem('account_id')
-                })"#).await {
+            }
+
+            // Debug: dump localStorage on first iteration
+            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // Dump ALL localStorage keys and values for debugging
+                if let Ok(all) = page.evaluate(r#"JSON.stringify(localStorage)"#).await {
                     if let Some(v) = all.value().and_then(|v| v.as_str()) {
-                        info!("localStorage auth data: {}", v);
+                        info!("ALL localStorage: {}", v);
                     }
                 }
             }
 
             // Try to get token from localStorage
-            let result = page.evaluate(r#"localStorage.getItem('ssssoooodd')"#).await;
+            // For CN: capture _pre_id_token (raw Google JWT) - ssssoooodd gets consumed by browser
+            let (token_key, token_type) = if server_owned == "cn" {
+                ("_pre_id_token", "jwt")
+            } else {
+                ("ssssoooodd", "uuid")
+            };
+
+            let script = format!(r#"localStorage.getItem('{}')"#, token_key);
+            let result = page.evaluate(script.as_str()).await;
 
             if let Ok(value) = result {
                 if let Some(token_str) = value.value().and_then(|v| v.as_str()) {
-                    if token_str.len() == 36 && token_str.contains('-') {
-                        info!("Found access token in localStorage");
-                        return CachedToken {
-                            access_token: token_str.to_string(),
-                            uid: 0,
-                            captured_at: chrono::Utc::now().timestamp(),
-                            server: server_owned.clone(),
+                    let valid = if token_type == "jwt" {
+                        token_str.starts_with("eyJ") && token_str.len() > 100
+                    } else {
+                        token_str.len() == 36 && token_str.contains('-')
+                    };
+
+                    if valid {
+                        // Also check for lq_uid to ensure account is fully loaded
+                        let uid: u64 = if let Ok(uid_val) = page.evaluate(r#"localStorage.getItem('lq_uid')"#).await {
+                            uid_val.value()
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0)
+                        } else {
+                            0
                         };
+
+                        if uid > 0 {
+                            info!("Found access token with uid {} in localStorage", uid);
+                            return CachedToken {
+                                access_token: token_str.to_string(),
+                                uid,
+                                captured_at: chrono::Utc::now().timestamp(),
+                                server: server_owned.clone(),
+                            };
+                        } else if attempts > 5 {
+                            // Fallback: CN server may not set lq_uid, accept token anyway after 10 seconds
+                            info!("Found access token (no lq_uid after {} attempts, using anyway)", attempts);
+                            return CachedToken {
+                                access_token: token_str.to_string(),
+                                uid: 0,
+                                captured_at: chrono::Utc::now().timestamp(),
+                                server: server_owned.clone(),
+                            };
+                        } else {
+                            debug!("Token found but lq_uid not set yet, waiting... (attempt {})", attempts);
+                        }
                     }
                 }
             }

@@ -112,6 +112,16 @@ mod requests {
     use super::wrapper::encode_varint;
     use uuid::Uuid;
 
+    /// Get auth type for server
+    /// EN/JP (Yostar) = 7, TW/HK (Google) = 16, CN (native) = 0
+    pub fn auth_type_for_server(server: &str) -> u8 {
+        match server {
+            "cn" => 16,  // TW/HK uses Google OAuth type 16 (same domain as CN)
+            "en" | "jp" => 7,  // Yostar OAuth
+            _ => 7,
+        }
+    }
+
     /// oauth2Auth request for EN/JP servers (type 7)
     /// Exchanges code-uid for access_token
     pub fn oauth2_auth(code: &str, uid: &str, version: &str) -> Vec<u8> {
@@ -135,11 +145,54 @@ mod requests {
         buf
     }
 
-    pub fn oauth2_check(access_token: &str) -> Vec<u8> {
+    /// oauth2Auth for CN/TW/HK - exchanges Google token for liqi_access_token
+    pub fn oauth2_auth_for_cn(access_token: &str, version: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Field 1: type = 7 (Yostar)
+        // Field 1: type = 16 (Google OAuth for CN/TW/HK)
         buf.push(0x08);
-        buf.push(0x07);
+        buf.push(0x10); // 16
+        // Field 2: code (the Google access_token from localStorage)
+        buf.push(0x12);
+        encode_varint(&mut buf, access_token.len() as u64);
+        buf.extend_from_slice(access_token.as_bytes());
+        // Field 3: uid (empty for Google OAuth)
+        buf.push(0x1a);
+        buf.push(0x00);
+        // Field 8: client_version_string
+        let version_str = format!("web-{}", version);
+        buf.push(0x42);
+        encode_varint(&mut buf, version_str.len() as u64);
+        buf.extend_from_slice(version_str.as_bytes());
+        buf
+    }
+
+    /// oauth2Auth for CN/TW/HK with Google JWT (type 16 for TW/HK Google OAuth)
+    pub fn oauth2_auth_for_cn_jwt(id_token: &str, version: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: type = 16 (Google OAuth for TW/HK)
+        buf.push(0x08);
+        buf.push(0x10); // 16
+        // Field 2: code (the Google id_token JWT)
+        buf.push(0x12);
+        encode_varint(&mut buf, id_token.len() as u64);
+        buf.extend_from_slice(id_token.as_bytes());
+        // Field 3: uid (empty)
+        buf.push(0x1a);
+        buf.push(0x00);
+        // Field 8: client_version_string
+        let version_str = format!("web-{}", version);
+        buf.push(0x42);
+        encode_varint(&mut buf, version_str.len() as u64);
+        buf.extend_from_slice(version_str.as_bytes());
+        buf
+    }
+
+    pub fn oauth2_check(access_token: &str, server: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: type (7 for Yostar, 16 for TW/HK Google)
+        let auth_type = auth_type_for_server(server);
+        buf.push(0x08);
+        buf.push(auth_type);
         // Field 2: access_token
         buf.push(0x12);
         encode_varint(&mut buf, access_token.len() as u64);
@@ -147,11 +200,12 @@ mod requests {
         buf
     }
 
-    pub fn oauth2_login(access_token: &str, version: &str) -> Vec<u8> {
+    pub fn oauth2_login(access_token: &str, version: &str, server: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Field 1: type = 7 (Yostar)
+        // Field 1: type (7 for Yostar, 16 for TW/HK Google)
+        let auth_type = auth_type_for_server(server);
         buf.push(0x08);
-        buf.push(0x07);
+        buf.push(auth_type);
         // Field 2: access_token (FIXED: was incorrectly field 4)
         buf.push(0x12);
         encode_varint(&mut buf, access_token.len() as u64);
@@ -179,6 +233,45 @@ mod requests {
         encode_varint(&mut buf, client_version.len() as u64);
         buf.extend_from_slice(&client_version);
         // Field 10: client_version_string (tag 0x52)
+        buf.push(0x52);
+        encode_varint(&mut buf, version_str.len() as u64);
+        buf.extend_from_slice(version_str.as_bytes());
+        buf
+    }
+
+    /// oauth2_login with explicit type (for two-step retry with type 0)
+    pub fn oauth2_login_with_type(access_token: &str, version: &str, auth_type: u8) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: type
+        buf.push(0x08);
+        buf.push(auth_type);
+        // Field 2: access_token
+        buf.push(0x12);
+        encode_varint(&mut buf, access_token.len() as u64);
+        buf.extend_from_slice(access_token.as_bytes());
+        // Field 3: reconnect = false
+        buf.push(0x18);
+        buf.push(0x00);
+        // Field 4: device
+        let device = encode_device();
+        buf.push(0x22);
+        encode_varint(&mut buf, device.len() as u64);
+        buf.extend_from_slice(&device);
+        // Field 5: random_key
+        let random_key = Uuid::new_v4().to_string();
+        buf.push(0x2a);
+        encode_varint(&mut buf, random_key.len() as u64);
+        buf.extend_from_slice(random_key.as_bytes());
+        // Field 6: client_version
+        let version_str = format!("web-{}", version);
+        let mut client_version = Vec::new();
+        client_version.push(0x0a);
+        encode_varint(&mut client_version, version_str.len() as u64);
+        client_version.extend_from_slice(version_str.as_bytes());
+        buf.push(0x32);
+        encode_varint(&mut buf, client_version.len() as u64);
+        buf.extend_from_slice(&client_version);
+        // Field 10: client_version_string
         buf.push(0x52);
         encode_varint(&mut buf, version_str.len() as u64);
         buf.extend_from_slice(version_str.as_bytes());
@@ -318,7 +411,7 @@ impl MajsoulRpc {
 
     /// Login with code-uid format (for EN/JP servers)
     /// Format: "{code}-{uid}" where code is from localStorage 'dddddcv' and uid is account_id
-    pub async fn login(&self, token: &str, version: &str) -> Result<Vec<u8>> {
+    pub async fn login(&self, token: &str, version: &str, server: &str) -> Result<Vec<u8>> {
         // Step 0: Send heartbeat first (required to establish session)
         info!("Sending heartbeat");
         let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
@@ -333,11 +426,11 @@ impl MajsoulRpc {
                 (&token[..last_dash], potential_uid)
             } else {
                 // No uid suffix, use token directly as access_token
-                return self.login_with_access_token(token, version).await;
+                return self.login_with_access_token(token, version, server).await;
             }
         } else {
             // No uid, try as direct access_token
-            return self.login_with_access_token(token, version).await;
+            return self.login_with_access_token(token, version, server).await;
         };
 
         info!("Authenticating with oauth2Auth (code={}, uid={})", &code[..8], uid);
@@ -370,19 +463,46 @@ impl MajsoulRpc {
         info!("Got access_token: {}...", &access_token[..8.min(access_token.len())]);
 
         // Step 2: oauth2Login with the real access_token
-        self.login_with_access_token(&access_token, version).await
+        self.login_with_access_token(&access_token, version, "en").await
     }
 
-    async fn login_with_access_token(&self, access_token: &str, version: &str) -> Result<Vec<u8>> {
+    async fn login_with_access_token(&self, access_token: &str, version: &str, server: &str) -> Result<Vec<u8>> {
         // Step 1: oauth2Check to validate token
-        info!("Checking token with oauth2Check");
-        let check_request = requests::oauth2_check(access_token);
+        info!("Checking token with oauth2Check (server: {}, type: {})", server, requests::auth_type_for_server(server));
+        let check_request = requests::oauth2_check(access_token, server);
         let check_response = self.call(".lq.Lobby.oauth2Check", &check_request).await?;
         debug!("oauth2Check response: {:02x?}", &check_response[..std::cmp::min(50, check_response.len())]);
 
+        // For CN/TW/HK with JWT token: exchange via oauth2Auth first
+        // JWT starts with "eyJ", UUID tokens are 36 chars
+        let is_jwt = access_token.starts_with("eyJ") && access_token.len() > 100;
+
+        let final_token = if server == "cn" && is_jwt {
+            info!("CN: exchanging Google JWT via oauth2Auth (type 20)...");
+            let auth_request = requests::oauth2_auth_for_cn_jwt(access_token, version);
+            let auth_response = self.call(".lq.Lobby.oauth2Auth", &auth_request).await?;
+            debug!("oauth2Auth response: {:02x?}", &auth_response[..std::cmp::min(100, auth_response.len())]);
+
+            // Parse liqi_access_token from response (field 2)
+            match Self::parse_access_token(&auth_response) {
+                Ok(liqi_token) => {
+                    info!("Got liqi_access_token from oauth2Auth: {}...", &liqi_token[..8.min(liqi_token.len())]);
+                    liqi_token
+                }
+                Err(_) => {
+                    if auth_response.len() >= 4 && auth_response[0] == 0x0a && auth_response[2] == 0x08 && auth_response[3] != 0 {
+                        anyhow::bail!("oauth2Auth failed (error {}). JWT may be expired.", auth_response[3]);
+                    }
+                    access_token.to_string()
+                }
+            }
+        } else {
+            access_token.to_string()
+        };
+
         // Step 2: oauth2Login
         info!("Authenticating with oauth2Login");
-        let login_request = requests::oauth2_login(access_token, version);
+        let login_request = requests::oauth2_login(&final_token, version, server);
         let response = self.call(".lq.Lobby.oauth2Login", &login_request).await?;
 
         // Debug: dump response hex
@@ -413,8 +533,8 @@ impl MajsoulRpc {
                 // CN server error 109: two-step OAuth - extract liqi_access_token and retry
                 if code == 109 {
                     if let Some(liqi_token) = Self::extract_liqi_token(&response) {
-                        info!("CN two-step OAuth: got liqi_access_token, retrying...");
-                        let retry_request = requests::oauth2_login(&liqi_token, version);
+                        info!("TW/HK two-step OAuth: got liqi_access_token, retrying with type 16...");
+                        let retry_request = requests::oauth2_login_with_type(&liqi_token, version, 16);
                         let retry_response = self.call(".lq.Lobby.oauth2Login", &retry_request).await?;
                         info!("oauth2Login retry response ({} bytes)", retry_response.len());
                         // Check retry response for errors

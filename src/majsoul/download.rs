@@ -20,6 +20,7 @@ impl MajsoulDownloader {
         db: &Database,
         access_token: &str,
         limit: Option<usize>,
+        server: &str,
     ) -> Result<(usize, usize)> {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
@@ -35,7 +36,7 @@ impl MajsoulDownloader {
         let (endpoint, version) = {
             let mut attempts = 0;
             loop {
-                match discover_gateway(&client).await {
+                match discover_gateway(&client, server).await {
                     Ok(result) => break result,
                     Err(e) if attempts < 3 => {
                         attempts += 1;
@@ -63,7 +64,7 @@ impl MajsoulDownloader {
             }
         };
 
-        rpc.login(access_token, &version).await?;
+        rpc.login(access_token, &version, server).await?;
 
         info!("Downloading {} game records", uuids.len());
 
