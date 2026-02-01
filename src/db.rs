@@ -106,29 +106,37 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_unconverted_logs(&self, limit: Option<usize>) -> Result<Vec<(String, Vec<u8>)>> {
-        let mut results = Vec::new();
+    pub fn get_unconverted_logs(
+        &self,
+        limit: Option<usize>,
+        num_players: Option<i32>,
+        hanchan_only: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut sql = String::from(
+            "SELECT id, xml_data FROM logs
+             WHERE is_downloaded = 1 AND is_converted = 0 AND xml_data IS NOT NULL",
+        );
+
+        if let Some(players) = num_players {
+            sql.push_str(&format!(" AND num_players = {}", players));
+        }
+
+        if hanchan_only {
+            sql.push_str(" AND is_hanchan = 1");
+        }
+
+        sql.push_str(" ORDER BY id");
 
         if let Some(n) = limit {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, xml_data FROM logs
-                 WHERE is_downloaded = 1 AND is_converted = 0 AND xml_data IS NOT NULL
-                 ORDER BY id LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([n], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            for row in rows {
-                results.push(row?);
-            }
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT id, xml_data FROM logs
-                 WHERE is_downloaded = 1 AND is_converted = 0 AND xml_data IS NOT NULL
-                 ORDER BY id",
-            )?;
-            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            for row in rows {
-                results.push(row?);
-            }
+            sql.push_str(&format!(" LIMIT {}", n));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
         }
 
         Ok(results)
