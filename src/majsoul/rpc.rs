@@ -11,6 +11,7 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 const MS_HOST: &str = "https://game.maj-soul.com";
 
@@ -109,21 +110,109 @@ mod wrapper {
 
 mod requests {
     use super::wrapper::encode_varint;
+    use uuid::Uuid;
 
-    pub fn oauth2_login(access_token: &str, version: &str) -> Vec<u8> {
+    /// oauth2Auth request for EN/JP servers (type 7)
+    /// Exchanges code-uid for access_token
+    pub fn oauth2_auth(code: &str, uid: &str, version: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Field 4: access_token
-        buf.push(0x22);
-        encode_varint(&mut buf, access_token.len() as u64);
-        buf.extend_from_slice(access_token.as_bytes());
+        // Field 1: type = 7
+        buf.push(0x08);
+        buf.push(0x07);
+        // Field 2: code (GUID)
+        buf.push(0x12);
+        encode_varint(&mut buf, code.len() as u64);
+        buf.extend_from_slice(code.as_bytes());
+        // Field 3: uid
+        buf.push(0x1a);
+        encode_varint(&mut buf, uid.len() as u64);
+        buf.extend_from_slice(uid.as_bytes());
         // Field 8: client_version_string
         let version_str = format!("web-{}", version);
         buf.push(0x42);
         encode_varint(&mut buf, version_str.len() as u64);
         buf.extend_from_slice(version_str.as_bytes());
-        // Field 10: currency_platforms
-        buf.push(0x50);
+        buf
+    }
+
+    pub fn oauth2_check(access_token: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: type = 7 (Yostar)
+        buf.push(0x08);
+        buf.push(0x07);
+        // Field 2: access_token
+        buf.push(0x12);
+        encode_varint(&mut buf, access_token.len() as u64);
+        buf.extend_from_slice(access_token.as_bytes());
+        buf
+    }
+
+    pub fn oauth2_login(access_token: &str, version: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: type = 7 (Yostar)
+        buf.push(0x08);
+        buf.push(0x07);
+        // Field 2: access_token (FIXED: was incorrectly field 4)
+        buf.push(0x12);
+        encode_varint(&mut buf, access_token.len() as u64);
+        buf.extend_from_slice(access_token.as_bytes());
+        // Field 3: reconnect = false (FIXED: was incorrectly field 5)
+        buf.push(0x18);
+        buf.push(0x00);
+        // Field 4: device - nested message (FIXED: was incorrectly field 6)
+        let device = encode_device();
+        buf.push(0x22);
+        encode_varint(&mut buf, device.len() as u64);
+        buf.extend_from_slice(&device);
+        // Field 5: random_key (UUID) (FIXED: was incorrectly field 7)
+        let random_key = Uuid::new_v4().to_string();
+        buf.push(0x2a);
+        encode_varint(&mut buf, random_key.len() as u64);
+        buf.extend_from_slice(random_key.as_bytes());
+        // Field 6: client_version - nested message (FIXED: was incorrectly field 8)
+        let version_str = format!("web-{}", version);
+        let mut client_version = Vec::new();
+        client_version.push(0x0a); // field 1 = resource
+        encode_varint(&mut client_version, version_str.len() as u64);
+        client_version.extend_from_slice(version_str.as_bytes());
+        buf.push(0x32);
+        encode_varint(&mut buf, client_version.len() as u64);
+        buf.extend_from_slice(&client_version);
+        // Field 10: client_version_string (tag 0x52)
+        buf.push(0x52);
+        encode_varint(&mut buf, version_str.len() as u64);
+        buf.extend_from_slice(version_str.as_bytes());
+        buf
+    }
+
+    fn encode_device() -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: platform = "pc" (was incorrectly field 2)
+        buf.push(0x0a);
         buf.push(0x02);
+        buf.extend_from_slice(b"pc");
+        // Field 2: hardware = "pc" (was incorrectly field 3)
+        buf.push(0x12);
+        buf.push(0x02);
+        buf.extend_from_slice(b"pc");
+        // Field 3: os = "pc" (was incorrectly field 4 with "windows")
+        buf.push(0x1a);
+        buf.push(0x02);
+        buf.extend_from_slice(b"pc");
+        // Field 4: os_version = "" (was incorrectly field 5)
+        buf.push(0x22);
+        buf.push(0x00);
+        // Field 5: is_browser = true (was incorrectly field 6)
+        buf.push(0x28);
+        buf.push(0x01);
+        // Field 6: software = "Chrome" (was incorrectly field 7)
+        buf.push(0x32);
+        buf.push(0x06);
+        buf.extend_from_slice(b"Chrome");
+        // Field 7: sale_platform = "web" (was incorrectly field 8)
+        buf.push(0x3a);
+        buf.push(0x03);
+        buf.extend_from_slice(b"web");
         buf
     }
 
@@ -227,14 +316,150 @@ impl MajsoulRpc {
         Ok(response)
     }
 
-    pub async fn login(&self, access_token: &str, version: &str) -> Result<Vec<u8>> {
-        let request = requests::oauth2_login(access_token, version);
-        let response = self.call(".lq.Lobby.oauth2Login", &request).await?;
-        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
-            anyhow::bail!("Login failed with error code: {}", response[1]);
+    /// Login with code-uid format (for EN/JP servers)
+    /// Format: "{code}-{uid}" where code is from localStorage 'dddddcv' and uid is account_id
+    pub async fn login(&self, token: &str, version: &str) -> Result<Vec<u8>> {
+        // Step 0: Send heartbeat first (required to establish session)
+        info!("Sending heartbeat");
+        let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
+        debug!("Heartbeat response: {} bytes", hb_response.len());
+
+        // Parse token: code-uid format
+        let (code, uid) = if token.contains('-') && token.len() > 40 {
+            // Assume format: {guid}-{uid} where guid has hyphens
+            let last_dash = token.rfind('-').unwrap();
+            let potential_uid = &token[last_dash + 1..];
+            if potential_uid.chars().all(|c| c.is_ascii_digit()) {
+                (&token[..last_dash], potential_uid)
+            } else {
+                // No uid suffix, use token directly as access_token
+                return self.login_with_access_token(token, version).await;
+            }
+        } else {
+            // No uid, try as direct access_token
+            return self.login_with_access_token(token, version).await;
+        };
+
+        info!("Authenticating with oauth2Auth (code={}, uid={})", &code[..8], uid);
+
+        // Step 1: oauth2Auth to exchange code+uid for access_token
+        let auth_request = requests::oauth2_auth(code, uid, version);
+        let auth_response = self.call(".lq.Lobby.oauth2Auth", &auth_request).await?;
+
+        debug!(
+            "oauth2Auth response ({} bytes): {:02x?}",
+            auth_response.len(),
+            &auth_response[..std::cmp::min(50, auth_response.len())]
+        );
+
+        // Check for error in oauth2Auth response
+        if auth_response.len() >= 4 && auth_response[0] == 0x0a && auth_response[2] == 0x08 {
+            let err_code = auth_response[3];
+            if err_code != 0 {
+                anyhow::bail!(
+                    "oauth2Auth failed (error {}). Code may be expired.\n\
+                     The 'dddddcv' code gets invalidated after use.\n\
+                     You need to logout and login again in browser to get a fresh code.",
+                    err_code
+                );
+            }
+        }
+
+        // Parse access_token from response
+        let access_token = Self::parse_access_token(&auth_response)?;
+        info!("Got access_token: {}...", &access_token[..8.min(access_token.len())]);
+
+        // Step 2: oauth2Login with the real access_token
+        self.login_with_access_token(&access_token, version).await
+    }
+
+    async fn login_with_access_token(&self, access_token: &str, version: &str) -> Result<Vec<u8>> {
+        // Step 1: oauth2Check to validate token
+        info!("Checking token with oauth2Check");
+        let check_request = requests::oauth2_check(access_token);
+        let check_response = self.call(".lq.Lobby.oauth2Check", &check_request).await?;
+        debug!("oauth2Check response: {:02x?}", &check_response[..std::cmp::min(50, check_response.len())]);
+
+        // Step 2: oauth2Login
+        info!("Authenticating with oauth2Login");
+        let login_request = requests::oauth2_login(access_token, version);
+        let response = self.call(".lq.Lobby.oauth2Login", &login_request).await?;
+
+        // Debug: dump response hex
+        info!(
+            "oauth2Login response ({} bytes): {:02x?}",
+            response.len(),
+            &response[..std::cmp::min(100, response.len())]
+        );
+
+        // Check for error - can be nested in field 1 (Error message)
+        // Format: 0a <len> 08 <error_code> ... or direct 08 <error_code>
+        let error_code = if response.len() >= 4 && response[0] == 0x0a {
+            // Nested error message in field 1
+            if response[2] == 0x08 {
+                Some(response[3])
+            } else {
+                None
+            }
+        } else if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
+            // Direct error code
+            Some(response[1])
+        } else {
+            None
+        };
+
+        if let Some(code) = error_code {
+            if code != 0 {
+                anyhow::bail!(
+                    "Login failed (error {}). Token may be expired.\n\
+                     Get a fresh token from browser: localStorage.getItem('ssssoooodd')\n\
+                     Your token: ssssoooodd (access_token), NOT dddddcv",
+                    code
+                );
+            }
         }
         info!("Login successful");
         Ok(response)
+    }
+
+    /// Parse access_token from oauth2Auth response
+    fn parse_access_token(data: &[u8]) -> Result<String> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let tag = data[pos];
+            pos += 1;
+            let field_num = tag >> 3;
+            let wire_type = tag & 0x07;
+
+            if wire_type == 2 {
+                // Length-delimited
+                let mut len: usize = 0;
+                let mut shift = 0;
+                while pos < data.len() {
+                    let b = data[pos];
+                    pos += 1;
+                    len |= ((b & 0x7f) as usize) << shift;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                    shift += 7;
+                }
+                if field_num == 2 && pos + len <= data.len() {
+                    // Field 2 is access_token
+                    return Ok(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                }
+                pos += len;
+            } else if wire_type == 0 {
+                // Varint - skip
+                while pos < data.len() && data[pos] & 0x80 != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            } else {
+                anyhow::bail!("Unexpected wire type {}", wire_type);
+            }
+        }
+        anyhow::bail!("access_token not found in oauth2Auth response");
     }
 
     pub async fn fetch_game_record(&self, uuid: &str) -> Result<Vec<u8>> {
