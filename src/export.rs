@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::db::Database;
 
 pub fn export_logs(db: &Database, output_dir: &Path, limit: Option<usize>) -> Result<(usize, usize)> {
-    let logs = db.get_unconverted_logs(limit)?;
+    let logs = db.get_unconverted_logs(limit, None, false)?;
 
     if logs.is_empty() {
         info!("No logs to export");

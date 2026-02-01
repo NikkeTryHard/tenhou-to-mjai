@@ -146,13 +146,13 @@ impl RawLog {
 
     #[inline]
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.logs.is_empty()
     }
 
     #[inline]
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.logs.len()
     }
 }
