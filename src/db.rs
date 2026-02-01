@@ -278,4 +278,39 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Get unconverted Majsoul logs (downloaded but not yet converted)
+    pub fn get_majsoul_unconverted(&self, limit: Option<usize>) -> Result<Vec<(String, Vec<u8>)>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT uuid, raw_data FROM majsoul_logs
+                 WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL
+                 ORDER BY start_time LIMIT {}",
+                n
+            ),
+            None => "SELECT uuid, raw_data FROM majsoul_logs
+                     WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL
+                     ORDER BY start_time"
+                .to_string(),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+
+        Ok(results)
+    }
+
+    /// Mark a Majsoul log as converted
+    pub fn mark_majsoul_converted(&self, uuid: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_logs SET is_converted = 1 WHERE uuid = ?1",
+            params![uuid],
+        )?;
+        Ok(())
+    }
 }

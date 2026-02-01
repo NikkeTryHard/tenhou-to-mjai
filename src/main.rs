@@ -168,6 +168,17 @@ enum MajsoulCommands {
         #[arg(long, default_value = "1500")]
         delay_ms: u64,
     },
+
+    /// Convert downloaded Majsoul logs to MJAI format
+    Convert {
+        /// Output directory for MJAI files
+        #[arg(short, long, default_value = "mjai-majsoul")]
+        output: PathBuf,
+
+        /// Maximum logs to convert (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -307,6 +318,11 @@ async fn main() -> Result<()> {
                 let downloader = majsoul::MajsoulDownloader::new(delay_ms);
                 let (success, failed) = downloader.download_logs(&db, &token, limit).await?;
                 info!("Downloaded {} records ({} failed)", success, failed);
+            }
+            MajsoulCommands::Convert { output, limit } => {
+                let converter = majsoul::MajsoulConverter::new(&output)?;
+                let (success, failed) = converter.convert_logs(&db, limit)?;
+                info!("Converted {} Majsoul logs ({} failed)", success, failed);
             }
         },
     }
