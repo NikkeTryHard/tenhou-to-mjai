@@ -107,22 +107,26 @@ impl Fetcher {
 
         for cap in log_id_re.captures_iter(html) {
             let full_id = cap.get(1).unwrap().as_str();
-            let game_type = cap.get(2).unwrap().as_str();
+            let game_type_str = cap.get(2).unwrap().as_str();
 
-            // Parse game type code
-            // 00a9 = 4-player hanchan with red
-            // 0029 = 4-player hanchan without red
-            // 00b9 = 3-player hanchan with red
-            // 00e1 = 4-player tonpu fast
-            let (num_players, is_hanchan) = match game_type {
-                "00a9" | "0029" => (4, true),  // 4p hanchan
-                "00b9" | "0039" => (3, true),  // 3p hanchan
-                "00e1" | "0061" => (4, false), // 4p tonpu
-                "00f1" | "0071" => (3, false), // 3p tonpu
-                _ => continue,                 // skip unknown types
+            // Parse game type using bitmask (same as houou-logs)
+            // Bit 4 (0x010) = 3-player if set, 4-player if unset
+            // Bit 3 (0x008) = Hanchan if set, Tonpu if unset
+            let Ok(game_type) = u16::from_str_radix(game_type_str, 16) else {
+                continue;
             };
 
-            // Extract date from log ID (first 8 chars after skipping time)
+            let is_3p = (game_type & 0x010) != 0;
+            let is_hanchan = (game_type & 0x008) != 0;
+
+            // Only capture 4-player games
+            if is_3p {
+                continue;
+            }
+
+            let num_players = 4;
+
+            // Extract date from log ID (first 8 chars)
             let date = &full_id[0..8];
 
             entries.push(LogEntry {
