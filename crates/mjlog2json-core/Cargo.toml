@@ -1,0 +1,13 @@
+[package]
+name = "mjlog2json-core"
+version = "0.1.3"
+edition = "2021"
+description = "Convert mjlog-XML to tenhou-JSON (core lib)"
+repository = "https://github.com/tsubakisakura/mjlog2json/"
+documentation = "https://docs.rs/mjlog2json-core"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+mjlog = { version = "0.1", path = "../mjlog" }
+tenhou-json = { version = "0.1", path = "../tenhou-json" }
+thiserror = "2.0.12"

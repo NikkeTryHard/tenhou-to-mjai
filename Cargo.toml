@@ -1,11 +1,12 @@
 [package]
 name = "tenhou-scraper"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["gzip", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 flate2 = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -16,7 +17,17 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
 regex = "1"
 chrono = "0.4"
+
+# Vendored crates
+mjlog = { path = "crates/mjlog" }
+mjlog2json-core = { path = "crates/mjlog2json-core" }
 convlog = { path = "crates/convlog" }
 
 [workspace]
-members = [".", "crates/convlog"]
+members = [
+    ".",
+    "crates/mjlog",
+    "crates/tenhou-json",
+    "crates/mjlog2json-core",
+    "crates/convlog",
+]
