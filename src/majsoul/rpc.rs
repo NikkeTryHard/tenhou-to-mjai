@@ -410,6 +410,21 @@ impl MajsoulRpc {
 
         if let Some(code) = error_code {
             if code != 0 {
+                // CN server error 109: two-step OAuth - extract liqi_access_token and retry
+                if code == 109 {
+                    if let Some(liqi_token) = Self::extract_liqi_token(&response) {
+                        info!("CN two-step OAuth: got liqi_access_token, retrying...");
+                        let retry_request = requests::oauth2_login(&liqi_token, version);
+                        let retry_response = self.call(".lq.Lobby.oauth2Login", &retry_request).await?;
+                        info!("oauth2Login retry response ({} bytes)", retry_response.len());
+                        // Check retry response for errors
+                        if retry_response.len() >= 4 && retry_response[0] == 0x0a && retry_response[2] == 0x08 && retry_response[3] != 0 {
+                            anyhow::bail!("CN login retry failed (error {})", retry_response[3]);
+                        }
+                        info!("Login successful (CN two-step)");
+                        return Ok(retry_response);
+                    }
+                }
                 anyhow::bail!(
                     "Login failed (error {}). Token may be expired.\n\
                      Get a fresh token from browser: localStorage.getItem('ssssoooodd')\n\
@@ -460,6 +475,20 @@ impl MajsoulRpc {
             }
         }
         anyhow::bail!("access_token not found in oauth2Auth response");
+    }
+
+    /// Extract liqi_access_token from CN error 109 response
+    /// Response contains JSON like {"type":7,"liqi_access_token":"uuid-here"}
+    fn extract_liqi_token(data: &[u8]) -> Option<String> {
+        // Find JSON in response (field 4, tag 0x22)
+        let json_str = String::from_utf8_lossy(data);
+        if let Some(start) = json_str.find("\"liqi_access_token\":\"") {
+            let start = start + 21;
+            if let Some(end) = json_str[start..].find('"') {
+                return Some(json_str[start..start + end].to_string());
+            }
+        }
+        None
     }
 
     pub async fn fetch_game_record(&self, uuid: &str) -> Result<Vec<u8>> {

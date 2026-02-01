@@ -22,11 +22,17 @@ fn token_cache_path() -> Result<PathBuf> {
 }
 
 /// Cached token data
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CachedToken {
     pub access_token: String,
     pub uid: u64,
     pub captured_at: i64,
+    #[serde(default = "default_server")]
+    pub server: String,
+}
+
+fn default_server() -> String {
+    "en".to_string()
 }
 
 impl CachedToken {
@@ -48,6 +54,15 @@ impl CachedToken {
         std::fs::write(&path, data)?;
         info!("Token saved to {:?}", path);
         Ok(())
+    }
+}
+
+/// Server URLs for different regions
+pub fn server_url(server: &str) -> &'static str {
+    match server {
+        "cn" => "https://game.maj-soul.com/1/",
+        "en" | "jp" => "https://mahjongsoul.game.yo-star.com/",
+        _ => "https://mahjongsoul.game.yo-star.com/",
     }
 }
 
@@ -78,17 +93,40 @@ async fn launch_browser(
         );
     }
 
-    let config = BrowserConfig::builder()
+    // Use a unique temp dir each time to avoid conflicts with running Chrome
+    let user_data_dir = std::env::temp_dir()
+        .join(format!("majsoul-auth-{}", std::process::id()));
+
+    // Try to find chromium first, fall back to chrome
+    let chrome_path = ["chromium", "chromium-browser", "google-chrome", "chrome"]
+        .iter()
+        .find_map(|name| {
+            std::process::Command::new("which")
+                .arg(name)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        });
+
+    let mut builder = BrowserConfig::builder()
         .no_sandbox()
-        .with_head() // Show the browser window for interactive login
-        .arg("--disable-gpu")
+        .with_head()
+        .disable_default_args()
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg("--exclude-switches=enable-automation")
         .arg("--disable-dev-shm-usage")
-        .arg("--disable-extensions")
-        .arg("--disable-background-networking")
-        .arg("--disable-default-apps")
         .arg("--no-first-run")
         .arg("--disable-features=Translate,OptimizationHints,MediaRouter")
-        .window_size(1280, 800)
+        .arg(format!("--user-data-dir={}", user_data_dir.display()))
+        .window_size(1280, 800);
+
+    if let Some(path) = chrome_path {
+        info!("Using browser: {}", path);
+        builder = builder.chrome_executable(path);
+    }
+
+    let config = builder
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to build browser config: {}", e))?;
 
@@ -99,10 +137,103 @@ async fn launch_browser(
     Ok((browser, handler))
 }
 
-/// Capture access token by intercepting browser WebSocket traffic
-pub async fn capture_token_interactive() -> Result<CachedToken> {
-    info!("Launching Chrome for Majsoul authentication...");
-    info!("Please login to Majsoul in the browser window that opens.");
+/// Fetch a game record using the browser's authenticated session
+pub async fn fetch_game_record_via_browser(
+    server: &str,
+    uuid: &str,
+) -> Result<Vec<u8>> {
+    let url = server_url(server);
+    info!("Launching browser to fetch game record: {}", uuid);
+
+    let (browser, mut handler) = launch_browser().await?;
+
+    let handler_task = tokio::spawn(async move {
+        while let Some(result) = handler.next().await {
+            if result.is_err() {
+                break;
+            }
+        }
+    });
+
+    let page = browser
+        .new_page(url)
+        .await
+        .context("Failed to open Majsoul page")?;
+
+    // Wait for game to load and check if logged in
+    info!("Waiting for game to initialize...");
+    let uuid_owned = uuid.to_string();
+
+    let result = timeout(Duration::from_secs(120), async {
+        // Wait for app to be ready
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let check = page.evaluate(r#"typeof app !== 'undefined' && app.NetMgr && app.NetMgr.Lobby"#).await;
+            if let Ok(val) = check {
+                if val.value().and_then(|v| v.as_bool()) == Some(true) {
+                    break;
+                }
+            }
+        }
+
+        info!("Game loaded, fetching record...");
+
+        // Call fetchGameRecord
+        let script = format!(
+            r#"
+            new Promise((resolve, reject) => {{
+                const uuid = "{}";
+                app.NetMgr.Lobby.fetchGameRecord({{ game_uuid: uuid }}, (err, res) => {{
+                    if (err) {{
+                        reject(JSON.stringify(err));
+                    }} else {{
+                        // Convert protobuf to base64
+                        const bytes = res.data || res.data_url;
+                        if (bytes instanceof Uint8Array) {{
+                            resolve(btoa(String.fromCharCode.apply(null, bytes)));
+                        }} else {{
+                            resolve(JSON.stringify(res));
+                        }}
+                    }}
+                }});
+            }})
+            "#,
+            uuid_owned
+        );
+
+        let result = page.evaluate(script).await
+            .context("Failed to call fetchGameRecord")?;
+
+        if let Some(data) = result.value().and_then(|v| v.as_str()) {
+            Ok(data.to_string())
+        } else {
+            anyhow::bail!("No data returned from fetchGameRecord")
+        }
+    })
+    .await
+    .context("Timeout fetching game record")??;
+
+    drop(page);
+    drop(browser);
+    handler_task.abort();
+
+    // Decode base64 if needed
+    if result.starts_with('{') {
+        // JSON response
+        Ok(result.into_bytes())
+    } else {
+        // Base64 encoded protobuf
+        base64::engine::general_purpose::STANDARD
+            .decode(&result)
+            .context("Failed to decode base64 response")
+    }
+}
+
+/// Capture access token by grabbing localStorage after login completes
+pub async fn capture_token_interactive(server: &str) -> Result<CachedToken> {
+    let url = server_url(server);
+    info!("Launching Chrome for Majsoul authentication ({} server)...", server);
+    info!("URL: {}", url);
 
     let (browser, mut handler) = launch_browser().await?;
 
@@ -117,53 +248,60 @@ pub async fn capture_token_interactive() -> Result<CachedToken> {
 
     // Navigate to Majsoul
     let page = browser
-        .new_page("https://game.maj-soul.com/1/")
+        .new_page(url)
         .await
         .context("Failed to open Majsoul page")?;
 
-    // Enable network domain for WebSocket interception
-    page.execute(NetworkEnable::default())
-        .await
-        .context("Failed to enable network domain")?;
-
-    // Listen for WebSocket frames
-    let mut ws_listener = page
-        .event_listener::<EventWebSocketFrameReceived>()
-        .await
-        .context("Failed to create WebSocket listener")?;
-
     info!("Waiting for login... (timeout: 5 minutes)");
-    info!("Login in the browser window, then wait for token capture.");
+    info!("Login in the browser, then wait for token capture.");
 
-    let mut frame_count = 0u64;
-
+    // Poll localStorage for ssssoooodd token
+    let server_owned = server.to_string();
     let token = timeout(Duration::from_secs(300), async {
-        while let Some(event) = ws_listener.next().await {
-            let frame = &event.response;
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
-            // Binary frame (opcode 2)
-            if frame.opcode == 2.0 {
-                if let Ok(data) =
-                    base64::engine::general_purpose::STANDARD.decode(&frame.payload_data)
-                {
-                    // Response packet starts with 0x03
-                    if data.len() > 3 && data[0] == 0x03 {
-                        if let Some(token) = try_extract_oauth2_token(&data[3..]) {
-                            return Ok(token);
-                        }
+            // Debug: dump all localStorage keys on first iteration
+            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                if let Ok(keys) = page.evaluate(r#"JSON.stringify(Object.keys(localStorage))"#).await {
+                    if let Some(k) = keys.value().and_then(|v| v.as_str()) {
+                        debug!("localStorage keys: {}", k);
+                    }
+                }
+                // Also dump values for relevant keys
+                if let Ok(all) = page.evaluate(r#"JSON.stringify({
+                    ssssoooodd: localStorage.getItem('ssssoooodd'),
+                    lq_uid: localStorage.getItem('lq_uid'),
+                    access_token: localStorage.getItem('access_token'),
+                    account_id: localStorage.getItem('account_id')
+                })"#).await {
+                    if let Some(v) = all.value().and_then(|v| v.as_str()) {
+                        info!("localStorage auth data: {}", v);
                     }
                 }
             }
 
-            frame_count += 1;
-            if frame_count % 50 == 0 {
-                debug!("Processed {} WebSocket frames...", frame_count);
+            // Try to get token from localStorage
+            let result = page.evaluate(r#"localStorage.getItem('ssssoooodd')"#).await;
+
+            if let Ok(value) = result {
+                if let Some(token_str) = value.value().and_then(|v| v.as_str()) {
+                    if token_str.len() == 36 && token_str.contains('-') {
+                        info!("Found access token in localStorage");
+                        return CachedToken {
+                            access_token: token_str.to_string(),
+                            uid: 0,
+                            captured_at: chrono::Utc::now().timestamp(),
+                            server: server_owned.clone(),
+                        };
+                    }
+                }
             }
         }
-        anyhow::bail!("WebSocket stream ended without capturing token")
     })
     .await
-    .context("Timeout waiting for login")??;
+    .context("Timeout waiting for login")?;
 
     // Cleanup
     drop(page);
@@ -177,27 +315,29 @@ pub async fn capture_token_interactive() -> Result<CachedToken> {
     Ok(token)
 }
 
-/// Try to extract access_token from oauth2Auth response
-fn try_extract_oauth2_token(data: &[u8]) -> Option<CachedToken> {
-    // Decode wrapper: field 1 = name, field 2 = payload
-    let (name, payload) = decode_wrapper(data).ok()?;
+/// Try to extract access_token from response payload
+/// Looks for UUID-like strings in field 2 (access_token field in oauth2Auth response)
+fn try_extract_oauth2_token(data: &[u8], server: &str) -> Option<CachedToken> {
+    // The wrapper has: field 1 = name (empty in responses), field 2 = payload
+    // We need to get field 2, then look for field 2 inside that (access_token)
 
-    if !name.contains("oauth2Auth") {
-        return None;
-    }
+    let (_, payload) = decode_wrapper(data).ok()?;
 
-    debug!("Found oauth2Auth response, extracting token...");
-
-    // Parse access_token from payload (field 2)
+    // Look for field 2 in the inner payload (access_token)
     let access_token = extract_string_field(&payload, 2)?;
 
-    // We don't have UID here, will get it from login response
-    // For now, use 0 and update later
-    Some(CachedToken {
-        access_token,
-        uid: 0,
-        captured_at: chrono::Utc::now().timestamp(),
-    })
+    // Must look like a UUID (36 chars with dashes)
+    if access_token.len() == 36 && access_token.chars().filter(|c| *c == '-').count() == 4 {
+        debug!("Found potential access_token: {}", access_token);
+        return Some(CachedToken {
+            access_token,
+            uid: 0,
+            captured_at: chrono::Utc::now().timestamp(),
+            server: server.to_string(),
+        });
+    }
+
+    None
 }
 
 /// Simple protobuf wrapper decoder (matches rpc.rs wrapper module)
