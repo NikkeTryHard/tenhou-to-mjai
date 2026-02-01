@@ -22,14 +22,23 @@ It also includes preprocessed yearly datasets and Tenhou database files for AI r
 
 ## Dataset Overview
 
-Each release contains data for **2009–2025** in two parts per year:
+Complete collection of Tenhou phoenix room (鳳凰卓) game logs in MJAI format, spanning **2009–2026**.
 
-| File Type | Example    | Description                                                         |
-| --------- | ---------- | ------------------------------------------------------------------- |
-| `.zip`    | `2024.zip` | Contains yearly folder of gzip-compressed `.mjson` game logs        |
-| `.db`     | `2024.db`  | SQLite database file downloaded from Tenhou (4-player hanchan mode) |
+| Year | Size | Games | Year | Size | Games |
+|------|------|-------|------|------|-------|
+| 2009 | 32MB | ~8k | 2018 | 760MB | ~195k |
+| 2010 | 311MB | ~80k | 2019 | 751MB | ~190k |
+| 2011 | 449MB | ~115k | 2020 | 958MB | ~245k |
+| 2012 | 521MB | ~135k | 2021 | 820MB | ~210k |
+| 2013 | 585MB | ~150k | 2022 | 1.1GB | ~280k |
+| 2014 | 625MB | ~160k | 2023 | 1.2GB | ~310k |
+| 2015 | 672MB | ~170k | 2024 | 1.3GB | ~335k |
+| 2016 | 702MB | ~180k | 2025 | 861MB | 197,692 |
+| 2017 | 743MB | ~190k | 2026 | 60MB | 13,639 (Jan) |
 
-All datasets contain only **4-player (四人麻雀)** **hanchan (半荘戦)** games.
+**Total: ~12GB, 18 yearly zips, 3M+ games**
+
+All datasets contain only **4-player (四人麻雀)** **hanchan (半荘戦)** games from the houou (phoenix) room.
 No 3-player or tonpuu (東風戦) matches are included.
 
 ---
