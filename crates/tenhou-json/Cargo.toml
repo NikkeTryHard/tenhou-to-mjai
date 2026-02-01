@@ -1,0 +1,15 @@
+[package]
+name = "tenhou-json"
+version = "0.1.2"
+edition = "2021"
+description = "Parsing Tenhou tenhou-json json files"
+repository = "https://github.com/tsubakisakura/mjlog2json/"
+documentation = "https://docs.rs/tenhou-json"
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+num-derive = "0.4.2"
+num-traits = "0.2.19"
+serde = "1.0.218"
+serde_json = { version = "1.0.139", features = ["preserve_order"] }
+thiserror = "2.0.11"
