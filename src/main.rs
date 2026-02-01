@@ -151,14 +151,13 @@ enum MajsoulCommands {
     /// Show Majsoul stats
     Stats,
 
-    /// Download game records (requires access token)
+    /// Download game records
     ///
-    /// To get token: Login to Mahjong Soul, open DevTools (F12),
-    /// Console tab, run: GameMgr.Inst.access_token
+    /// Uses cached token from `majsoul auth` if --token not provided.
     Download {
-        /// Access token from browser
+        /// Access token (optional if authenticated via `majsoul auth`)
         #[arg(long)]
-        token: String,
+        token: Option<String>,
 
         /// Maximum records to download
         #[arg(short, long)]
@@ -167,6 +166,16 @@ enum MajsoulCommands {
         /// Delay between requests in ms
         #[arg(long, default_value = "1500")]
         delay_ms: u64,
+    },
+
+    /// Authenticate with Majsoul via browser (interactive)
+    ///
+    /// Opens Chrome, navigates to Majsoul, and captures your access token
+    /// when you login. Token is cached for future use.
+    Auth {
+        /// Force re-authentication even if cached token exists
+        #[arg(long)]
+        force: bool,
     },
 
     /// Convert downloaded Majsoul logs to MJAI format
@@ -320,13 +329,61 @@ async fn main() -> Result<()> {
                 println!("  Pending download: {}", total - downloaded);
                 println!("  Pending convert:  {}", downloaded - converted);
             }
+            MajsoulCommands::Auth { force } => {
+                use crate::majsoul::browser::{capture_token_interactive, CachedToken};
+
+                // Check for existing token
+                if !force {
+                    if let Ok(Some(token)) = CachedToken::load() {
+                        info!(
+                            "Found cached token (captured at {})",
+                            chrono::DateTime::from_timestamp(token.captured_at, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        );
+                        info!("Use --force to re-authenticate");
+                        println!(
+                            "Token: {}...",
+                            &token.access_token[..8.min(token.access_token.len())]
+                        );
+                        return Ok(());
+                    }
+                }
+
+                let token = capture_token_interactive().await?;
+                println!(
+                    "Token captured: {}...",
+                    &token.access_token[..8.min(token.access_token.len())]
+                );
+            }
             MajsoulCommands::Download {
                 token,
                 limit,
                 delay_ms,
             } => {
+                use crate::majsoul::browser::CachedToken;
+
+                let access_token = match token {
+                    Some(t) => t,
+                    None => {
+                        // Try to load cached token
+                        match CachedToken::load()? {
+                            Some(cached) => {
+                                info!("Using cached token from majsoul auth");
+                                cached.access_token
+                            }
+                            None => {
+                                anyhow::bail!(
+                                    "No token provided and no cached token found.\n\
+                                     Run `majsoul auth` first, or provide --token"
+                                );
+                            }
+                        }
+                    }
+                };
+
                 let downloader = majsoul::MajsoulDownloader::new(delay_ms);
-                let (success, failed) = downloader.download_logs(&db, &token, limit).await?;
+                let (success, failed) = downloader.download_logs(&db, &access_token, limit).await?;
                 info!("Downloaded {} records ({} failed)", success, failed);
             }
             MajsoulCommands::Convert { output, limit, players, hanchan } => {

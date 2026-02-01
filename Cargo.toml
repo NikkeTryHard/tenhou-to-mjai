@@ -23,6 +23,9 @@ walkdir = "2"
 futures = "0.3"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-features = false }
+base64 = "0.22"
+dirs = "5"
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }
