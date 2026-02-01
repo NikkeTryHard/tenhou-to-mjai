@@ -21,6 +21,8 @@ chrono = "0.4"
 zip = "2"
 walkdir = "2"
 futures = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }

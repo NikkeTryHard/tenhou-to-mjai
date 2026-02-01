@@ -245,4 +245,37 @@ impl Database {
         )?;
         Ok((total, downloaded, converted))
     }
+
+    pub fn get_majsoul_undownloaded(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT uuid FROM majsoul_logs WHERE is_downloaded = 0 ORDER BY start_time LIMIT {}",
+                n
+            ),
+            None => "SELECT uuid FROM majsoul_logs WHERE is_downloaded = 0 ORDER BY start_time".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut uuids = Vec::new();
+        for uuid in rows {
+            uuids.push(uuid?);
+        }
+        Ok(uuids)
+    }
+
+    pub fn mark_majsoul_downloaded(&self, uuid: &str, raw_data: &[u8]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_logs SET is_downloaded = 1, raw_data = ?1 WHERE uuid = ?2",
+            params![raw_data, uuid],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_majsoul_download_error(&self, uuid: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_logs SET is_downloaded = -1 WHERE uuid = ?1",
+            params![uuid],
+        )?;
+        Ok(())
+    }
 }

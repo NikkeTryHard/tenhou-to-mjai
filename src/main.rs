@@ -150,6 +150,24 @@ enum MajsoulCommands {
 
     /// Show Majsoul stats
     Stats,
+
+    /// Download game records (requires access token)
+    ///
+    /// To get token: Login to Mahjong Soul, open DevTools (F12),
+    /// Console tab, run: GameMgr.Inst.access_token
+    Download {
+        /// Access token from browser
+        #[arg(long)]
+        token: String,
+
+        /// Maximum records to download
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between requests in ms
+        #[arg(long, default_value = "1500")]
+        delay_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -280,6 +298,15 @@ async fn main() -> Result<()> {
                 println!("  Converted:        {}", converted);
                 println!("  Pending download: {}", total - downloaded);
                 println!("  Pending convert:  {}", downloaded - converted);
+            }
+            MajsoulCommands::Download {
+                token,
+                limit,
+                delay_ms,
+            } => {
+                let downloader = majsoul::MajsoulDownloader::new(delay_ms);
+                let (success, failed) = downloader.download_logs(&db, &token, limit).await?;
+                info!("Downloaded {} records ({} failed)", success, failed);
             }
         },
     }
