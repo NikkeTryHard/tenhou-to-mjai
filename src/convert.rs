@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 use crate::db::Database;
@@ -21,15 +23,21 @@ impl Converter {
         Ok(Self { output_dir })
     }
 
-    pub fn convert_logs(&self, db: &Database, limit: Option<usize>) -> Result<(usize, usize)> {
-        let logs = db.get_unconverted_logs(limit)?;
+    pub fn convert_logs(
+        &self,
+        db: &Database,
+        limit: Option<usize>,
+        num_players: Option<i32>,
+        hanchan_only: bool,
+    ) -> Result<(usize, usize)> {
+        let logs = db.get_unconverted_logs(limit, num_players, hanchan_only)?;
 
         if logs.is_empty() {
             info!("No logs to convert");
             return Ok((0, 0));
         }
 
-        info!("Converting {} logs", logs.len());
+        info!("Converting {} logs in parallel", logs.len());
 
         let pb = ProgressBar::new(logs.len() as u64);
         pb.set_style(
@@ -38,25 +46,38 @@ impl Converter {
                 .progress_chars("#>-"),
         );
 
-        let mut success = 0;
-        let mut failed = 0;
+        let success = AtomicUsize::new(0);
+        let failed = AtomicUsize::new(0);
 
-        for (id, compressed_xml) in logs {
-            match self.convert_single(&id, &compressed_xml) {
-                Ok(_) => {
-                    db.mark_converted(&id)?;
-                    success += 1;
+        // Collect IDs that succeeded for later DB update
+        let successful_ids: Vec<String> = logs
+            .into_par_iter()
+            .progress_with(pb.clone())
+            .filter_map(|(id, compressed_xml)| {
+                match self.convert_single(&id, &compressed_xml) {
+                    Ok(_) => {
+                        success.fetch_add(1, Ordering::Relaxed);
+                        Some(id)
+                    }
+                    Err(e) => {
+                        warn!("Failed to convert {}: {}", id, e);
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        None
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to convert {}: {}", id, e);
-                    failed += 1;
-                }
-            }
-            pb.inc(1);
-        }
+            })
+            .collect();
 
         pb.finish_with_message("Done");
-        Ok((success, failed))
+
+        // Mark converted in DB (sequential, but fast)
+        for id in &successful_ids {
+            if let Err(e) = db.mark_converted(id) {
+                warn!("Failed to mark {} as converted: {}", id, e);
+            }
+        }
+
+        Ok((success.load(Ordering::Relaxed), failed.load(Ordering::Relaxed)))
     }
 
     fn convert_single(&self, id: &str, compressed_xml: &[u8]) -> Result<()> {

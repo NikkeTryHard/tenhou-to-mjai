@@ -3,6 +3,7 @@ mod db;
 mod download;
 mod export;
 mod fetch;
+mod package;
 
 use anyhow::Result;
 use chrono::NaiveDate;
@@ -67,6 +68,14 @@ enum Commands {
         /// Maximum logs to convert (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
+
+        /// Filter by player count (e.g., 4 for 4-player games)
+        #[arg(short, long)]
+        players: Option<i32>,
+
+        /// Only convert hanchan (full games)
+        #[arg(long)]
+        hanchan: bool,
     },
 
     /// Show database statistics
@@ -81,6 +90,17 @@ enum Commands {
         /// Maximum logs to export (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
+    },
+
+    /// Package MJAI files into a zip archive
+    Package {
+        /// Input directory containing .mjson.gz files
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// Output zip file path
+        #[arg(short, long)]
+        output: PathBuf,
     },
 }
 
@@ -126,9 +146,9 @@ async fn main() -> Result<()> {
             info!("Downloaded {} logs ({} failed)", success, failed);
         }
 
-        Commands::Convert { output, limit } => {
+        Commands::Convert { output, limit, players, hanchan } => {
             let converter = convert::Converter::new(&output)?;
-            let (success, failed) = converter.convert_logs(&db, limit)?;
+            let (success, failed) = converter.convert_logs(&db, limit, players, hanchan)?;
             info!("Converted {} logs ({} failed)", success, failed);
         }
 
@@ -145,6 +165,11 @@ async fn main() -> Result<()> {
         Commands::Export { output, limit } => {
             let (success, failed) = export::export_logs(&db, &output, limit)?;
             info!("Exported {} logs ({} failed)", success, failed);
+        }
+
+        Commands::Package { input, output } => {
+            let count = package::package_directory(&input, &output)?;
+            info!("Packaged {} files into {:?}", count, output);
         }
     }
 
