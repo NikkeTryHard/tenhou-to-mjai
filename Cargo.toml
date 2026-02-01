@@ -20,6 +20,7 @@ chrono = "0.4"
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }
+tenhou-json = { path = "crates/tenhou-json" }
 mjlog2json-core = { path = "crates/mjlog2json-core" }
 convlog = { path = "crates/convlog" }
 
