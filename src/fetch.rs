@@ -1,8 +1,12 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use flate2::read::GzDecoder;
+use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
 use regex::Regex;
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 use crate::db::{Database, LogEntry};
@@ -29,60 +33,121 @@ impl Fetcher {
         end: NaiveDate,
         log_types: &[&str],
         skip_fetched: bool,
+        concurrent: usize,
     ) -> Result<usize> {
-        let mut total_new = 0;
+        // Collect all dates to process
+        let mut dates_to_fetch = Vec::new();
         let mut current = start;
 
         while current <= end {
             let date_str = current.format("%Y%m%d").to_string();
-            let year = current.format("%Y").to_string();
 
             if skip_fetched && db.is_date_fetched(&date_str)? {
                 info!("Skipping already fetched date: {}", date_str);
-                current = current.succ_opt().unwrap();
-                continue;
+            } else {
+                dates_to_fetch.push(current);
             }
-
-            for log_type in log_types {
-                let url = format!(
-                    "{}/{}/{}{}.html.gz",
-                    TENHOU_BASE_URL, year, log_type, date_str
-                );
-
-                match self.fetch_log_ids_from_url(&url).await {
-                    Ok(entries) => {
-                        let mut new_count = 0;
-                        for entry in &entries {
-                            if db.insert_log_id(entry)? {
-                                new_count += 1;
-                            }
-                        }
-                        info!(
-                            "Fetched {} {} - {} total, {} new",
-                            log_type,
-                            date_str,
-                            entries.len(),
-                            new_count
-                        );
-                        total_new += new_count;
-                    }
-                    Err(e) => {
-                        warn!("Failed to fetch {} {}: {}", log_type, date_str, e);
-                    }
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
-            }
-
-            db.mark_date_fetched(&date_str)?;
             current = current.succ_opt().unwrap();
         }
 
-        Ok(total_new)
+        if dates_to_fetch.is_empty() {
+            info!("No dates to fetch");
+            return Ok(0);
+        }
+
+        info!(
+            "Fetching {} dates (concurrent: {})",
+            dates_to_fetch.len(),
+            concurrent
+        );
+
+        let pb = ProgressBar::new(dates_to_fetch.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                .progress_chars("#>-"),
+        );
+
+        let total_new = Arc::new(AtomicUsize::new(0));
+        let log_types: Vec<String> = log_types.iter().map(|s| s.to_string()).collect();
+
+        let results: Vec<_> = stream::iter(dates_to_fetch)
+            .map(|date| {
+                let client = self.client.clone();
+                let delay_ms = self.delay_ms;
+                let log_types = log_types.clone();
+                let total_new = Arc::clone(&total_new);
+                let pb = pb.clone();
+
+                async move {
+                    let date_str = date.format("%Y%m%d").to_string();
+                    let year = date.format("%Y").to_string();
+                    let mut entries_for_date = Vec::new();
+
+                    for log_type in &log_types {
+                        let url = format!(
+                            "{}/{}/{}{}.html.gz",
+                            TENHOU_BASE_URL, year, log_type, date_str
+                        );
+
+                        match Self::fetch_log_ids_from_url_static(&client, &url).await {
+                            Ok(entries) => {
+                                let count = entries.len();
+                                entries_for_date.extend(entries);
+                                info!(
+                                    "Fetched {} {} - {} entries",
+                                    log_type, date_str, count
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to fetch {} {}: {}", log_type, date_str, e);
+                            }
+                        }
+
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
+                    }
+
+                    pb.inc(1);
+                    (date_str, entries_for_date)
+                }
+            })
+            .buffer_unordered(concurrent)
+            .collect()
+            .await;
+
+        pb.finish_with_message("Done");
+
+        // Insert results into database (must be sequential for SQLite)
+        let mut total = 0;
+        for (date_str, entries) in results {
+            let mut new_count = 0;
+            for entry in &entries {
+                if db.insert_log_id(entry)? {
+                    new_count += 1;
+                }
+            }
+            if !entries.is_empty() {
+                info!(
+                    "Inserted {} - {} total, {} new",
+                    date_str,
+                    entries.len(),
+                    new_count
+                );
+            }
+            total += new_count;
+            db.mark_date_fetched(&date_str)?;
+        }
+
+        Ok(total)
     }
 
-    async fn fetch_log_ids_from_url(&self, url: &str) -> Result<Vec<LogEntry>> {
-        let response = self.client.get(url).send().await?;
+    async fn fetch_log_ids_from_url_static(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<Vec<LogEntry>> {
+        let response = client.get(url).send().await?;
 
         if !response.status().is_success() {
             anyhow::bail!("HTTP {}", response.status());
@@ -96,10 +161,10 @@ impl Fetcher {
             .read_to_string(&mut html)
             .context("Failed to decompress gzip")?;
 
-        self.parse_log_ids(&html)
+        Self::parse_log_ids_static(&html)
     }
 
-    fn parse_log_ids(&self, html: &str) -> Result<Vec<LogEntry>> {
+    fn parse_log_ids_static(html: &str) -> Result<Vec<LogEntry>> {
         // Pattern: log=2025010100gm-00a9-0000-d7141b66
         let log_id_re = Regex::new(r"log=(\d{10}gm-([0-9a-f]{4})-[0-9a-f]{4}-[0-9a-f]{8})")?;
 

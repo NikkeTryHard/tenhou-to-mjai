@@ -3,6 +3,7 @@ mod db;
 mod download;
 mod export;
 mod fetch;
+mod majsoul;
 mod package;
 
 use anyhow::Result;
@@ -43,6 +44,10 @@ enum Commands {
         #[arg(long, default_value = "200")]
         delay_ms: u64,
 
+        /// Number of concurrent date fetches (default: 1)
+        #[arg(short, long, default_value = "1")]
+        concurrent: usize,
+
         /// Skip already fetched dates
         #[arg(long, default_value = "true")]
         skip_fetched: bool,
@@ -57,6 +62,10 @@ enum Commands {
         /// Delay between requests in ms
         #[arg(long, default_value = "200")]
         delay_ms: u64,
+
+        /// Number of concurrent downloads (default: 1)
+        #[arg(short, long, default_value = "1")]
+        concurrent: usize,
     },
 
     /// Convert downloaded logs to MJAI format
@@ -102,6 +111,45 @@ enum Commands {
         #[arg(short, long)]
         output: PathBuf,
     },
+
+    /// Mahjong Soul (Majsoul) operations
+    #[command(subcommand)]
+    Majsoul(MajsoulCommands),
+}
+
+#[derive(Subcommand)]
+enum MajsoulCommands {
+    /// Search for a player by nickname
+    Search {
+        /// Player nickname to search
+        nickname: String,
+    },
+
+    /// Fetch game UUIDs for a player
+    Fetch {
+        /// Player ID from amae-koromo
+        #[arg(long)]
+        player_id: i64,
+
+        /// Room mode (16=Throne, 12=Jade, 9=Gold)
+        #[arg(long, default_value = "16")]
+        mode: i32,
+
+        /// Start date (YYYYMMDD)
+        #[arg(long)]
+        start: String,
+
+        /// End date (YYYYMMDD)
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Delay between requests in ms
+        #[arg(long, default_value = "300")]
+        delay_ms: u64,
+    },
+
+    /// Show Majsoul stats
+    Stats,
 }
 
 #[tokio::main]
@@ -122,6 +170,7 @@ async fn main() -> Result<()> {
             end,
             log_types,
             delay_ms,
+            concurrent,
             skip_fetched,
         } => {
             let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
@@ -134,15 +183,15 @@ async fn main() -> Result<()> {
 
             let fetcher = fetch::Fetcher::new(delay_ms)?;
             let new_count = fetcher
-                .fetch_date_range(&db, start_date, end_date, &log_types, skip_fetched)
+                .fetch_date_range(&db, start_date, end_date, &log_types, skip_fetched, concurrent)
                 .await?;
 
             info!("Fetched {} new log IDs", new_count);
         }
 
-        Commands::Download { limit, delay_ms } => {
+        Commands::Download { limit, delay_ms, concurrent } => {
             let downloader = download::Downloader::new(delay_ms)?;
-            let (success, failed) = downloader.download_logs(&db, limit).await?;
+            let (success, failed) = downloader.download_logs(&db, limit, concurrent).await?;
             info!("Downloaded {} logs ({} failed)", success, failed);
         }
 
@@ -171,6 +220,68 @@ async fn main() -> Result<()> {
             let count = package::package_directory(&input, &output)?;
             info!("Packaged {} files into {:?}", count, output);
         }
+
+        Commands::Majsoul(cmd) => match cmd {
+            MajsoulCommands::Search { nickname } => {
+                let client = majsoul::AmaeKoromoClient::new(300)?;
+                let results = client.search_player(&nickname).await?;
+                if results.is_empty() {
+                    println!("No players found for '{}'", nickname);
+                } else {
+                    for p in results {
+                        let level = p.level.map_or(0, |l| l.id);
+                        println!("{} (ID: {}, Level: {})", p.nickname, p.id, level);
+                    }
+                }
+            }
+            MajsoulCommands::Fetch {
+                player_id,
+                mode,
+                start,
+                end,
+                delay_ms,
+            } => {
+                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
+                let end_date = match end {
+                    Some(e) => NaiveDate::parse_from_str(&e, "%Y%m%d")?,
+                    None => chrono::Local::now().date_naive(),
+                };
+
+                let start_ms = start_date
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis();
+                let end_ms = end_date
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap()
+                    .and_utc()
+                    .timestamp_millis();
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let records = client.get_player_records(player_id, start_ms, end_ms, mode).await?;
+
+                info!("Found {} records", records.len());
+
+                let mut new_count = 0;
+                for r in &records {
+                    if db.insert_majsoul_log(&r.uuid, player_id, r.start_time, Some(r.mode_id))? {
+                        new_count += 1;
+                    }
+                }
+
+                info!("Stored {} new UUIDs in database", new_count);
+            }
+            MajsoulCommands::Stats => {
+                let (total, downloaded, converted) = db.count_majsoul_logs()?;
+                println!("Majsoul logs:");
+                println!("  Total UUIDs:      {}", total);
+                println!("  Downloaded:       {}", downloaded);
+                println!("  Converted:        {}", converted);
+                println!("  Pending download: {}", total - downloaded);
+                println!("  Pending convert:  {}", downloaded - converted);
+            }
+        },
     }
 
     Ok(())

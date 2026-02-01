@@ -45,6 +45,28 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_logs_downloaded ON logs(is_downloaded);
             CREATE INDEX IF NOT EXISTS idx_logs_converted ON logs(is_converted);
+
+            -- Majsoul tables
+            CREATE TABLE IF NOT EXISTS majsoul_players (
+                id INTEGER PRIMARY KEY,
+                nickname TEXT NOT NULL,
+                level_id INTEGER,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS majsoul_logs (
+                uuid TEXT PRIMARY KEY,
+                player_id INTEGER NOT NULL,
+                start_time INTEGER NOT NULL,
+                mode_id INTEGER,
+                is_downloaded INTEGER DEFAULT 0,
+                is_converted INTEGER DEFAULT 0,
+                raw_data BLOB,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_majsoul_logs_downloaded ON majsoul_logs(is_downloaded);
+            CREATE INDEX IF NOT EXISTS idx_majsoul_logs_converted ON majsoul_logs(is_converted);
             ",
         )?;
         Ok(())
@@ -72,7 +94,7 @@ impl Database {
         if let Some(n) = limit {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM logs WHERE is_downloaded = 0 ORDER BY id LIMIT ?1")?;
+                .prepare("SELECT id FROM logs WHERE is_downloaded <= 0 ORDER BY id LIMIT ?1")?;
             let rows = stmt.query_map([n], |row| row.get(0))?;
             for id in rows {
                 ids.push(id?);
@@ -80,7 +102,7 @@ impl Database {
         } else {
             let mut stmt = self
                 .conn
-                .prepare("SELECT id FROM logs WHERE is_downloaded = 0 ORDER BY id")?;
+                .prepare("SELECT id FROM logs WHERE is_downloaded <= 0 ORDER BY id")?;
             let rows = stmt.query_map([], |row| row.get(0))?;
             for id in rows {
                 ids.push(id?);
@@ -165,6 +187,46 @@ impl Database {
             |row| row.get(0),
         )?;
         Ok(count > 0)
+    }
+
+    // Majsoul methods
+    pub fn insert_majsoul_player(&self, id: i64, nickname: &str, level_id: Option<i32>) -> Result<bool> {
+        let result = self.conn.execute(
+            "INSERT OR IGNORE INTO majsoul_players (id, nickname, level_id) VALUES (?1, ?2, ?3)",
+            params![id, nickname, level_id],
+        )?;
+        Ok(result > 0)
+    }
+
+    pub fn insert_majsoul_log(
+        &self,
+        uuid: &str,
+        player_id: i64,
+        start_time: i64,
+        mode_id: Option<i32>,
+    ) -> Result<bool> {
+        let result = self.conn.execute(
+            "INSERT OR IGNORE INTO majsoul_logs (uuid, player_id, start_time, mode_id) VALUES (?1, ?2, ?3, ?4)",
+            params![uuid, player_id, start_time, mode_id],
+        )?;
+        Ok(result > 0)
+    }
+
+    pub fn count_majsoul_logs(&self) -> Result<(i64, i64, i64)> {
+        let total: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM majsoul_logs", [], |row| row.get(0))?;
+        let downloaded: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE is_downloaded = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let converted: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE is_converted = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, downloaded, converted))
     }
 
     pub fn count_logs(&self) -> Result<(i64, i64, i64)> {

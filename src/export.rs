@@ -1,9 +1,11 @@
 use anyhow::Result;
 use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 use crate::db::Database;
@@ -18,7 +20,7 @@ pub fn export_logs(db: &Database, output_dir: &Path, limit: Option<usize>) -> Re
 
     fs::create_dir_all(output_dir)?;
 
-    info!("Exporting {} logs", logs.len());
+    info!("Exporting {} logs (parallel)", logs.len());
 
     let pb = ProgressBar::new(logs.len() as u64);
     pb.set_style(
@@ -27,22 +29,24 @@ pub fn export_logs(db: &Database, output_dir: &Path, limit: Option<usize>) -> Re
             .progress_chars("#>-"),
     );
 
-    let mut success = 0;
-    let mut failed = 0;
+    let success = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
 
-    for (id, compressed_xml) in logs {
-        match export_single(&id, &compressed_xml, output_dir) {
-            Ok(_) => success += 1,
+    logs.par_iter().for_each(|(id, compressed_xml)| {
+        match export_single(id, compressed_xml, output_dir) {
+            Ok(_) => {
+                success.fetch_add(1, Ordering::Relaxed);
+            }
             Err(e) => {
                 warn!("Failed to export {}: {}", id, e);
-                failed += 1;
+                failed.fetch_add(1, Ordering::Relaxed);
             }
         }
         pb.inc(1);
-    }
+    });
 
     pb.finish_with_message("Done");
-    Ok((success, failed))
+    Ok((success.load(Ordering::Relaxed), failed.load(Ordering::Relaxed)))
 }
 
 fn export_single(id: &str, compressed_xml: &[u8], output_dir: &Path) -> Result<()> {

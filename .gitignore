@@ -1,2 +1,19 @@
 /target
 CLAUDE.md
+
+# Database files
+*.db
+
+# Output directories
+mjai/
+xml/
+
+# Packaged archives
+*.zip
+
+# Plans (local only)
+docs/plans/
+
+# Scripts (local dev helpers)
+scripts/
+*.sh

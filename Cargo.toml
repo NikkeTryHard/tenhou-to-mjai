@@ -20,6 +20,7 @@ regex = "1"
 chrono = "0.4"
 zip = "2"
 walkdir = "2"
+futures = "0.3"
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }

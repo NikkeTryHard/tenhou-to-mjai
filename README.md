@@ -13,6 +13,7 @@ It also includes preprocessed yearly datasets and Tenhou database files for AI r
 * [Release Structure](#release-structure)
 * [File Size Notes](#file-size-notes)
 * [Understanding the MJAI Format](#understanding-the-mjai-format)
+* [CLI Tool: tenhou-scraper](#cli-tool-tenhou-scraper)
 * [Preparing Your Own Dataset](#preparing-your-own-dataset)
 * [Licenses](#licenses)
 * [Attribution](#attribution)
@@ -123,6 +124,112 @@ Each JSON object has a `type` field that describes the game event. Here are some
     *   `{"type":"ryukyoku","reason":"fanpai", ...}`
 
 For a complete and authoritative reference, please see the original [MJAI Protocol Documentation (in Japanese)](https://gimite.net/pukiwiki/index.php?Mjai%20%E9%BA%BB%E9%9B%80AI%E5%AF%BE%E6%88%A6%E3%82%B5%E3%83%BC%E3%83%90).
+
+---
+
+## CLI Tool: tenhou-scraper
+
+This repository includes `tenhou-scraper`, a Rust CLI for fetching, downloading, converting, and packaging mahjong logs.
+
+### Installation
+
+```bash
+git clone https://github.com/NikkeTryHard/tenhou-to-mjai.git
+cd tenhou-to-mjai
+cargo build --release
+```
+
+The binary will be at `./target/release/tenhou-scraper`.
+
+### Commands
+
+#### `fetch` - Fetch log IDs from Tenhou
+
+Scrapes daily HTML.gz index files from Tenhou to collect game log IDs.
+
+```bash
+# Fetch all 2025 houou logs
+tenhou-scraper fetch --start 20250101 --end 20251231
+
+# Custom delay between requests (ms)
+tenhou-scraper fetch --start 20250101 --end 20250131 --delay-ms 500
+```
+
+#### `download` - Download XML content
+
+Downloads the actual game XML data for all pending logs.
+
+```bash
+# Download all pending logs
+tenhou-scraper download
+
+# Download with limit
+tenhou-scraper download --limit 1000
+
+# Custom delay (default: 200ms)
+tenhou-scraper download --delay-ms 300
+```
+
+#### `convert` - Convert to MJAI format
+
+Converts downloaded Tenhou XML logs to MJAI format (parallelized with rayon).
+
+```bash
+# Convert all downloaded logs
+tenhou-scraper convert --output mjai/
+
+# Convert with limit
+tenhou-scraper convert --output mjai/ --limit 100
+
+# Filter: only 4-player hanchan games
+tenhou-scraper convert --output mjai/ --players 4 --hanchan
+```
+
+#### `package` - Create zip archive
+
+Bundles converted MJAI files into a distributable zip archive.
+
+```bash
+tenhou-scraper package --input mjai/ --output houou-2025.zip
+```
+
+#### `export` - Export XML from database
+
+Exports raw XML content from the database to individual files.
+
+```bash
+tenhou-scraper export --output xml/ --limit 100
+```
+
+#### `stats` - Show database statistics
+
+```bash
+tenhou-scraper stats
+```
+
+### Database
+
+Default database: `tenhou.db` in current directory. Override with `-d`:
+
+```bash
+tenhou-scraper -d custom.db stats
+```
+
+### Full Pipeline Example
+
+```bash
+# 1. Fetch all log IDs for a year
+tenhou-scraper fetch --start 20250101 --end 20251231
+
+# 2. Download XML content (takes hours with rate limiting)
+tenhou-scraper download
+
+# 3. Convert to MJAI format
+tenhou-scraper convert --output mjai/ --players 4 --hanchan
+
+# 4. Package for distribution
+tenhou-scraper package --input mjai/ --output houou-2025.zip
+```
 
 ---
 
