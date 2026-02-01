@@ -136,7 +136,7 @@ Obtain [Tenhou logs](https://tenhou.net/sc/raw/) from official sources or your o
 
 ### 2. Convert XML to JSON (Intermediate Step)
 
-First, convert the raw Tenhou XML logs into an intermediate JSON format using a tool like [`mjlog2json`](https://github.com/d-mahjong/mjlog2json).
+First, convert the raw Tenhou XML logs into an intermediate JSON format using a tool like [`mjlog2json`](https://github.com/tsubakisakura/mjlog2json/).
 
 ```bash
 # This creates a directory of .json files from your .xml files

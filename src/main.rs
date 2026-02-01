@@ -1,6 +1,7 @@
 mod convert;
 mod db;
 mod download;
+mod export;
 mod fetch;
 
 use anyhow::Result;
@@ -70,6 +71,17 @@ enum Commands {
 
     /// Show database statistics
     Stats,
+
+    /// Export XML logs from database to files
+    Export {
+        /// Output directory for XML files
+        #[arg(short, long, default_value = "xml")]
+        output: PathBuf,
+
+        /// Maximum logs to export (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
 }
 
 #[tokio::main]
@@ -128,6 +140,11 @@ async fn main() -> Result<()> {
             println!("Converted:        {}", converted);
             println!("Pending download: {}", total - downloaded);
             println!("Pending convert:  {}", downloaded - converted);
+        }
+
+        Commands::Export { output, limit } => {
+            let (success, failed) = export::export_logs(&db, &output, limit)?;
+            info!("Exported {} logs ({} failed)", success, failed);
         }
     }
 
