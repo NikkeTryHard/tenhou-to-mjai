@@ -71,4 +71,41 @@ impl AmaeKoromoClient {
 
         Ok(records)
     }
+
+    /// Fetch recent records from a specific room (no player ID required)
+    pub async fn get_room_records(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        mode: i32,
+        limit: u32,
+    ) -> Result<Vec<GameRecord>> {
+        let url = format!(
+            "{}/games/{}/{}?mode={}&limit={}",
+            DATA_BASE, start_ms, end_ms, mode, limit
+        );
+
+        info!("Fetching room records (mode {}, limit {})", mode, limit);
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch room records")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("HTTP {}: {}", status, body);
+        }
+
+        let records: Vec<GameRecord> = resp.json().await?;
+
+        if self.delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+        }
+
+        Ok(records)
+    }
 }

@@ -1,8 +1,26 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::info;
 
-const MS_HOST: &str = "https://game.maj-soul.com";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Get base URL for server
+pub fn server_base_url(server: &str) -> &'static str {
+    match server {
+        "cn" => "https://game.maj-soul.com",
+        "en" | "jp" => "https://mahjongsoul.game.yo-star.com",
+        _ => "https://mahjongsoul.game.yo-star.com",
+    }
+}
+
+/// Get path prefix for server (CN uses /1/, EN doesn't)
+fn server_path_prefix(server: &str) -> &'static str {
+    match server {
+        "cn" => "/1",
+        _ => "",
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct VersionInfo {
@@ -10,13 +28,14 @@ pub struct VersionInfo {
 }
 
 #[derive(Debug, Deserialize)]
-struct RegionUrl {
+struct Gateway {
     url: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct IpEntry {
-    region_urls: Vec<RegionUrl>,
+    #[serde(default)]
+    gateways: Vec<Gateway>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -24,57 +43,55 @@ struct Config {
     ip: Vec<IpEntry>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServerList {
-    servers: Vec<String>,
-}
-
-pub async fn discover_gateway(client: &reqwest::Client) -> Result<(String, String)> {
+pub async fn discover_gateway(client: &reqwest::Client, server: &str) -> Result<(String, String)> {
+    let ms_host = server_base_url(server);
+    let prefix = server_path_prefix(server);
+    info!("Using {} server: {}", server, ms_host);
     // Step 1: Get version
-    let version_url = format!("{}/1/version.json", MS_HOST);
-    let version_info: VersionInfo = client
-        .get(&version_url)
-        .send()
-        .await?
-        .json()
-        .await
-        .context("Failed to parse version.json")?;
+    let version_url = format!("{}{}/version.json", ms_host, prefix);
+    let version_info: VersionInfo = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        client
+            .get(&version_url)
+            .send()
+            .await?
+            .json()
+            .await
+            .context("Failed to parse version.json")
+    })
+    .await
+    .context("Timeout fetching version.json")??;
 
     let version = &version_info.version;
     let version_clean = version.replace(".w", "");
     info!("Majsoul version: {}", version);
 
     // Step 2: Get config
-    let config_url = format!("{}/1/v{}/config.json", MS_HOST, version);
-    let config: Config = client
-        .get(&config_url)
-        .send()
-        .await?
-        .json()
-        .await
-        .context("Failed to parse config.json")?;
+    let config_url = format!("{}{}/v{}/config.json", ms_host, prefix, version);
+    let config: Config = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        client
+            .get(&config_url)
+            .send()
+            .await?
+            .json()
+            .await
+            .context("Failed to parse config.json")
+    })
+    .await
+    .context("Timeout fetching config.json")??;
 
-    let region_url = config
+    // New format: gateways contains direct server URLs
+    let gateway = config
         .ip
         .first()
-        .and_then(|ip| ip.region_urls.get(1).or(ip.region_urls.first()))
-        .map(|r| &r.url)
-        .context("No region URL found in config")?;
+        .and_then(|ip| ip.gateways.first())
+        .context("No gateway found in config")?;
 
-    // Step 3: Get server list
-    let servers_url = format!("{}?service=ws-gateway&protocol=ws&ssl=true", region_url);
-    let server_list: ServerList = client
-        .get(&servers_url)
-        .send()
-        .await?
-        .json()
-        .await
-        .context("Failed to parse server list")?;
-
-    let server = server_list
-        .servers
-        .first()
-        .context("No servers available")?;
+    // Gateway URL is like "https://route-2.maj-soul.com"
+    // Strip protocol and use directly as WebSocket server
+    let server = gateway
+        .url
+        .replace("https://", "")
+        .replace("http://", "");
 
     let endpoint = format!("wss://{}/gateway", server);
     info!("Discovered gateway: {}", endpoint);
