@@ -69,6 +69,16 @@ impl Database {
 
             CREATE INDEX IF NOT EXISTS idx_majsoul_logs_downloaded ON majsoul_logs(is_downloaded);
             CREATE INDEX IF NOT EXISTS idx_majsoul_logs_converted ON majsoul_logs(is_converted);
+            CREATE INDEX IF NOT EXISTS idx_majsoul_logs_mode_id ON majsoul_logs(mode_id);
+
+            -- Majsoul room fetch state tracking
+            CREATE TABLE IF NOT EXISTS majsoul_room_fetch_state (
+                date TEXT NOT NULL,
+                mode_id INTEGER NOT NULL,
+                fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                record_count INTEGER DEFAULT 0,
+                PRIMARY KEY (date, mode_id)
+            );
             ",
         )?;
 
@@ -330,5 +340,63 @@ impl Database {
             params![uuid],
         )?;
         Ok(())
+    }
+
+    // Majsoul room fetch state methods
+
+    /// Check if a specific date and mode has been fetched
+    pub fn is_majsoul_room_fetched(&self, date: &str, mode_id: i32) -> Result<bool> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_room_fetch_state WHERE date = ?1 AND mode_id = ?2",
+            params![date, mode_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Mark a date and mode as fetched
+    pub fn mark_majsoul_room_fetched(&self, date: &str, mode_id: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO majsoul_room_fetch_state (date, mode_id, fetched_at)
+             VALUES (?1, ?2, datetime('now'))",
+            params![date, mode_id],
+        )?;
+        Ok(())
+    }
+
+    /// Mark a date and mode as fetched with record count
+    pub fn mark_majsoul_room_fetched_with_count(&self, date: &str, mode_id: i32, count: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO majsoul_room_fetch_state (date, mode_id, fetched_at, record_count)
+             VALUES (?1, ?2, datetime('now'), ?3)",
+            params![date, mode_id, count],
+        )?;
+        Ok(())
+    }
+
+    /// Count Majsoul logs grouped by mode
+    pub fn count_majsoul_logs_by_mode(&self) -> Result<Vec<(i32, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT mode_id, COUNT(*) FROM majsoul_logs WHERE mode_id IS NOT NULL GROUP BY mode_id ORDER BY mode_id"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Count days fetched per mode
+    pub fn count_majsoul_room_fetch_days(&self) -> Result<Vec<(i32, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT mode_id, COUNT(*) FROM majsoul_room_fetch_state GROUP BY mode_id"
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
     }
 }
