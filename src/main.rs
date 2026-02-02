@@ -208,6 +208,29 @@ enum MajsoulCommands {
         #[arg(long)]
         hanchan: bool,
     },
+
+    /// Fetch game UUIDs from ranked rooms (no player ID needed)
+    FetchRoom {
+        /// Room type: throne (16), jade (12), gold (9)
+        #[arg(long, default_value = "throne")]
+        room: String,
+
+        /// Start date (YYYYMMDD)
+        #[arg(long)]
+        start: String,
+
+        /// End date (YYYYMMDD), defaults to today
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "1000")]
+        delay_ms: u64,
+
+        /// Skip dates already fetched
+        #[arg(long, default_value = "true")]
+        skip_fetched: bool,
+    },
 }
 
 #[tokio::main]
@@ -340,6 +363,30 @@ async fn main() -> Result<()> {
                 println!("  Converted:        {}", converted);
                 println!("  Pending download: {}", total - downloaded);
                 println!("  Pending convert:  {}", downloaded - converted);
+
+                println!("\nBy room:");
+                let by_mode = db.count_majsoul_logs_by_mode()?;
+                for (mode_id, count) in by_mode {
+                    let room_name = match mode_id {
+                        16 => "Throne",
+                        12 => "Jade",
+                        9 => "Gold",
+                        _ => "Other",
+                    };
+                    println!("  {} (mode {}): {}", room_name, mode_id, count);
+                }
+
+                println!("\nRoom fetch progress (days):");
+                let fetch_days = db.count_majsoul_room_fetch_days()?;
+                for (mode_id, days) in fetch_days {
+                    let room_name = match mode_id {
+                        16 => "Throne",
+                        12 => "Jade",
+                        9 => "Gold",
+                        _ => "Other",
+                    };
+                    println!("  {} (mode {}): {} days", room_name, mode_id, days);
+                }
             }
             MajsoulCommands::Auth { force, server } => {
                 use crate::majsoul::browser::{capture_token_interactive, CachedToken};
@@ -449,6 +496,87 @@ async fn main() -> Result<()> {
                 let converter = majsoul::MajsoulConverter::new(&output)?;
                 let (success, failed) = converter.convert_logs(&db, limit, players, hanchan)?;
                 info!("Converted {} Majsoul logs ({} failed)", success, failed);
+            }
+            MajsoulCommands::FetchRoom {
+                room,
+                start,
+                end,
+                delay_ms,
+                skip_fetched,
+            } => {
+                let mode_id: i32 = match room.to_lowercase().as_str() {
+                    "throne" => 16,
+                    "jade" => 12,
+                    "gold" => 9,
+                    _ => anyhow::bail!(
+                        "Invalid room: {}. Use: throne, jade, gold",
+                        room
+                    ),
+                };
+
+                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
+                let end_date = match end {
+                    Some(e) => NaiveDate::parse_from_str(&e, "%Y%m%d")?,
+                    None => chrono::Local::now().date_naive(),
+                };
+
+                info!(
+                    "Fetching {} room games from {} to {}",
+                    room,
+                    start_date.format("%Y-%m-%d"),
+                    end_date.format("%Y-%m-%d")
+                );
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let mut total_new = 0;
+                let mut current_date = start_date;
+
+                while current_date <= end_date {
+                    let date_str = current_date.format("%Y-%m-%d").to_string();
+
+                    if skip_fetched && db.is_majsoul_room_fetched(&date_str, mode_id)? {
+                        info!("Skipping {} (already fetched)", date_str);
+                        current_date += chrono::Duration::days(1);
+                        continue;
+                    }
+
+                    let start_ms = current_date
+                        .and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp_millis();
+                    let end_ms = current_date
+                        .and_hms_opt(23, 59, 59)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp_millis();
+
+                    match client.get_room_records(start_ms, end_ms, mode_id, 1000).await {
+                        Ok(records) => {
+                            let mut new_count = 0;
+                            for r in &records {
+                                if db.insert_majsoul_log(&r.uuid, 0, r.start_time, Some(r.mode_id))? {
+                                    new_count += 1;
+                                }
+                            }
+                            info!(
+                                "{}: {} records ({} new)",
+                                date_str,
+                                records.len(),
+                                new_count
+                            );
+                            total_new += new_count;
+                            db.mark_majsoul_room_fetched_with_count(&date_str, mode_id, records.len() as i32)?;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch {}: {}", date_str, e);
+                        }
+                    }
+
+                    current_date += chrono::Duration::days(1);
+                }
+
+                info!("Total new UUIDs stored: {}", total_new);
             }
         },
     }
