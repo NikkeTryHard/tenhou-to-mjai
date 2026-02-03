@@ -1,0 +1,13 @@
+[project]
+name = "tensoul-download"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "tensoul",
+    "ujson>=5.11.0",
+]
+
+[tool.uv.sources]
+tensoul = { git = "https://github.com/unStatiK/tensoul-py-ng.git" }
