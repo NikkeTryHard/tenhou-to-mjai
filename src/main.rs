@@ -1045,8 +1045,10 @@ async fn main() -> Result<()> {
                 use crate::majsoul::browser::CachedToken;
                 use crate::majsoul::gateway::discover_gateway;
                 use crate::majsoul::rpc::{MajsoulRpc, extract_full_uuid_from_record};
-                use tokio::sync::Semaphore;
+                use futures::stream::{self, StreamExt};
                 use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use tokio::sync::Mutex;
 
                 // Load cached token
                 let cached = match CachedToken::load()? {
@@ -1076,51 +1078,77 @@ async fn main() -> Result<()> {
                 rpc.login(&cached.access_token, &version, &server).await?;
                 info!("Logged in successfully\n");
 
-                let semaphore = Arc::new(Semaphore::new(concurrent));
-                let mut resolved = 0usize;
-                let mut failed = 0usize;
+                // Wrap RPC and DB in Arc for sharing across concurrent tasks
+                let rpc = Arc::new(rpc);
+                let db = Arc::new(Mutex::new(db));
+                let resolved = Arc::new(AtomicUsize::new(0));
+                let failed = Arc::new(AtomicUsize::new(0));
+                let processed = Arc::new(AtomicUsize::new(0));
                 let total = orphans.len();
 
-                for (i, short_uuid) in orphans.iter().enumerate() {
-                    let _permit = semaphore.acquire().await?;
+                // Process orphans with true parallelism using buffer_unordered
+                stream::iter(orphans.into_iter().enumerate())
+                    .map(|(i, short_uuid)| {
+                        let rpc = Arc::clone(&rpc);
+                        let db = Arc::clone(&db);
+                        let resolved = Arc::clone(&resolved);
+                        let failed = Arc::clone(&failed);
+                        let processed = Arc::clone(&processed);
 
-                    match rpc.fetch_game_record(short_uuid).await {
-                        Ok(data) => {
-                            match extract_full_uuid_from_record(&data) {
-                                Ok(full_uuid) => {
-                                    if db.set_orphan_full_uuid(short_uuid, &full_uuid)? {
-                                        resolved += 1;
+                        async move {
+                            // Optional delay between batches
+                            if delay_ms > 0 && i > 0 && i % concurrent == 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+
+                            match rpc.fetch_game_record(&short_uuid).await {
+                                Ok(data) => {
+                                    match extract_full_uuid_from_record(&data) {
+                                        Ok(full_uuid) => {
+                                            let db_guard = db.lock().await;
+                                            if db_guard.set_orphan_full_uuid(&short_uuid, &full_uuid).unwrap_or(false) {
+                                                resolved.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to parse {}: {}", short_uuid, e);
+                                            failed.fetch_add(1, Ordering::Relaxed);
+                                        }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Failed to parse {}: {}", short_uuid, e);
-                                    failed += 1;
+                                    tracing::warn!("RPC failed for {}: {}", short_uuid, e);
+                                    failed.fetch_add(1, Ordering::Relaxed);
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!("RPC failed for {}: {}", short_uuid, e);
-                            failed += 1;
-                        }
-                    }
 
-                    if (i + 1) % 100 == 0 || i + 1 == total {
-                        let remaining = db.count_orphaned_games()?;
-                        info!(
-                            "Progress: {}/{} | Resolved: {} | Failed: {} | Remaining: {}",
-                            i + 1, total, resolved, failed, remaining
-                        );
-                    }
+                            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if current % 100 == 0 || current == total {
+                                let db_guard = db.lock().await;
+                                let remaining = db_guard.count_orphaned_games().unwrap_or(0);
+                                info!(
+                                    "Progress: {}/{} | Resolved: {} | Failed: {} | Remaining: {}",
+                                    current, total,
+                                    resolved.load(Ordering::Relaxed),
+                                    failed.load(Ordering::Relaxed),
+                                    remaining
+                                );
+                            }
+                        }
+                    })
+                    .buffer_unordered(concurrent)
+                    .collect::<Vec<()>>()
+                    .await;
 
-                    if delay_ms > 0 && (i + 1) % concurrent == 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    }
-                }
+                let final_resolved = resolved.load(Ordering::Relaxed);
+                let final_failed = failed.load(Ordering::Relaxed);
+                let db_guard = db.lock().await;
+                let remaining = db_guard.count_orphaned_games()?;
 
                 info!("\n=== RESOLUTION COMPLETE ===");
-                info!("Resolved: {}", resolved);
-                info!("Failed: {}", failed);
-                info!("Remaining orphans: {}", db.count_orphaned_games()?);
+                info!("Resolved: {}", final_resolved);
+                info!("Failed: {}", final_failed);
+                info!("Remaining orphans: {}", remaining);
             }
             MajsoulCommands::ScrapeAll { rps, start } => {
                 use std::sync::Arc;
