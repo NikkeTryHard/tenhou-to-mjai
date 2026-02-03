@@ -108,4 +108,91 @@ impl AmaeKoromoClient {
 
         Ok(records)
     }
+
+    /// Fetch all records for a player (all modes, no time filter)
+    pub async fn get_player_all_records(&self, player_id: i64) -> Result<Vec<GameRecord>> {
+        // Use a very wide time range to get all records
+        let start_ms: i64 = 0;
+        let end_ms: i64 = chrono::Utc::now().timestamp_millis();
+
+        let url = format!(
+            "{}/player_records/{}/{}/{}",
+            DATA_BASE, player_id, start_ms, end_ms
+        );
+
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to fetch player records")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            anyhow::bail!("HTTP {} for player {}", status, player_id);
+        }
+
+        let records: Vec<GameRecord> = resp.json().await?;
+        Ok(records)
+    }
+
+    /// Fetch ALL records for a player with pagination (handles 200 game limit)
+    /// Returns (all_records, num_api_calls)
+    pub async fn get_player_records_paginated(
+        &self,
+        player_id: i64,
+        mode: i32,
+    ) -> Result<(Vec<GameRecord>, u32)> {
+        let mut all_records = Vec::new();
+        let mut end_ms: i64 = chrono::Utc::now().timestamp_millis();
+        let start_ms: i64 = 0; // Beginning of time
+        let mut api_calls = 0u32;
+
+        loop {
+            let url = format!(
+                "{}/player_records/{}/{}/{}?mode={}",
+                DATA_BASE, player_id, start_ms, end_ms, mode
+            );
+
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .context("Failed to fetch player records")?;
+
+            api_calls += 1;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                anyhow::bail!("HTTP {} for player {}", status, player_id);
+            }
+
+            let records: Vec<GameRecord> = resp.json().await?;
+            let batch_size = records.len();
+
+            if records.is_empty() {
+                break;
+            }
+
+            // Find oldest game's start_time for next pagination
+            let oldest_start_time = records.iter().map(|r| r.start_time).min().unwrap_or(0);
+
+            all_records.extend(records);
+
+            // If we got fewer than 200, we've reached the end
+            if batch_size < 200 {
+                break;
+            }
+
+            // Set end_ms to oldest game's start_time - 1ms for next batch
+            end_ms = oldest_start_time - 1;
+
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+        }
+
+        Ok((all_records, api_calls))
+    }
 }
