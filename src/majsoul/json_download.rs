@@ -9,7 +9,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use tracing::{info, warn};
 
-use super::browser::CachedToken;
 use super::gateway::discover_gateway;
 use super::rpc::MajsoulRpc;
 use super::to_tenhou::convert_to_tenhou;
@@ -21,8 +20,8 @@ use crate::db::Database;
 /// * `db` - Database containing game UUIDs to download
 /// * `output_dir` - Directory to save JSON files
 /// * `limit` - Maximum number of games to download
-/// * `username` - Optional username for native login
-/// * `password` - Optional password for native login
+/// * `username` - Username for native login (required)
+/// * `password` - Password for native login (required)
 /// * `delay_ms` - Delay between requests in milliseconds
 /// * `server` - Server region (en, jp)
 ///
@@ -32,8 +31,8 @@ pub async fn download_as_json(
     db: &Database,
     output_dir: &Path,
     limit: Option<usize>,
-    username: Option<&str>,
-    password: Option<&str>,
+    username: &str,
+    password: &str,
     delay_ms: u64,
     server: &str,
 ) -> Result<(usize, usize)> {
@@ -48,35 +47,14 @@ pub async fn download_as_json(
     }
 
     info!("Found {} games to download", uuids.len());
-
-    // Get authentication token
-    let access_token = if let (Some(user), Some(pass)) = (username, password) {
-        info!("Using native login for {}", user);
-        // For native login, we'll connect and login inline
-        // Return empty string to signal native login mode
-        format!("native:{}:{}", user, pass)
-    } else {
-        // Try to load cached token
-        match CachedToken::load()? {
-            Some(cached) => {
-                info!("Using cached token (server: {})", cached.server);
-                cached.access_token
-            }
-            None => {
-                anyhow::bail!(
-                    "No credentials provided and no cached token found.\n\
-                     Run `majsoul auth` first, or provide --username and --password"
-                );
-            }
-        }
-    };
+    info!("Using native login for {}", username);
 
     // Connect to Majsoul gateway
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
         .build()?;
 
-    let (endpoint, version) = {
+    let (endpoint, version, route_id) = {
         let mut attempts = 0;
         loop {
             match discover_gateway(&client, server).await {
@@ -107,17 +85,8 @@ pub async fn download_as_json(
         }
     };
 
-    // Login based on auth mode
-    if access_token.starts_with("native:") {
-        let parts: Vec<&str> = access_token.splitn(3, ':').collect();
-        if parts.len() == 3 {
-            rpc.login_native(parts[1], parts[2], &version).await?;
-        } else {
-            anyhow::bail!("Invalid native login format");
-        }
-    } else {
-        rpc.login(&access_token, &version, server).await?;
-    }
+    // Login with native credentials
+    rpc.login_native(username, password, &version, &route_id).await?;
 
     info!("Downloading {} game records to {:?}", uuids.len(), output_dir);
 

@@ -12,7 +12,6 @@ pub mod rpc;
 pub mod tenhou_format;
 pub mod tiles;
 pub mod to_tenhou;
-pub mod token_pool;
 pub mod types;
 
 pub use api::AmaeKoromoClient;
@@ -21,5 +20,5 @@ pub use download::MajsoulDownloader;
 pub use parallel_download::{ParallelDownloader, WorkDistributor};
 pub use tenhou_format::{PlayerMapping, TenhouLog, TenhouRule, TensoulOutput};
 pub use to_tenhou::{convert_to_tenhou, get_dan_name, get_room_name, majsoul_tile_to_tenhou};
-pub use token_pool::{AccountToken, TokenPool};
 pub use types::{GameRecord, PlayerSearchResult};
+

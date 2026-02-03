@@ -1,12 +1,11 @@
 use anyhow::Result;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::gateway::discover_gateway;
 use super::rpc::MajsoulRpc;
-use super::token_pool::{AccountToken, TokenPool};
 use crate::db::Database;
 
 /// Gateway info discovered once and shared across workers.
@@ -14,6 +13,7 @@ use crate::db::Database;
 struct GatewayInfo {
     endpoint: String,
     version: String,
+    route_id: String,
 }
 
 /// Distributes work across multiple workers.
@@ -39,17 +39,17 @@ impl WorkDistributor {
     }
 }
 
-/// Parallel downloader that uses multiple tokens from a pool.
+/// Downloader that uses native login (username/password).
 pub struct ParallelDownloader {
     delay_ms: u64,
     restart_every: usize,
 }
 
 impl ParallelDownloader {
-    /// Create a new parallel downloader.
+    /// Create a new downloader.
     ///
     /// # Arguments
-    /// * `delay_ms` - Delay between requests per worker (in milliseconds)
+    /// * `delay_ms` - Delay between requests (in milliseconds)
     /// * `restart_every` - Restart RPC connection every N records (0 = never restart)
     pub fn new(delay_ms: u64, restart_every: usize) -> Self {
         Self {
@@ -58,15 +58,15 @@ impl ParallelDownloader {
         }
     }
 
-    /// Download logs using a pool of tokens in parallel.
+    /// Download logs using native login (username/password).
     ///
-    /// Each worker gets its own token and processes a chunk of UUIDs.
-    /// Gateway is discovered once and shared across all workers.
     /// Returns (success_count, failed_count).
-    pub async fn download_with_pool(
+    pub async fn download_with_credentials(
         &self,
         db: Arc<Mutex<Database>>,
-        pool: &TokenPool,
+        username: &str,
+        password: &str,
+        server: &str,
         limit: Option<usize>,
     ) -> Result<(usize, usize)> {
         // Get UUIDs to download
@@ -80,127 +80,51 @@ impl ParallelDownloader {
             return Ok((0, 0));
         }
 
-        let num_workers = pool.len();
-        if num_workers == 0 {
-            anyhow::bail!("Token pool is empty");
-        }
+        info!("Downloading {} game records", uuids.len());
 
-        info!(
-            "Downloading {} game records with {} workers",
-            uuids.len(),
-            num_workers
-        );
-
-        // Discover gateway once before spawning workers (fix #1)
+        // Discover gateway
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
             .build()?;
 
-        // Use first token's server for gateway discovery
-        let first_token = pool.next();
-        let (endpoint, version) = discover_gateway_with_retry(&client, &first_token.server).await?;
-        let gateway = GatewayInfo { endpoint, version };
+        let (endpoint, version, route_id) = discover_gateway_with_retry(&client, server).await?;
+        let gateway = GatewayInfo { endpoint, version, route_id };
         info!("Discovered gateway: {} (version {})", gateway.endpoint, gateway.version);
 
-        // Distribute work (fix #4: takes Vec by value)
-        let chunks = WorkDistributor::chunk_work(uuids, num_workers);
+        // Connect and login
+        let rpc = connect_and_login_native(&gateway, username, password).await?;
 
-        // Set up progress bars
-        let multi_progress = MultiProgress::new();
-        let style = ProgressStyle::default_bar()
-            .template("{prefix:.bold.dim} [{bar:30.cyan/blue}] {pos}/{len} ({eta})")?
-            .progress_chars("##-");
-
-        // Spawn workers
-        let mut handles = Vec::new();
-
-        for (worker_id, chunk) in chunks.into_iter().enumerate() {
-            if chunk.is_empty() {
-                continue;
-            }
-
-            let token = pool.next();
-            let db_clone = Arc::clone(&db);
-            let delay_ms = self.delay_ms;
-            let restart_every = self.restart_every;
-            let gateway_clone = gateway.clone();
-
-            let pb = multi_progress.add(ProgressBar::new(chunk.len() as u64));
-            pb.set_style(style.clone());
-            pb.set_prefix(format!("Worker {}", worker_id));
-
-            let handle = tokio::spawn(async move {
-                Self::worker_loop(worker_id, token, chunk, db_clone, delay_ms, restart_every, pb, gateway_clone)
-                    .await
-            });
-
-            handles.push(handle);
-        }
-
-        // Wait for all workers to complete
-        let mut total_success = 0;
-        let mut total_failed = 0;
-
-        for handle in handles {
-            match handle.await {
-                Ok(Ok((success, failed))) => {
-                    total_success += success;
-                    total_failed += failed;
-                }
-                Ok(Err(e)) => {
-                    warn!("Worker failed: {}", e);
-                    total_failed += 1;
-                }
-                Err(e) => {
-                    warn!("Worker panicked: {}", e);
-                    total_failed += 1;
-                }
-            }
-        }
-
-        Ok((total_success, total_failed))
-    }
-
-    /// Worker loop that processes a chunk of UUIDs.
-    /// Uses pre-discovered gateway info but can re-discover on version mismatch (error 151).
-    async fn worker_loop(
-        worker_id: usize,
-        token: AccountToken,
-        uuids: Vec<String>,
-        db: Arc<Mutex<Database>>,
-        delay_ms: u64,
-        restart_every: usize,
-        pb: ProgressBar,
-        mut gateway: GatewayInfo,
-    ) -> Result<(usize, usize)> {
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-            .build()?;
+        // Set up progress bar
+        let pb = ProgressBar::new(uuids.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
+                .progress_chars("#>-"),
+        );
 
         let mut success = 0;
         let mut failed = 0;
         let mut processed_since_restart = 0;
-
-        // Initial connection using pre-discovered gateway
-        let mut rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
+        let mut current_rpc = rpc;
+        let mut current_gateway = gateway;
 
         for uuid in uuids {
             // Check if we need to restart connection
-            if restart_every > 0 && processed_since_restart >= restart_every {
-                info!("Worker {}: Restarting connection", worker_id);
-                let _ = rpc.close().await;
-                rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
+            if self.restart_every > 0 && processed_since_restart >= self.restart_every {
+                info!("Restarting connection after {} records", processed_since_restart);
+                let _ = current_rpc.close().await;
+                current_rpc = connect_and_login_native(&current_gateway, username, password).await?;
                 processed_since_restart = 0;
             }
 
-            // Use Database::normalize_uuid instead of duplicating logic (fix #3)
+            // Use Database::normalize_uuid for consistent key
             let short_uuid = Database::normalize_uuid(&uuid).to_string();
 
-            match rpc.fetch_game_record(&uuid).await {
+            match current_rpc.fetch_game_record(&uuid).await {
                 Ok(data) => {
                     let db_guard = db.lock().await;
                     if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
-                        warn!("Worker {}: Failed to save {}: {}", worker_id, uuid, e);
+                        warn!("Failed to save {}: {}", uuid, e);
                         failed += 1;
                     } else {
                         success += 1;
@@ -208,56 +132,52 @@ impl ParallelDownloader {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    warn!("Worker {}: Failed to fetch {}: {}", worker_id, uuid, err_str);
+                    warn!("Failed to fetch {}: {}", uuid, err_str);
 
                     if err_str.contains("151") {
-                        // Error 151 = version mismatch - re-discover gateway for fresh version (fix #2)
-                        warn!("Worker {}: Version mismatch (error 151), re-discovering gateway", worker_id);
+                        // Error 151 = version mismatch - re-discover gateway
+                        warn!("Version mismatch (error 151), re-discovering gateway");
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
                         // Re-discover gateway to get fresh version
-                        let (new_endpoint, new_version) = discover_gateway_with_retry(&client, &token.server).await?;
-                        gateway = GatewayInfo {
+                        let (new_endpoint, new_version, new_route_id) =
+                            discover_gateway_with_retry(&client, server).await?;
+                        current_gateway = GatewayInfo {
                             endpoint: new_endpoint,
                             version: new_version,
+                            route_id: new_route_id,
                         };
-                        info!("Worker {}: Re-discovered gateway version {}", worker_id, gateway.version);
+                        info!("Re-discovered gateway version {}", current_gateway.version);
 
                         // Reconnect with new gateway info
-                        let _ = rpc.close().await;
-                        rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
+                        let _ = current_rpc.close().await;
+                        current_rpc = connect_and_login_native(&current_gateway, username, password).await?;
                         processed_since_restart = 0;
 
                         // Retry this UUID
-                        match rpc.fetch_game_record(&uuid).await {
+                        match current_rpc.fetch_game_record(&uuid).await {
                             Ok(data) => {
                                 let db_guard = db.lock().await;
-                                if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data)
-                                {
-                                    warn!("Worker {}: Failed to save {}: {}", worker_id, uuid, e);
+                                if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
+                                    warn!("Failed to save {}: {}", uuid, e);
                                     failed += 1;
                                 } else {
                                     success += 1;
                                 }
                             }
                             Err(e) => {
-                                warn!(
-                                    "Worker {}: Failed to fetch {} after retry: {}",
-                                    worker_id, uuid, e
-                                );
+                                warn!("Failed to fetch {} after retry: {}", uuid, e);
                                 let db_guard = db.lock().await;
-                                // Log warning on DB error instead of silently ignoring (fix #5)
                                 if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
-                                    warn!("Worker {}: Failed to mark error for {}: {}", worker_id, uuid, db_err);
+                                    warn!("Failed to mark error for {}: {}", uuid, db_err);
                                 }
                                 failed += 1;
                             }
                         }
                     } else {
                         let db_guard = db.lock().await;
-                        // Log warning on DB error instead of silently ignoring (fix #5)
                         if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
-                            warn!("Worker {}: Failed to mark error for {}: {}", worker_id, uuid, db_err);
+                            warn!("Failed to mark error for {}: {}", uuid, db_err);
                         }
                         failed += 1;
                     }
@@ -267,13 +187,13 @@ impl ParallelDownloader {
             processed_since_restart += 1;
             pb.inc(1);
 
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
             }
         }
 
-        pb.finish();
-        let _ = rpc.close().await;
+        pb.finish_with_message("Done");
+        let _ = current_rpc.close().await;
 
         Ok((success, failed))
     }
@@ -283,7 +203,7 @@ impl ParallelDownloader {
 async fn discover_gateway_with_retry(
     client: &reqwest::Client,
     server: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     let mut attempts = 0;
     loop {
         match discover_gateway(client, server).await {
@@ -298,19 +218,17 @@ async fn discover_gateway_with_retry(
     }
 }
 
-/// Connect to gateway and login with token.
-async fn connect_and_login(
-    endpoint: &str,
-    token: &AccountToken,
-    version: &str,
+/// Connect to gateway and login with native credentials.
+async fn connect_and_login_native(
+    gateway: &GatewayInfo,
+    username: &str,
+    password: &str,
 ) -> Result<MajsoulRpc> {
     let mut attempts = 0;
     loop {
-        match MajsoulRpc::connect(endpoint).await {
+        match MajsoulRpc::connect(&gateway.endpoint).await {
             Ok(rpc) => {
-                // Format token as "token-uid" for login
-                let login_token = format!("{}-{}", token.token, token.uid);
-                rpc.login(&login_token, version, &token.server).await?;
+                rpc.login_native(username, password, &gateway.version, &gateway.route_id).await?;
                 return Ok(rpc);
             }
             Err(e) if attempts < 3 => {
