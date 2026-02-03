@@ -361,6 +361,21 @@ enum MajsoulCommands {
         #[arg(long, default_value = "en")]
         server: String,
     },
+
+    /// Phase 1: Fetch all player IDs by day (fast, parallel-safe)
+    FetchDays {
+        /// Start date (YYYYMMDD)
+        #[arg(long)]
+        start: String,
+
+        /// End date (YYYYMMDD), defaults to yesterday
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "100")]
+        delay_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -1478,6 +1493,85 @@ async fn main() -> Result<()> {
                 }
 
                 info!("Resolved {} phantom UUIDs", resolved);
+            }
+            MajsoulCommands::FetchDays { start, end, delay_ms } => {
+                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
+                let end_date = match end {
+                    Some(e) => NaiveDate::parse_from_str(&e, "%Y%m%d")?,
+                    None => chrono::Local::now().date_naive() - chrono::Duration::days(1),
+                };
+
+                info!("=== PHASE 1: Fetch Days ===");
+                info!("Range: {} to {}", start_date, end_date);
+
+                let unfetched_days = db.get_unfetched_days(
+                    &start_date.format("%Y%m%d").to_string(),
+                    &end_date.format("%Y%m%d").to_string(),
+                )?;
+
+                if unfetched_days.is_empty() {
+                    info!("All days already fetched!");
+                    return Ok(());
+                }
+
+                info!("Unfetched days: {}", unfetched_days.len());
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let mut total_games = 0usize;
+                let mut total_new_players = 0usize;
+
+                for (i, date) in unfetched_days.iter().enumerate() {
+                    match client.fetch_day_games(date).await {
+                        Ok((games, player_ids, api_calls)) => {
+                            let game_count = games.len();
+                            let player_count = player_ids.len();
+
+                            // Store players
+                            let mut new_players = 0;
+                            for game in &games {
+                                for player in &game.players {
+                                    if db.upsert_player_for_scraping(
+                                        player.account_id,
+                                        &player.nickname,
+                                        date,
+                                    )? {
+                                        new_players += 1;
+                                    }
+                                }
+                            }
+
+                            // Mark day as fetched
+                            db.mark_day_fetched(date, game_count as i32, player_count as i32)?;
+
+                            total_games += game_count;
+                            total_new_players += new_players;
+
+                            info!(
+                                "[{}/{}] {}: {} games, {} players ({} new), {} API calls",
+                                i + 1,
+                                unfetched_days.len(),
+                                date,
+                                game_count,
+                                player_count,
+                                new_players,
+                                api_calls
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch {}: {}", date, e);
+                        }
+                    }
+                }
+
+                let (days_done, _, _) = db.count_day_fetch_progress()?;
+                let (total_players_db, scraped) = db.count_player_scrape_progress()?;
+
+                info!("\n=== Phase 1 Complete ===");
+                info!("Days fetched: {}", days_done);
+                info!("Total games seen: {}", total_games);
+                info!("New players discovered: {}", total_new_players);
+                info!("Total players in DB: {} ({} scraped)", total_players_db, scraped);
+                info!("\nRun 'majsoul scrape-players' for Phase 2");
             }
         },
     }

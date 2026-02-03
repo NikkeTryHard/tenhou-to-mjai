@@ -1,4 +1,6 @@
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
+use std::collections::HashSet;
 use tracing::info;
 
 use super::types::{GameRecord, PlayerSearchResult};
@@ -138,5 +140,92 @@ impl AmaeKoromoClient {
         }
 
         Ok((all_records, api_calls))
+    }
+
+    /// Fetch all games for a specific day (Throne mode) with pagination
+    /// Paginates until API returns `invalid_date_range` error
+    /// Returns (games, unique_player_ids, api_calls)
+    pub async fn fetch_day_games(
+        &self,
+        date: &str,  // YYYYMMDD format
+    ) -> Result<(Vec<GameRecord>, Vec<i64>, u32)> {
+        let parsed_date = NaiveDate::parse_from_str(date, "%Y%m%d")
+            .context("Invalid date format, expected YYYYMMDD")?;
+
+        // Calculate day boundaries in milliseconds (UTC)
+        let day_start_ms = parsed_date
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let day_end_ms = parsed_date
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis() + 999; // Include .999
+
+        let mut all_games = Vec::new();
+        let mut player_ids = HashSet::new();
+        let mut api_calls = 0u32;
+        let mut current_end_ms = day_end_ms;
+
+        loop {
+            let url = format!(
+                "{}/games/{}/{}?limit=500&descending=true&mode=16",
+                DATA_BASE, current_end_ms, day_start_ms
+            );
+
+            let resp = self.client.get(&url).send().await?;
+            api_calls += 1;
+
+            // Check for invalid_date_range error (means we've reached the end)
+            if resp.status().is_client_error() {
+                let body = resp.text().await.unwrap_or_default();
+                if body.contains("invalid_date_range") {
+                    break;
+                }
+                anyhow::bail!("API error: {}", body);
+            }
+
+            if !resp.status().is_success() {
+                anyhow::bail!("HTTP {}", resp.status());
+            }
+
+            let games: Vec<GameRecord> = resp.json().await?;
+
+            if games.is_empty() {
+                break;
+            }
+
+            // Extract player IDs
+            for game in &games {
+                for player in &game.players {
+                    player_ids.insert(player.account_id);
+                }
+            }
+
+            // Get oldest game's startTime for next pagination
+            let oldest_start_time = games
+                .last()
+                .map(|g| g.start_time)
+                .unwrap_or(0);
+
+            all_games.extend(games);
+
+            // Next page: end_ms = oldest_start_time * 1000 - 1
+            current_end_ms = (oldest_start_time * 1000) - 1;
+
+            // If we're getting close to day_start_ms, we might hit invalid_date_range
+            if current_end_ms <= day_start_ms {
+                break;
+            }
+
+            if self.delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            }
+        }
+
+        let player_vec: Vec<i64> = player_ids.into_iter().collect();
+        Ok((all_games, player_vec, api_calls))
     }
 }
