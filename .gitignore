@@ -14,6 +14,13 @@ xml/
 # Plans (local only)
 docs/plans/
 
+# Reference repos (cloned for research)
+Majsoul-to-NAGA/
+Auto-Mortal-Analysis-System/
+majsoul-record/
+majsoul-record-parser/
+amae-koromo-scripts/
+
 # Scripts (local dev helpers)
 scripts/
 *.sh
