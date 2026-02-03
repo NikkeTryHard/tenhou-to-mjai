@@ -6,7 +6,6 @@
 
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fs;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -39,10 +38,10 @@ pub async fn download_as_json(
     server: &str,
 ) -> Result<(usize, usize)> {
     // Create output directory if it doesn't exist
-    fs::create_dir_all(output_dir)?;
+    tokio::fs::create_dir_all(output_dir).await?;
 
     // Get UUIDs to download (games with full_uuid that haven't been downloaded)
-    let uuids = db.get_majsoul_undownloaded(limit)?;
+    let uuids = db.get_majsoul_undownloaded_with_full_uuid(limit)?;
     if uuids.is_empty() {
         info!("No pending downloads");
         return Ok((0, 0));
@@ -151,7 +150,7 @@ pub async fn download_as_json(
 
                             match serde_json::to_string_pretty(&log) {
                                 Ok(json) => {
-                                    if let Err(e) = fs::write(&filepath, json) {
+                                    if let Err(e) = tokio::fs::write(&filepath, json).await {
                                         warn!("Failed to write {}: {}", filename, e);
                                         failed += 1;
                                     } else {

@@ -311,6 +311,10 @@ pub fn convert_to_tenhou(
     uuid: &str,
     mode_id: u32,
 ) -> Result<TensoulOutput> {
+    tracing::warn!(
+        "Protobuf parsing not yet implemented - returning skeleton data for {}",
+        uuid
+    );
     let num_players = if is_sanma(mode_id) { 3 } else { 4 };
 
     let mut log = TenhouLog::new(uuid.to_string(), num_players);
