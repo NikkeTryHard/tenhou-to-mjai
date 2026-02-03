@@ -450,35 +450,18 @@ async fn main() -> Result<()> {
             MajsoulCommands::Fetch {
                 player_id,
                 mode,
-                start,
-                end,
+                start: _,
+                end: _,
                 delay_ms,
             } => {
-                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
-                let end_date = match end {
-                    Some(e) => NaiveDate::parse_from_str(&e, "%Y%m%d")?,
-                    None => chrono::Local::now().date_naive(),
-                };
-
-                let start_ms = start_date
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc()
-                    .timestamp_millis();
-                let end_ms = end_date
-                    .and_hms_opt(23, 59, 59)
-                    .unwrap()
-                    .and_utc()
-                    .timestamp_millis();
-
                 let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
-                let records = client.get_player_records(player_id, start_ms, end_ms, mode).await?;
+                let (records, api_calls) = client.get_player_records_paginated(player_id, mode).await?;
 
-                info!("Found {} records", records.len());
+                info!("Found {} records ({} API calls)", records.len(), api_calls);
 
                 let mut new_count = 0;
                 for r in &records {
-                    if db.insert_majsoul_log(&r.uuid, player_id, r.start_time, Some(r.mode_id))? {
+                    if db.insert_majsoul_log_with_full_uuid(&r.uuid, player_id, r.start_time, Some(r.mode_id))? {
                         new_count += 1;
                     }
                 }

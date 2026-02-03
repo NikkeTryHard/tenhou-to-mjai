@@ -38,40 +38,6 @@ impl AmaeKoromoClient {
         Ok(results)
     }
 
-    pub async fn get_player_records(
-        &self,
-        player_id: i64,
-        start_ms: i64,
-        end_ms: i64,
-        mode: i32,
-    ) -> Result<Vec<GameRecord>> {
-        let url = format!(
-            "{}/player_records/{}/{}/{}?mode={}",
-            DATA_BASE, player_id, start_ms, end_ms, mode
-        );
-
-        info!("Fetching records for player {} (mode {})", player_id, mode);
-
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch player records")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("HTTP {}", resp.status());
-        }
-
-        let records: Vec<GameRecord> = resp.json().await?;
-
-        if self.delay_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
-        }
-
-        Ok(records)
-    }
-
     /// Fetch recent records from a specific room (no player ID required)
     pub async fn get_room_records(
         &self,
@@ -106,33 +72,6 @@ impl AmaeKoromoClient {
             tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
         }
 
-        Ok(records)
-    }
-
-    /// Fetch all records for a player (all modes, no time filter)
-    pub async fn get_player_all_records(&self, player_id: i64) -> Result<Vec<GameRecord>> {
-        // Use a very wide time range to get all records
-        let start_ms: i64 = 0;
-        let end_ms: i64 = chrono::Utc::now().timestamp_millis();
-
-        let url = format!(
-            "{}/player_records/{}/{}/{}",
-            DATA_BASE, player_id, start_ms, end_ms
-        );
-
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .context("Failed to fetch player records")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            anyhow::bail!("HTTP {} for player {}", status, player_id);
-        }
-
-        let records: Vec<GameRecord> = resp.json().await?;
         Ok(records)
     }
 
