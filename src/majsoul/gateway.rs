@@ -50,10 +50,16 @@ struct Route {
     id: String,
 }
 
+/// Inner data from /api/clientgate/routes
+#[derive(Debug, Deserialize)]
+struct RoutesData {
+    routes: Vec<Route>,
+}
+
 /// Routes response from /api/clientgate/routes
 #[derive(Debug, Deserialize)]
 struct RoutesResponse {
-    routes: Vec<Route>,
+    data: RoutesData,
 }
 
 /// Discover gateway endpoint, version, and route_id for Majsoul server
@@ -124,6 +130,7 @@ pub async fn discover_gateway(client: &reqwest::Client, server: &str) -> Result<
     .context("Timeout fetching routes")??;
 
     let route = routes_response
+        .data
         .routes
         .first()
         .context("No routes found in response")?;

@@ -176,6 +176,8 @@ mod requests {
     }
 
     /// Build ReqLogin for CN native login (username/password)
+    /// Field numbers from protobuf: account=1, password=2, device=4, random_key=5,
+    /// gen_access_token=7, currency_platforms=8, client_version_string=11
     pub fn build_login_request(
         account: &str,
         password_hash: &str,
@@ -190,14 +192,14 @@ mod requests {
         encode_string(&mut buf, 2, password_hash);
         // Field 4: device { is_browser: true }
         encode_nested_device_simple(&mut buf);
-        // Field 8: random_key (string)
-        encode_string(&mut buf, 8, random_key);
-        // Field 9: gen_access_token (bool = true)
-        encode_bool(&mut buf, 9, true);
-        // Field 10: currency_platforms (repeated int32 = [2])
-        encode_varint_field(&mut buf, 10, 2);
-        // Field 12: client_version_string
-        encode_string(&mut buf, 12, version);
+        // Field 5: random_key (string)
+        encode_string(&mut buf, 5, random_key);
+        // Field 7: gen_access_token (bool = true)
+        encode_bool(&mut buf, 7, true);
+        // Field 8: currency_platforms (repeated int32 = [2])
+        encode_varint_field(&mut buf, 8, 2);
+        // Field 11: client_version_string
+        encode_string(&mut buf, 11, version);
 
         buf
     }
@@ -243,14 +245,15 @@ mod requests {
     }
 
     /// Build ReqRequestConnection for route handshake (required before login)
+    /// Field numbers from protobuf: type=2, route_id=3, timestamp=4
     pub fn build_request_connection(route_id: &str, timestamp: u64) -> Vec<u8> {
         let mut buf = Vec::new();
-        // Field 1: type = 3 (varint)
-        encode_varint_field(&mut buf, 1, 3);
-        // Field 2: route_id (string)
-        encode_string(&mut buf, 2, route_id);
-        // Field 3: timestamp (varint, milliseconds)
-        encode_varint_field(&mut buf, 3, timestamp);
+        // Field 2: type = 3 (varint)
+        encode_varint_field(&mut buf, 2, 3);
+        // Field 3: route_id (string)
+        encode_string(&mut buf, 3, route_id);
+        // Field 4: timestamp (varint, milliseconds)
+        encode_varint_field(&mut buf, 4, timestamp);
         buf
     }
 
@@ -427,10 +430,9 @@ impl MajsoulRpc {
         // Step 1: Route connection handshake (CRITICAL - required before login)
         self.route_connect(route_id).await?;
 
-        // Step 2: Heartbeat via Route service
+        // Step 2: Heartbeat via Lobby service (like original implementation)
         info!("Sending heartbeat");
-        let hb_request = requests::build_heartbeat();
-        let hb_response = self.call(".lq.Route.heartbeat", &hb_request).await?;
+        let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
         debug!("Heartbeat response: {} bytes", hb_response.len());
 
         let password_hash = hash_password(password);
