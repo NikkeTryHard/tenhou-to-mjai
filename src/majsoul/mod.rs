@@ -1,4 +1,5 @@
 pub mod api;
+pub mod auth;
 pub mod browser;
 pub mod convert;
 pub mod download;
