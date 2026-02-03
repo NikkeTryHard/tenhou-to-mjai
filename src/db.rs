@@ -947,7 +947,8 @@ impl Database {
         Ok((days, games, players))
     }
 
-    /// Upsert a player discovered during Phase 1 (day fetching)
+    /// Insert a new player discovered during Phase 1 (day fetching)
+    /// Returns true only if player was newly inserted, false if already existed
     pub fn upsert_player_for_scraping(
         &self,
         player_id: i64,
@@ -955,10 +956,8 @@ impl Database {
         first_seen_date: &str,
     ) -> Result<bool> {
         let result = self.conn.execute(
-            "INSERT INTO majsoul_pipeline_players (player_id, nickname, first_seen_date)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(player_id) DO UPDATE SET
-                nickname = COALESCE(excluded.nickname, nickname)",
+            "INSERT OR IGNORE INTO majsoul_pipeline_players (player_id, nickname, first_seen_date)
+             VALUES (?1, ?2, ?3)",
             params![player_id, nickname, first_seen_date],
         )?;
         Ok(result > 0)
