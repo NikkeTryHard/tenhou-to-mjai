@@ -376,6 +376,21 @@ enum MajsoulCommands {
         #[arg(long, default_value = "100")]
         delay_ms: u64,
     },
+
+    /// Phase 2: Scrape full game history for unscraped players (slow, resumable)
+    ScrapePlayers {
+        /// Maximum players to scrape
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Number of concurrent player fetches
+        #[arg(short, long, default_value = "5")]
+        concurrent: usize,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "200")]
+        delay_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -1572,6 +1587,88 @@ async fn main() -> Result<()> {
                 info!("New players discovered: {}", total_new_players);
                 info!("Total players in DB: {} ({} scraped)", total_players_db, scraped);
                 info!("\nRun 'majsoul scrape-players' for Phase 2");
+            }
+            MajsoulCommands::ScrapePlayers { limit, concurrent, delay_ms } => {
+                let unscraped = db.get_unscraped_players(limit)?;
+
+                if unscraped.is_empty() {
+                    info!("All players already scraped!");
+                    let (total, scraped) = db.count_player_scrape_progress()?;
+                    info!("Total: {}, Scraped: {}", total, scraped);
+                    return Ok(());
+                }
+
+                info!("=== PHASE 2: Scrape Players ===");
+                info!("Unscraped players: {}", unscraped.len());
+                info!("Concurrent: {}", concurrent);
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let mut processed = 0usize;
+                let mut total_games = 0usize;
+                let mut total_new_uuids = 0usize;
+                let total_players = unscraped.len();
+
+                for chunk in unscraped.chunks(concurrent) {
+                    let futures: Vec<_> = chunk.iter().map(|&player_id| {
+                        let client = &client;
+                        async move {
+                            let result = client.get_player_records_paginated(player_id, 16).await;
+                            (player_id, result)
+                        }
+                    }).collect();
+
+                    let results = futures::future::join_all(futures).await;
+
+                    for (player_id, result) in results {
+                        match result {
+                            Ok((records, api_calls)) => {
+                                let mut new_for_player = 0;
+                                for r in &records {
+                                    if db.insert_majsoul_log_with_full_uuid(
+                                        &r.uuid,
+                                        player_id,
+                                        r.start_time,
+                                        Some(r.mode_id),
+                                    )? {
+                                        new_for_player += 1;
+                                    }
+                                }
+
+                                db.mark_player_scraped(player_id, records.len() as i32)?;
+                                total_games += records.len();
+                                total_new_uuids += new_for_player;
+
+                                if api_calls > 1 || records.len() > 100 {
+                                    info!(
+                                        "Player {}: {} games ({} API calls, {} new)",
+                                        player_id, records.len(), api_calls, new_for_player
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to scrape player {}: {}", player_id, e);
+                            }
+                        }
+                        processed += 1;
+                    }
+
+                    if processed % 100 == 0 || processed == total_players {
+                        let (total_p, scraped_p) = db.count_player_scrape_progress()?;
+                        info!(
+                            "Progress: {}/{} players | {} games | {} new UUIDs | {}/{} total scraped",
+                            processed, total_players, total_games, total_new_uuids, scraped_p, total_p
+                        );
+                    }
+                }
+
+                let (total_logs, downloaded, _) = db.count_majsoul_logs()?;
+                let (total_p, scraped_p) = db.count_player_scrape_progress()?;
+
+                info!("\n=== Phase 2 Complete ===");
+                info!("Players scraped: {}/{}", scraped_p, total_p);
+                info!("Total games in DB: {}", total_logs);
+                info!("Games downloaded: {}", downloaded);
+                info!("New UUIDs this run: {}", total_new_uuids);
             }
         },
     }
