@@ -136,7 +136,8 @@ impl AmaeKoromoClient {
         Ok(records)
     }
 
-    /// Fetch ALL records for a player with pagination (handles 200 game limit)
+    /// Fetch ALL records for a player with pagination (handles 500 game limit)
+    /// Uses descending mode like the Amae-Koromo website
     /// Returns (all_records, num_api_calls)
     pub async fn get_player_records_paginated(
         &self,
@@ -145,13 +146,14 @@ impl AmaeKoromoClient {
     ) -> Result<(Vec<GameRecord>, u32)> {
         let mut all_records = Vec::new();
         let mut end_ms: i64 = chrono::Utc::now().timestamp_millis();
-        let start_ms: i64 = 0; // Beginning of time
+        let start_ms: i64 = 1262304000000; // 2010-01-01
         let mut api_calls = 0u32;
 
         loop {
+            // Descending mode: swap end/start in URL, add descending=true, limit=500
             let url = format!(
-                "{}/player_records/{}/{}/{}?mode={}",
-                DATA_BASE, player_id, start_ms, end_ms, mode
+                "{}/player_records/{}/{}/{}?mode={}&limit=500&descending=true",
+                DATA_BASE, player_id, end_ms, start_ms, mode
             );
 
             let resp = self
@@ -175,18 +177,21 @@ impl AmaeKoromoClient {
                 break;
             }
 
-            // Find oldest game's start_time for next pagination
-            let oldest_start_time = records.iter().map(|r| r.start_time).min().unwrap_or(0);
+            // In descending mode, last record is oldest - use its endTime for next page
+            let oldest_end_time = records
+                .last()
+                .and_then(|r| r.end_time)
+                .unwrap_or(0);
 
             all_records.extend(records);
 
-            // If we got fewer than 200, we've reached the end
-            if batch_size < 200 {
+            // If we got fewer than 500, we've reached the end
+            if batch_size < 500 {
                 break;
             }
 
-            // Set end_ms to oldest game's start_time - 1ms for next batch
-            end_ms = oldest_start_time - 1;
+            // Set end_ms to oldest game's end_time (in ms) - 1 for next batch
+            end_ms = (oldest_end_time * 1000) - 1;
 
             if self.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;

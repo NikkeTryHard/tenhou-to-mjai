@@ -897,13 +897,55 @@ async fn main() -> Result<()> {
                     let futures: Vec<_> = chunk.iter().map(|&player_id| {
                         let client = client.clone();
                         async move {
-                            let url = format!(
-                                "https://5-data.amae-koromo.com/api/v2/pl4/player_records/{}/0/{}?mode=16",
-                                player_id,
-                                chrono::Utc::now().timestamp_millis()
-                            );
-                            let result = client.get(&url).send().await;
-                            (player_id, result)
+                            // Paginate through all records using descending mode
+                            let mut all_records = Vec::new();
+                            let mut end_ms: i64 = chrono::Utc::now().timestamp_millis();
+                            let start_ms: i64 = 1262304000000; // 2010-01-01
+
+                            loop {
+                                // Descending mode: swap end/start, add descending=true, limit=500
+                                let url = format!(
+                                    "https://5-data.amae-koromo.com/api/v2/pl4/player_records/{}/{}/{}?mode=16&limit=500&descending=true",
+                                    player_id, end_ms, start_ms
+                                );
+
+                                let resp = match client.get(&url).send().await {
+                                    Ok(r) => r,
+                                    Err(e) => return (player_id, Err(e)),
+                                };
+
+                                if !resp.status().is_success() {
+                                    break;
+                                }
+
+                                let records: Vec<majsoul::GameRecord> = match resp.json().await {
+                                    Ok(r) => r,
+                                    Err(_) => break,
+                                };
+
+                                let batch_size = records.len();
+                                if records.is_empty() {
+                                    break;
+                                }
+
+                                // In descending mode, last record is oldest - use its endTime for next page
+                                let oldest_end_time = records
+                                    .last()
+                                    .and_then(|r| r.end_time)
+                                    .unwrap_or(0);
+
+                                all_records.extend(records);
+
+                                // If we got fewer than 500, we've reached the end
+                                if batch_size < 500 {
+                                    break;
+                                }
+
+                                // Set end_ms to oldest game's end_time (in ms) - 1 for next batch
+                                end_ms = (oldest_end_time * 1000) - 1;
+                            }
+
+                            (player_id, Ok(all_records))
                         }
                     }).collect();
 
@@ -912,32 +954,22 @@ async fn main() -> Result<()> {
                     // Sequential DB writes
                     for (player_id, result) in results {
                         match result {
-                            Ok(resp) if resp.status().is_success() => {
-                                match resp.json::<Vec<majsoul::GameRecord>>().await {
-                                    Ok(records) => {
-                                        let mut new_for_player = 0;
-                                        for r in &records {
-                                            // Insert with full UUID directly (player_records returns full UUIDs)
-                                            if db.insert_majsoul_log_with_full_uuid(
-                                                &r.uuid,
-                                                player_id,
-                                                r.start_time,
-                                                Some(r.mode_id),
-                                            )? {
-                                                new_for_player += 1;
-                                            }
-                                        }
-                                        total_records += records.len();
-                                        total_new += new_for_player;
-                                        db.mark_throne_player_fetched(player_id)?;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("Failed to parse records for {}: {}", player_id, e);
+                            Ok(records) => {
+                                let mut new_for_player = 0;
+                                for r in &records {
+                                    // Insert with full UUID directly (player_records returns full UUIDs)
+                                    if db.insert_majsoul_log_with_full_uuid(
+                                        &r.uuid,
+                                        player_id,
+                                        r.start_time,
+                                        Some(r.mode_id),
+                                    )? {
+                                        new_for_player += 1;
                                     }
                                 }
-                            }
-                            Ok(resp) => {
-                                tracing::warn!("HTTP {} for player {}", resp.status(), player_id);
+                                total_records += records.len();
+                                total_new += new_for_player;
+                                db.mark_throne_player_fetched(player_id)?;
                             }
                             Err(e) => {
                                 tracing::warn!("Request failed for {}: {}", player_id, e);
