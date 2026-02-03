@@ -152,16 +152,20 @@ impl AmaeKoromoClient {
         let parsed_date = NaiveDate::parse_from_str(date, "%Y%m%d")
             .context("Invalid date format, expected YYYYMMDD")?;
 
-        // Calculate day boundaries in milliseconds (UTC)
+        // Calculate day boundaries in milliseconds (CST/UTC-6 - Amae-Koromo uses Central time)
+        use chrono::FixedOffset;
+        let cst = FixedOffset::west_opt(6 * 3600).unwrap();
         let day_start_ms = parsed_date
             .and_hms_opt(0, 0, 0)
             .unwrap()
-            .and_utc()
+            .and_local_timezone(cst)
+            .unwrap()
             .timestamp_millis();
         let day_end_ms = parsed_date
             .and_hms_opt(23, 59, 59)
             .unwrap()
-            .and_utc()
+            .and_local_timezone(cst)
+            .unwrap()
             .timestamp_millis() + 999; // Include .999
 
         let mut all_games = Vec::new();
