@@ -1548,7 +1548,8 @@ async fn main() -> Result<()> {
                             let game_count = games.len();
                             let player_count = player_ids.len();
 
-                            // Store players
+                            // Store players in a single transaction for performance
+                            db.begin_transaction()?;
                             let mut new_players = 0;
                             for game in &games {
                                 for player in &game.players {
@@ -1561,6 +1562,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
+                            db.commit()?;
 
                             // Mark day as fetched
                             db.mark_day_fetched(date, game_count as i32, player_count as i32)?;

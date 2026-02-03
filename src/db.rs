@@ -872,6 +872,18 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Begin a transaction (for batching writes)
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+        Ok(())
+    }
+
+    /// Commit the current transaction
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
     /// Mark a day as fetched with stats
     pub fn mark_day_fetched(&self, date: &str, game_count: i32, player_count: i32) -> Result<()> {
         self.conn.execute(
@@ -885,18 +897,28 @@ impl Database {
     /// Get unfetched days in a date range (returns YYYYMMDD strings)
     pub fn get_unfetched_days(&self, start: &str, end: &str) -> Result<Vec<String>> {
         use chrono::NaiveDate;
+        use std::collections::HashSet;
 
         let start_date = NaiveDate::parse_from_str(start, "%Y%m%d")
             .map_err(|e| anyhow::anyhow!("Invalid start date: {}", e))?;
         let end_date = NaiveDate::parse_from_str(end, "%Y%m%d")
             .map_err(|e| anyhow::anyhow!("Invalid end date: {}", e))?;
 
+        // Query all fetched dates in range at once (single query instead of N+1)
+        let mut stmt = self.conn.prepare(
+            "SELECT date FROM majsoul_day_fetch_state WHERE date >= ?1 AND date <= ?2"
+        )?;
+        let fetched_dates: HashSet<String> = stmt
+            .query_map(params![start, end], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Generate all dates and filter out fetched ones
         let mut unfetched = Vec::new();
         let mut current = start_date;
-
         while current <= end_date {
             let date_str = current.format("%Y%m%d").to_string();
-            if !self.is_day_fetched(&date_str)? {
+            if !fetched_dates.contains(&date_str) {
                 unfetched.push(date_str);
             }
             current += chrono::Duration::days(1);
