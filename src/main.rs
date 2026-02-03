@@ -362,6 +362,33 @@ enum MajsoulCommands {
         server: String,
     },
 
+    /// Download games and convert to Tenhou JSON format
+    DownloadJson {
+        /// Output directory for JSON files
+        #[arg(short, long, default_value = "tenhou-json")]
+        output: PathBuf,
+
+        /// Maximum records to download
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Username for native login (optional, uses cached token if not provided)
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Password for native login (optional)
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Delay between requests in ms
+        #[arg(long, default_value = "2000")]
+        delay_ms: u64,
+
+        /// Server region: en, jp
+        #[arg(long, default_value = "en")]
+        server: String,
+    },
+
     /// Phase 1: Fetch all player IDs by day (fast, parallel-safe)
     FetchDays {
         /// Start date (YYYYMMDD)
@@ -1515,6 +1542,21 @@ async fn main() -> Result<()> {
                 }
 
                 info!("Resolved {} phantom UUIDs", resolved);
+            }
+            MajsoulCommands::DownloadJson { output, limit, username, password, delay_ms, server } => {
+                use crate::majsoul::json_download::download_as_json;
+
+                let (success, failed) = download_as_json(
+                    &db,
+                    &output,
+                    limit,
+                    username.as_deref(),
+                    password.as_deref(),
+                    delay_ms,
+                    &server,
+                ).await?;
+
+                info!("Downloaded {} games as Tenhou JSON ({} failed)", success, failed);
             }
             MajsoulCommands::FetchDays { start, end, delay_ms } => {
                 let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;

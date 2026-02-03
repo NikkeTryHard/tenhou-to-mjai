@@ -378,6 +378,16 @@ impl Database {
         Ok(())
     }
 
+    /// Get mode_id for a Majsoul log by UUID.
+    pub fn get_majsoul_mode_id(&self, uuid: &str) -> Result<i32> {
+        let mode_id: i32 = self.conn.query_row(
+            "SELECT COALESCE(mode_id, 16) FROM majsoul_logs WHERE uuid = ?1 OR full_uuid = ?1",
+            params![uuid],
+            |row| row.get(0),
+        )?;
+        Ok(mode_id)
+    }
+
     /// Get undownloaded Majsoul logs that have a full_uuid (required for download).
     ///
     /// Returns full_uuid values for records where:

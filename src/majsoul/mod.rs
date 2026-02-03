@@ -5,6 +5,7 @@ pub mod convert;
 pub mod download;
 pub mod events;
 pub mod gateway;
+pub mod json_download;
 pub mod parallel_download;
 pub mod proto;
 pub mod rpc;
