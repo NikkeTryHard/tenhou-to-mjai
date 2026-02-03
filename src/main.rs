@@ -152,6 +152,7 @@ enum MajsoulCommands {
     Stats,
 
     /// Fetch public game UUIDs from ranked rooms (Throne, Jade, Gold)
+    /// Note: This command requires authentication. Use --username and --password.
     FetchPublic {
         /// Room type: throne, jade, gold, silver, bronze, all
         #[arg(long, default_value = "throne")]
@@ -164,16 +165,18 @@ enum MajsoulCommands {
         /// Server region: en, jp, cn
         #[arg(long, default_value = "en")]
         server: String,
+
+        /// Username for native login (required)
+        #[arg(long)]
+        username: String,
+
+        /// Password for native login (required)
+        #[arg(long)]
+        password: String,
     },
 
-    /// Download game records
-    ///
-    /// Uses cached token from `majsoul auth` if --token not provided.
+    /// Download game records using native login (username/password)
     Download {
-        /// Access token (optional if authenticated via `majsoul auth`)
-        #[arg(long)]
-        token: Option<String>,
-
         /// Maximum records to download
         #[arg(short, long)]
         limit: Option<usize>,
@@ -182,27 +185,17 @@ enum MajsoulCommands {
         #[arg(long, default_value = "1500")]
         delay_ms: u64,
 
-        /// Server region: cn, en, jp (uses cached token's server if not specified)
-        #[arg(long)]
-        server: Option<String>,
-
-        /// Use browser to download (bypasses token issues for CN server)
-        #[arg(long)]
-        browser: bool,
-    },
-
-    /// Authenticate with Majsoul via browser (interactive)
-    ///
-    /// Opens Chrome, navigates to Majsoul, and captures your access token
-    /// when you login. Token is cached for future use.
-    Auth {
-        /// Force re-authentication even if cached token exists
-        #[arg(long)]
-        force: bool,
-
-        /// Server region: cn, en, jp (default: en)
+        /// Server region: cn, en, jp
         #[arg(long, default_value = "en")]
         server: String,
+
+        /// Username for native login (required)
+        #[arg(long)]
+        username: String,
+
+        /// Password for native login (required)
+        #[arg(long)]
+        password: String,
     },
 
     /// Convert downloaded Majsoul logs to MJAI format
@@ -296,6 +289,7 @@ enum MajsoulCommands {
     },
 
     /// Resolve short UUIDs to full UUIDs via Majsoul RPC
+    /// Note: This command requires authentication. Use --username and --password.
     ResolveUuids {
         /// Maximum UUIDs to resolve
         #[arg(short, long)]
@@ -312,6 +306,14 @@ enum MajsoulCommands {
         /// Server region: en, jp (default: en)
         #[arg(long, default_value = "en")]
         server: String,
+
+        /// Username for native login (required)
+        #[arg(long)]
+        username: String,
+
+        /// Password for native login (required)
+        #[arg(long)]
+        password: String,
     },
 
     /// Exhaustive scrape: fetch ALL Throne games (runs until no new games found)
@@ -328,23 +330,31 @@ enum MajsoulCommands {
     /// Reset fetch status for players who hit the 200-game cap
     ResetCappedPlayers,
 
-    /// Bulk download with multiple accounts (parallel)
+    /// Bulk download with native login (username/password)
     BulkDownload {
-        /// Path to tokens file (format: uid,token,server per line)
-        #[arg(long)]
-        tokens: PathBuf,
-
         /// Maximum records to download
         #[arg(short, long)]
         limit: Option<usize>,
 
-        /// Delay between requests per account in ms
+        /// Delay between requests in ms
         #[arg(long, default_value = "2000")]
         delay_ms: u64,
 
         /// Restart RPC connection every N records (prevents memory leaks)
         #[arg(long, default_value = "10000")]
         restart_every: usize,
+
+        /// Server region: en, jp, cn
+        #[arg(long, default_value = "en")]
+        server: String,
+
+        /// Username for native login (required)
+        #[arg(long)]
+        username: String,
+
+        /// Password for native login (required)
+        #[arg(long)]
+        password: String,
     },
 
     /// Resolve phantom UUIDs via browser injection
@@ -372,13 +382,13 @@ enum MajsoulCommands {
         #[arg(short, long)]
         limit: Option<usize>,
 
-        /// Username for native login (optional, uses cached token if not provided)
+        /// Username for native login (required)
         #[arg(long)]
-        username: Option<String>,
+        username: String,
 
-        /// Password for native login (optional)
+        /// Password for native login (required)
         #[arg(long)]
-        password: Option<String>,
+        password: String,
 
         /// Delay between requests in ms
         #[arg(long, default_value = "2000")]
@@ -565,8 +575,7 @@ async fn main() -> Result<()> {
                     println!("  {} (mode {}): {}", room_name, mode_id, count);
                 }
             }
-            MajsoulCommands::FetchPublic { room, count, server } => {
-                use crate::majsoul::browser::CachedToken;
+            MajsoulCommands::FetchPublic { room, count, server, username, password } => {
                 use crate::majsoul::gateway::discover_gateway;
                 use crate::majsoul::rpc::MajsoulRpc;
 
@@ -580,22 +589,13 @@ async fn main() -> Result<()> {
                     _ => anyhow::bail!("Invalid room type: {}. Use: throne, jade, gold, silver, bronze, all", room),
                 };
 
-                // Get token
-                let access_token = match CachedToken::load()? {
-                    Some(cached) => {
-                        info!("Using cached token (server: {})", cached.server);
-                        cached.access_token
-                    }
-                    None => anyhow::bail!("No cached token. Run `majsoul auth` first."),
-                };
-
                 info!("Fetching {} public {} room games from {} server...", count, room, server);
 
-                // Connect and login
+                // Connect and login with native credentials
                 let client = reqwest::Client::new();
-                let (endpoint, version) = discover_gateway(&client, &server).await?;
+                let (endpoint, version, route_id) = discover_gateway(&client, &server).await?;
                 let rpc = MajsoulRpc::connect(&endpoint).await?;
-                rpc.login(&access_token, &version, &server).await?;
+                rpc.login_native(&username, &password, &version, &route_id).await?;
 
                 // Fetch public game list
                 let response = rpc.fetch_game_record_list(0, count, room_type).await?;
@@ -615,113 +615,15 @@ async fn main() -> Result<()> {
 
                 info!("Done");
             }
-            MajsoulCommands::Auth { force, server } => {
-                use crate::majsoul::browser::{capture_token_interactive, CachedToken};
-
-                // Check for existing token
-                if !force {
-                    if let Ok(Some(token)) = CachedToken::load() {
-                        info!(
-                            "Found cached token for {} server (captured at {})",
-                            token.server,
-                            chrono::DateTime::from_timestamp(token.captured_at, 0)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
-                        info!("Use --force to re-authenticate");
-                        println!(
-                            "Token: {}... (server: {})",
-                            &token.access_token[..8.min(token.access_token.len())],
-                            token.server
-                        );
-                        return Ok(());
-                    }
-                }
-
-                let token = capture_token_interactive(&server).await?;
-                println!(
-                    "Token captured: {}... (server: {})",
-                    &token.access_token[..8.min(token.access_token.len())],
-                    token.server
-                );
-            }
             MajsoulCommands::Download {
-                token,
                 limit,
                 delay_ms,
                 server,
-                browser,
+                username,
+                password,
             } => {
-                use crate::majsoul::browser::CachedToken;
-
-                // Browser mode: use browser's authenticated session directly (bypasses token issues)
-                if browser {
-                    use tracing::warn;
-
-                    // Default to EN server if not specified
-                    let server = server.unwrap_or_else(|| "en".to_string());
-
-                    info!("Using browser-based batch download for {} server", server);
-
-                    let uuids = db.get_majsoul_undownloaded(limit)?;
-                    if uuids.is_empty() {
-                        info!("No pending downloads in DB - will fetch game list from server");
-                    } else {
-                        info!("Will download {} records from DB (browser stays open)", uuids.len());
-                    }
-
-                    // Single browser session for all downloads
-                    // If uuids is empty, browser will fetch game list from server
-                    let results = majsoul::browser::fetch_game_records_batch(&server, &uuids, delay_ms).await?;
-
-                    let mut success = 0;
-                    let mut failed = 0;
-
-                    for (uuid, result) in results {
-                        match result {
-                            Ok(data) => {
-                                if let Err(e) = db.mark_majsoul_downloaded(&uuid, &data) {
-                                    warn!("Failed to save {}: {}", uuid, e);
-                                    failed += 1;
-                                } else {
-                                    success += 1;
-                                    info!("Saved {} ({} bytes)", uuid, data.len());
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed {}: {}", uuid, e);
-                                db.mark_majsoul_download_error(&uuid)?;
-                                failed += 1;
-                            }
-                        }
-                    }
-
-                    info!("Downloaded {} records ({} failed)", success, failed);
-                    return Ok(());
-                }
-
-                let (access_token, server) = match token {
-                    Some(t) => (t, server.unwrap_or_else(|| "en".to_string())),
-                    None => {
-                        // Try to load cached token
-                        match CachedToken::load()? {
-                            Some(cached) => {
-                                info!("Using cached token from majsoul auth (server: {})", cached.server);
-                                let srv = server.unwrap_or(cached.server.clone());
-                                (cached.access_token, srv)
-                            }
-                            None => {
-                                anyhow::bail!(
-                                    "No token provided and no cached token found.\n\
-                                     Run `majsoul auth` first, or provide --token"
-                                );
-                            }
-                        }
-                    }
-                };
-
                 let downloader = majsoul::MajsoulDownloader::new(delay_ms);
-                let (success, failed) = downloader.download_logs(&db, &access_token, limit, &server).await?;
+                let (success, failed) = downloader.download_logs(&db, &username, &password, limit, &server).await?;
                 info!("Downloaded {} records ({} failed)", success, failed);
             }
             MajsoulCommands::Convert { output, limit, players, hanchan } => {
@@ -1120,21 +1022,13 @@ async fn main() -> Result<()> {
                 info!("Orphans after: {}", after_orphans);
                 info!("Total recovered: {}", before_orphans - after_orphans);
             }
-            MajsoulCommands::ResolveUuids { limit, concurrent, delay_ms, server } => {
-                use crate::majsoul::browser::CachedToken;
+            MajsoulCommands::ResolveUuids { limit, concurrent, delay_ms, server, username, password } => {
                 use crate::majsoul::gateway::discover_gateway;
                 use crate::majsoul::rpc::{MajsoulRpc, extract_full_uuid_from_record};
-                use futures::stream::{self, StreamExt};
+                use futures::stream::StreamExt;
                 use std::sync::Arc;
                 use std::sync::atomic::{AtomicUsize, Ordering};
                 use tokio::sync::Mutex;
-
-                // Load cached token
-                let cached = match CachedToken::load()? {
-                    Some(t) => t,
-                    None => anyhow::bail!("No cached token. Run `majsoul auth` first."),
-                };
-                info!("Using cached token (server: {})", cached.server);
 
                 // Get orphan UUIDs
                 let orphans = db.get_orphan_short_uuids(limit, Some(16))?;
@@ -1150,11 +1044,11 @@ async fn main() -> Result<()> {
 
                 // Connect to gateway
                 let client = reqwest::Client::new();
-                let (endpoint, version) = discover_gateway(&client, &server).await?;
+                let (endpoint, version, route_id) = discover_gateway(&client, &server).await?;
                 info!("Gateway: {}", endpoint);
 
                 let rpc = MajsoulRpc::connect(&endpoint).await?;
-                rpc.login(&cached.access_token, &version, &server).await?;
+                rpc.login_native(&username, &password, &version, &route_id).await?;
                 info!("Logged in successfully\n");
 
                 // Wrap RPC and DB in Arc for sharing across concurrent tasks
@@ -1166,7 +1060,7 @@ async fn main() -> Result<()> {
                 let total = orphans.len();
 
                 // Process orphans with true parallelism using buffer_unordered
-                stream::iter(orphans.into_iter().enumerate())
+                futures::stream::iter(orphans.into_iter().enumerate())
                     .map(|(i, short_uuid)| {
                         let rpc = Arc::clone(&rpc);
                         let db = Arc::clone(&db);
@@ -1491,21 +1385,13 @@ async fn main() -> Result<()> {
                 info!("Reset {} players who hit the 200-game cap", count);
                 info!("Run 'majsoul scrape-all' to re-fetch with pagination");
             }
-            MajsoulCommands::BulkDownload { tokens, limit, delay_ms, restart_every } => {
-                use crate::majsoul::token_pool::TokenPool;
+            MajsoulCommands::BulkDownload { limit, delay_ms, restart_every, server, username, password } => {
                 use crate::majsoul::parallel_download::ParallelDownloader;
                 use std::sync::Arc;
                 use tokio::sync::Mutex;
 
                 // Enable WAL mode for concurrent writes
                 db.enable_wal_mode()?;
-
-                // Load token pool
-                let pool = TokenPool::from_file(&tokens)?;
-                if pool.is_empty() {
-                    anyhow::bail!("No tokens found in {:?}", tokens);
-                }
-                info!("Loaded {} accounts from {:?}", pool.len(), tokens);
 
                 // Check downloadable count
                 let downloadable = db.count_majsoul_downloadable()?;
@@ -1519,7 +1405,7 @@ async fn main() -> Result<()> {
                 let db = Arc::new(Mutex::new(db));
                 let downloader = ParallelDownloader::new(delay_ms, restart_every);
 
-                let (success, failed) = downloader.download_with_pool(db, &pool, limit).await?;
+                let (success, failed) = downloader.download_with_credentials(db, &username, &password, &server, limit).await?;
 
                 info!("Bulk download complete: {} success, {} failed", success, failed);
             }
@@ -1550,8 +1436,8 @@ async fn main() -> Result<()> {
                     &db,
                     &output,
                     limit,
-                    username.as_deref(),
-                    password.as_deref(),
+                    &username,
+                    &password,
                     delay_ms,
                     &server,
                 ).await?;

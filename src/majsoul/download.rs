@@ -15,10 +15,12 @@ impl MajsoulDownloader {
         Self { delay_ms }
     }
 
+    /// Download logs using native login (username/password)
     pub async fn download_logs(
         &self,
         db: &Database,
-        access_token: &str,
+        username: &str,
+        password: &str,
         limit: Option<usize>,
         server: &str,
     ) -> Result<(usize, usize)> {
@@ -33,7 +35,7 @@ impl MajsoulDownloader {
         }
 
         // Discover gateway with retry
-        let (endpoint, version) = {
+        let (endpoint, version, route_id) = {
             let mut attempts = 0;
             loop {
                 match discover_gateway(&client, server).await {
@@ -64,7 +66,8 @@ impl MajsoulDownloader {
             }
         };
 
-        rpc.login(access_token, &version, server).await?;
+        // Login with native credentials
+        rpc.login_native(username, password, &version, &route_id).await?;
 
         info!("Downloading {} game records", uuids.len());
 

@@ -1,44 +1,16 @@
-//! Browser automation for Majsoul token capture via Chrome DevTools Protocol.
+//! Browser automation for Majsoul phantom resolution via Chrome DevTools Protocol.
 
 use anyhow::{Context, Result};
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::cdp::browser_protocol::network::{
-    EnableParams as NetworkEnable, EventWebSocketFrameReceived,
-};
 use futures::StreamExt;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-/// Path to cached token file
-fn token_cache_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("Could not find config directory")?
-        .join("tenhou-scraper");
-    std::fs::create_dir_all(&config_dir)?;
-    Ok(config_dir.join("majsoul-token.json"))
-}
-
-/// Path to cached cookies file
-fn cookies_cache_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("Could not find config directory")?
-        .join("tenhou-scraper");
-    std::fs::create_dir_all(&config_dir)?;
-    Ok(config_dir.join("majsoul-cookies.json"))
-}
-
-/// Cached cookies for session persistence
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct CachedCookies {
-    pub cookies: Vec<serde_json::Value>,
-    pub server: String,
-    pub saved_at: i64,
-}
-
 /// Cached localStorage for session persistence (the real auth data)
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CachedSession {
     pub local_storage: std::collections::HashMap<String, String>,
@@ -56,6 +28,7 @@ fn session_cache_path() -> Result<PathBuf> {
     Ok(config_dir.join("majsoul-session.json"))
 }
 
+#[allow(dead_code)]
 impl CachedSession {
     /// Load cached session from disk
     pub fn load() -> Result<Option<Self>> {
@@ -79,64 +52,6 @@ impl CachedSession {
     }
 }
 
-impl CachedCookies {
-    /// Load cached cookies from disk
-    pub fn load() -> Result<Option<Self>> {
-        let path = cookies_cache_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = std::fs::read_to_string(&path)?;
-        let cookies: CachedCookies = serde_json::from_str(&data)?;
-        Ok(Some(cookies))
-    }
-
-    /// Save cookies to disk
-    pub fn save(&self) -> Result<()> {
-        let path = cookies_cache_path()?;
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
-        info!("Cookies saved to {:?} ({} cookies)", path, self.cookies.len());
-        Ok(())
-    }
-}
-
-/// Cached token data
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct CachedToken {
-    pub access_token: String,
-    pub uid: u64,
-    pub captured_at: i64,
-    #[serde(default = "default_server")]
-    pub server: String,
-}
-
-fn default_server() -> String {
-    "en".to_string()
-}
-
-impl CachedToken {
-    /// Load cached token from disk
-    pub fn load() -> Result<Option<Self>> {
-        let path = token_cache_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = std::fs::read_to_string(&path)?;
-        let token: CachedToken = serde_json::from_str(&data)?;
-        Ok(Some(token))
-    }
-
-    /// Save token to disk
-    pub fn save(&self) -> Result<()> {
-        let path = token_cache_path()?;
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
-        info!("Token saved to {:?}", path);
-        Ok(())
-    }
-}
-
 /// Server URLs for different regions
 pub fn server_url(server: &str) -> &'static str {
     match server {
@@ -147,6 +62,7 @@ pub fn server_url(server: &str) -> &'static str {
 }
 
 /// Profile type for browser launch
+#[allow(dead_code)]
 pub enum BrowserProfile {
     /// Interactive headed browser for login
     Interactive,
@@ -244,6 +160,7 @@ async fn launch_browser_with_profile(
 }
 
 /// Backward-compatible launch (interactive headed)
+#[allow(dead_code)]
 async fn launch_browser(
 ) -> Result<(
     Browser,
@@ -253,6 +170,7 @@ async fn launch_browser(
 }
 
 /// Export full session (localStorage + cookies) from browser
+#[allow(dead_code)]
 pub async fn export_session_from_page(page: &chromiumoxide::Page, server: &str) -> Result<CachedSession> {
     use chromiumoxide::cdp::browser_protocol::network::GetCookiesParams;
 
@@ -297,6 +215,7 @@ pub async fn export_session_from_page(page: &chromiumoxide::Page, server: &str) 
 }
 
 /// Import full session (localStorage + cookies) into browser
+#[allow(dead_code)]
 pub async fn import_session_to_page(page: &chromiumoxide::Page, session: &CachedSession) -> Result<()> {
     use chromiumoxide::cdp::browser_protocol::network::{SetCookieParams, CookieSameSite};
 
@@ -343,6 +262,7 @@ pub async fn import_session_to_page(page: &chromiumoxide::Page, session: &Cached
 
 /// Fetch multiple game records using ONE browser session (kept alive)
 /// Browser opens, waits for lobby, fetches all UUIDs, then closes
+#[allow(dead_code)]
 pub async fn fetch_game_records_batch(
     server: &str,
     uuids: &[String],
@@ -870,6 +790,7 @@ pub async fn resolve_phantom_uuids(
 }
 
 /// Fetch a game record using the browser's authenticated session
+#[allow(dead_code)]
 pub async fn fetch_game_record_via_browser(
     server: &str,
     uuid: &str,
@@ -995,341 +916,4 @@ pub async fn fetch_game_record_via_browser(
             .decode(&result)
             .context("Failed to decode base64 response")
     }
-}
-
-/// Capture access token by grabbing localStorage after login completes
-/// Also intercepts WebSocket to see actual auth flow
-pub async fn capture_token_interactive(server: &str) -> Result<CachedToken> {
-    let url = server_url(server);
-    info!("Launching Chrome for Majsoul authentication ({} server)...", server);
-    info!("URL: {}", url);
-
-    let (browser, mut handler) = launch_browser().await?;
-
-    // Drive the browser connection in background
-    let handler_task = tokio::spawn(async move {
-        while let Some(result) = handler.next().await {
-            if result.is_err() {
-                break;
-            }
-        }
-    });
-
-    // Inject JS hook BEFORE navigation to capture token from URL params
-    // EN/JP redirect with ?uid=...&token=... after Google login
-    let inject_script = r#"
-        (function() {
-            // Check URL for token params on every navigation
-            function checkUrlForToken() {
-                const params = new URLSearchParams(window.location.search);
-                const uid = params.get('uid');
-                const token = params.get('token');
-                if (uid && token) {
-                    window._capturedUid = uid;
-                    window._capturedToken = token;
-                    console.log('[HOOK] Captured from URL - uid:', uid, 'token:', token);
-                }
-            }
-
-            // Check immediately
-            checkUrlForToken();
-
-            // Also check on popstate (back/forward)
-            window.addEventListener('popstate', checkUrlForToken);
-
-            // Hook pushState/replaceState
-            const origPushState = history.pushState;
-            history.pushState = function() {
-                origPushState.apply(this, arguments);
-                checkUrlForToken();
-            };
-
-            // Fallback: also hook localStorage.setItem
-            const originalSetItem = localStorage.setItem.bind(localStorage);
-            localStorage.setItem = function(key, value) {
-                if (key === 'ssssoooodd') {
-                    window._capturedLiqiToken = value;
-                    console.log('[HOOK] Captured ssssoooodd on setItem:', value);
-                }
-                return originalSetItem(key, value);
-            };
-
-            console.log('[HOOK] URL + localStorage interceptors installed');
-        })();
-    "#;
-
-    // Create page and navigate directly (skip about:blank)
-    let page = browser
-        .new_page(url)
-        .await
-        .context("Failed to create page")?;
-
-    // Add script to run on every new document (before page scripts)
-    use chromiumoxide::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
-    page.execute(AddScriptToEvaluateOnNewDocumentParams::new(inject_script.to_string()))
-        .await
-        .context("Failed to inject interceptor script")?;
-    info!("Injected token capture hooks");
-
-    // Enable network interception to see WebSocket frames
-    page.execute(NetworkEnable::default()).await?;
-
-    info!("Waiting for login... (timeout: 5 minutes)");
-    info!("Login in the browser, then wait for token capture.");
-
-    // Poll for token - check URL params first (fresh!), then localStorage fallback
-    let server_owned = server.to_string();
-    let mut attempts = 0;
-    let token = timeout(Duration::from_secs(300), async {
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            attempts += 1;
-
-            // BEST: Check for token from URL redirect (EN/JP pass ?uid=...&token=...)
-            if let Ok(captured) = page.evaluate(r#"
-                (function() {
-                    const params = new URLSearchParams(window.location.search);
-                    const uid = params.get('uid');
-                    const token = params.get('token');
-                    if (uid && token) {
-                        return JSON.stringify({uid: uid, token: token});
-                    }
-                    return null;
-                })()
-            "#).await {
-                if let Some(json_str) = captured.value().and_then(|v| v.as_str()) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let (Some(uid), Some(token)) = (
-                            parsed.get("uid").and_then(|v| v.as_str()),
-                            parsed.get("token").and_then(|v| v.as_str())
-                        ) {
-                            info!("Captured token from URL redirect! uid={}", uid);
-                            return CachedToken {
-                                access_token: token.to_string(),
-                                uid: uid.parse().unwrap_or(0),
-                                captured_at: chrono::Utc::now().timestamp(),
-                                server: server_owned.clone(),
-                            };
-                        }
-                    }
-                }
-            }
-
-            // FALLBACK: Check for captured liqi_access_token from localStorage hook
-            if let Ok(captured) = page.evaluate(r#"window._capturedLiqiToken || null"#).await {
-                if let Some(liqi_token) = captured.value().and_then(|v| v.as_str()) {
-                    if liqi_token.len() == 36 && liqi_token.contains('-') {
-                        info!("Captured liqi_access_token from localStorage hook!");
-                        return CachedToken {
-                            access_token: liqi_token.to_string(),
-                            uid: 0,
-                            captured_at: chrono::Utc::now().timestamp(),
-                            server: server_owned.clone(),
-                        };
-                    }
-                }
-            }
-
-            // Debug: dump localStorage on first iteration
-            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !DUMPED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                // Dump ALL localStorage keys and values for debugging
-                if let Ok(all) = page.evaluate(r#"JSON.stringify(localStorage)"#).await {
-                    if let Some(v) = all.value().and_then(|v| v.as_str()) {
-                        info!("ALL localStorage: {}", v);
-                    }
-                }
-            }
-
-            // Try to get token from localStorage
-            // For CN: capture _pre_id_token (raw Google JWT) - ssssoooodd gets consumed by browser
-            let (token_key, token_type) = if server_owned == "cn" {
-                ("_pre_id_token", "jwt")
-            } else {
-                ("ssssoooodd", "uuid")
-            };
-
-            let script = format!(r#"localStorage.getItem('{}')"#, token_key);
-            let result = page.evaluate(script.as_str()).await;
-
-            if let Ok(value) = result {
-                if let Some(token_str) = value.value().and_then(|v| v.as_str()) {
-                    let valid = if token_type == "jwt" {
-                        token_str.starts_with("eyJ") && token_str.len() > 100
-                    } else {
-                        token_str.len() == 36 && token_str.contains('-')
-                    };
-
-                    if valid {
-                        // Also check for lq_uid to ensure account is fully loaded
-                        let uid: u64 = if let Ok(uid_val) = page.evaluate(r#"localStorage.getItem('lq_uid')"#).await {
-                            uid_val.value()
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
-                                .and_then(|s| s.parse().ok())
-                                .unwrap_or(0)
-                        } else {
-                            0
-                        };
-
-                        if uid > 0 {
-                            info!("Found access token with uid {} in localStorage", uid);
-                            return CachedToken {
-                                access_token: token_str.to_string(),
-                                uid,
-                                captured_at: chrono::Utc::now().timestamp(),
-                                server: server_owned.clone(),
-                            };
-                        } else if attempts > 5 {
-                            // Fallback: CN server may not set lq_uid, accept token anyway after 10 seconds
-                            info!("Found access token (no lq_uid after {} attempts, using anyway)", attempts);
-                            return CachedToken {
-                                access_token: token_str.to_string(),
-                                uid: 0,
-                                captured_at: chrono::Utc::now().timestamp(),
-                                server: server_owned.clone(),
-                            };
-                        } else {
-                            debug!("Token found but lq_uid not set yet, waiting... (attempt {})", attempts);
-                        }
-                    }
-                }
-            }
-        }
-    })
-    .await
-    .context("Timeout waiting for login")?;
-
-    // Export full session (localStorage + cookies) BEFORE closing browser
-    info!("Exporting session for headless use...");
-    export_session_from_page(&page, &server_owned).await?;
-
-    // Cleanup
-    drop(page);
-    drop(browser);
-    handler_task.abort();
-
-    // Save to cache
-    token.save()?;
-    info!("Token captured and cached successfully!");
-    info!("Cookies saved - you can now use `majsoul download --headless`");
-
-    Ok(token)
-}
-
-/// Try to extract access_token from response payload
-/// Looks for UUID-like strings in field 2 (access_token field in oauth2Auth response)
-fn try_extract_oauth2_token(data: &[u8], server: &str) -> Option<CachedToken> {
-    // The wrapper has: field 1 = name (empty in responses), field 2 = payload
-    // We need to get field 2, then look for field 2 inside that (access_token)
-
-    let (_, payload) = decode_wrapper(data).ok()?;
-
-    // Look for field 2 in the inner payload (access_token)
-    let access_token = extract_string_field(&payload, 2)?;
-
-    // Must look like a UUID (36 chars with dashes)
-    if access_token.len() == 36 && access_token.chars().filter(|c| *c == '-').count() == 4 {
-        debug!("Found potential access_token: {}", access_token);
-        return Some(CachedToken {
-            access_token,
-            uid: 0,
-            captured_at: chrono::Utc::now().timestamp(),
-            server: server.to_string(),
-        });
-    }
-
-    None
-}
-
-/// Simple protobuf wrapper decoder (matches rpc.rs wrapper module)
-fn decode_wrapper(buf: &[u8]) -> Result<(String, Vec<u8>)> {
-    let mut pos = 0;
-    let mut name = String::new();
-    let mut data = Vec::new();
-
-    while pos < buf.len() {
-        if pos >= buf.len() {
-            break;
-        }
-        let tag = buf[pos];
-        pos += 1;
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-
-        if wire_type != 2 {
-            if wire_type == 0 {
-                while pos < buf.len() && buf[pos] & 0x80 != 0 {
-                    pos += 1;
-                }
-                pos += 1;
-            }
-            continue;
-        }
-
-        let (len, bytes_read) = decode_varint(&buf[pos..])?;
-        pos += bytes_read;
-        let end = pos + len as usize;
-        if end > buf.len() {
-            anyhow::bail!("Buffer overflow");
-        }
-
-        match field_num {
-            1 => name = String::from_utf8_lossy(&buf[pos..end]).to_string(),
-            2 => data = buf[pos..end].to_vec(),
-            _ => {}
-        }
-        pos = end;
-    }
-    Ok((name, data))
-}
-
-fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
-    let mut value: u64 = 0;
-    let mut shift = 0;
-    let mut pos = 0;
-    loop {
-        if pos >= buf.len() {
-            anyhow::bail!("Unexpected end in varint");
-        }
-        let byte = buf[pos];
-        pos += 1;
-        value |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-        shift += 7;
-    }
-    Ok((value, pos))
-}
-
-fn extract_string_field(data: &[u8], target_field: u8) -> Option<String> {
-    let mut pos = 0;
-    while pos < data.len() {
-        let tag = data[pos];
-        pos += 1;
-        let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-
-        if wire_type == 2 {
-            let (len, bytes_read) = decode_varint(&data[pos..]).ok()?;
-            pos += bytes_read;
-            let end = pos + len as usize;
-            if end > data.len() {
-                return None;
-            }
-            if field_num == target_field {
-                return Some(String::from_utf8_lossy(&data[pos..end]).to_string());
-            }
-            pos = end;
-        } else if wire_type == 0 {
-            while pos < data.len() && data[pos] & 0x80 != 0 {
-                pos += 1;
-            }
-            pos += 1;
-        } else {
-            return None;
-        }
-    }
-    None
 }
