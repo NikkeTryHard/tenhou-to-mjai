@@ -9,23 +9,30 @@ use super::rpc::MajsoulRpc;
 use super::token_pool::{AccountToken, TokenPool};
 use crate::db::Database;
 
+/// Gateway info discovered once and shared across workers.
+#[derive(Clone)]
+struct GatewayInfo {
+    endpoint: String,
+    version: String,
+}
+
 /// Distributes work across multiple workers.
 pub struct WorkDistributor;
 
 impl WorkDistributor {
-    /// Divide UUIDs evenly across workers.
+    /// Divide UUIDs evenly across workers by moving ownership.
     ///
     /// If there are fewer UUIDs than workers, some workers will get empty chunks.
-    /// The first `remainder` workers get one extra item each.
-    pub fn chunk_work(uuids: &[String], num_workers: usize) -> Vec<Vec<String>> {
+    /// Uses round-robin distribution for even load balancing.
+    pub fn chunk_work(uuids: Vec<String>, num_workers: usize) -> Vec<Vec<String>> {
         if num_workers == 0 {
             return vec![];
         }
 
         let mut chunks: Vec<Vec<String>> = (0..num_workers).map(|_| Vec::new()).collect();
 
-        for (i, uuid) in uuids.iter().enumerate() {
-            chunks[i % num_workers].push(uuid.clone());
+        for (i, uuid) in uuids.into_iter().enumerate() {
+            chunks[i % num_workers].push(uuid);
         }
 
         chunks
@@ -54,6 +61,7 @@ impl ParallelDownloader {
     /// Download logs using a pool of tokens in parallel.
     ///
     /// Each worker gets its own token and processes a chunk of UUIDs.
+    /// Gateway is discovered once and shared across all workers.
     /// Returns (success_count, failed_count).
     pub async fn download_with_pool(
         &self,
@@ -83,8 +91,19 @@ impl ParallelDownloader {
             num_workers
         );
 
-        // Distribute work
-        let chunks = WorkDistributor::chunk_work(&uuids, num_workers);
+        // Discover gateway once before spawning workers (fix #1)
+        let client = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+            .build()?;
+
+        // Use first token's server for gateway discovery
+        let first_token = pool.next();
+        let (endpoint, version) = discover_gateway_with_retry(&client, &first_token.server).await?;
+        let gateway = GatewayInfo { endpoint, version };
+        info!("Discovered gateway: {} (version {})", gateway.endpoint, gateway.version);
+
+        // Distribute work (fix #4: takes Vec by value)
+        let chunks = WorkDistributor::chunk_work(uuids, num_workers);
 
         // Set up progress bars
         let multi_progress = MultiProgress::new();
@@ -104,13 +123,14 @@ impl ParallelDownloader {
             let db_clone = Arc::clone(&db);
             let delay_ms = self.delay_ms;
             let restart_every = self.restart_every;
+            let gateway_clone = gateway.clone();
 
             let pb = multi_progress.add(ProgressBar::new(chunk.len() as u64));
             pb.set_style(style.clone());
             pb.set_prefix(format!("Worker {}", worker_id));
 
             let handle = tokio::spawn(async move {
-                Self::worker_loop(worker_id, token, chunk, db_clone, delay_ms, restart_every, pb)
+                Self::worker_loop(worker_id, token, chunk, db_clone, delay_ms, restart_every, pb, gateway_clone)
                     .await
             });
 
@@ -142,6 +162,7 @@ impl ParallelDownloader {
     }
 
     /// Worker loop that processes a chunk of UUIDs.
+    /// Uses pre-discovered gateway info but can re-discover on version mismatch (error 151).
     async fn worker_loop(
         worker_id: usize,
         token: AccountToken,
@@ -150,6 +171,7 @@ impl ParallelDownloader {
         delay_ms: u64,
         restart_every: usize,
         pb: ProgressBar,
+        mut gateway: GatewayInfo,
     ) -> Result<(usize, usize)> {
         let client = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
@@ -159,24 +181,24 @@ impl ParallelDownloader {
         let mut failed = 0;
         let mut processed_since_restart = 0;
 
-        // Initial connection
-        let (endpoint, version) = discover_gateway_with_retry(&client, &token.server).await?;
-        let mut rpc = connect_and_login(&endpoint, &token, &version).await?;
+        // Initial connection using pre-discovered gateway
+        let mut rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
 
         for uuid in uuids {
             // Check if we need to restart connection
             if restart_every > 0 && processed_since_restart >= restart_every {
                 info!("Worker {}: Restarting connection", worker_id);
                 let _ = rpc.close().await;
-                rpc = connect_and_login(&endpoint, &token, &version).await?;
+                rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
                 processed_since_restart = 0;
             }
+
+            // Use Database::normalize_uuid instead of duplicating logic (fix #3)
+            let short_uuid = Database::normalize_uuid(&uuid).to_string();
 
             match rpc.fetch_game_record(&uuid).await {
                 Ok(data) => {
                     let db_guard = db.lock().await;
-                    // Extract short UUID from full UUID for database lookup
-                    let short_uuid = extract_short_uuid(&uuid);
                     if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
                         warn!("Worker {}: Failed to save {}: {}", worker_id, uuid, e);
                         failed += 1;
@@ -189,20 +211,27 @@ impl ParallelDownloader {
                     warn!("Worker {}: Failed to fetch {}: {}", worker_id, uuid, err_str);
 
                     if err_str.contains("151") {
-                        // Rate limited - pause for 60 seconds
-                        warn!("Worker {}: Rate limited (error 151), pausing 60s", worker_id);
+                        // Error 151 = version mismatch - re-discover gateway for fresh version (fix #2)
+                        warn!("Worker {}: Version mismatch (error 151), re-discovering gateway", worker_id);
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
 
-                        // Reconnect after rate limit pause
+                        // Re-discover gateway to get fresh version
+                        let (new_endpoint, new_version) = discover_gateway_with_retry(&client, &token.server).await?;
+                        gateway = GatewayInfo {
+                            endpoint: new_endpoint,
+                            version: new_version,
+                        };
+                        info!("Worker {}: Re-discovered gateway version {}", worker_id, gateway.version);
+
+                        // Reconnect with new gateway info
                         let _ = rpc.close().await;
-                        rpc = connect_and_login(&endpoint, &token, &version).await?;
+                        rpc = connect_and_login(&gateway.endpoint, &token, &gateway.version).await?;
                         processed_since_restart = 0;
 
                         // Retry this UUID
                         match rpc.fetch_game_record(&uuid).await {
                             Ok(data) => {
                                 let db_guard = db.lock().await;
-                                let short_uuid = extract_short_uuid(&uuid);
                                 if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data)
                                 {
                                     warn!("Worker {}: Failed to save {}: {}", worker_id, uuid, e);
@@ -217,15 +246,19 @@ impl ParallelDownloader {
                                     worker_id, uuid, e
                                 );
                                 let db_guard = db.lock().await;
-                                let short_uuid = extract_short_uuid(&uuid);
-                                let _ = db_guard.mark_majsoul_download_error(&short_uuid);
+                                // Log warning on DB error instead of silently ignoring (fix #5)
+                                if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
+                                    warn!("Worker {}: Failed to mark error for {}: {}", worker_id, uuid, db_err);
+                                }
                                 failed += 1;
                             }
                         }
                     } else {
                         let db_guard = db.lock().await;
-                        let short_uuid = extract_short_uuid(&uuid);
-                        let _ = db_guard.mark_majsoul_download_error(&short_uuid);
+                        // Log warning on DB error instead of silently ignoring (fix #5)
+                        if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
+                            warn!("Worker {}: Failed to mark error for {}: {}", worker_id, uuid, db_err);
+                        }
                         failed += 1;
                     }
                 }
@@ -243,16 +276,6 @@ impl ParallelDownloader {
         let _ = rpc.close().await;
 
         Ok((success, failed))
-    }
-}
-
-/// Extract short UUID from full UUID (e.g., "220502-abc-def-ghi" -> "abc-def-ghi")
-fn extract_short_uuid(full_uuid: &str) -> String {
-    if full_uuid.len() > 7 && full_uuid.chars().nth(6) == Some('-') {
-        // Has date prefix like "220502-"
-        full_uuid[7..].to_string()
-    } else {
-        full_uuid.to_string()
     }
 }
 
@@ -307,7 +330,7 @@ mod tests {
     #[test]
     fn test_work_distributor() {
         let uuids: Vec<String> = (0..10).map(|i| format!("uuid-{}", i)).collect();
-        let chunks = WorkDistributor::chunk_work(&uuids, 3);
+        let chunks = WorkDistributor::chunk_work(uuids, 3);
 
         assert_eq!(chunks.len(), 3);
 
@@ -331,7 +354,7 @@ mod tests {
     fn test_work_distributor_uneven() {
         // Test with fewer items than workers
         let uuids: Vec<String> = (0..2).map(|i| format!("uuid-{}", i)).collect();
-        let chunks = WorkDistributor::chunk_work(&uuids, 5);
+        let chunks = WorkDistributor::chunk_work(uuids, 5);
 
         assert_eq!(chunks.len(), 5);
 
@@ -350,7 +373,7 @@ mod tests {
     #[test]
     fn test_work_distributor_empty() {
         let uuids: Vec<String> = vec![];
-        let chunks = WorkDistributor::chunk_work(&uuids, 3);
+        let chunks = WorkDistributor::chunk_work(uuids, 3);
 
         assert_eq!(chunks.len(), 3);
         assert!(chunks.iter().all(|c| c.is_empty()));
@@ -359,26 +382,8 @@ mod tests {
     #[test]
     fn test_work_distributor_zero_workers() {
         let uuids: Vec<String> = vec!["uuid-0".to_string()];
-        let chunks = WorkDistributor::chunk_work(&uuids, 0);
+        let chunks = WorkDistributor::chunk_work(uuids, 0);
 
         assert_eq!(chunks.len(), 0);
-    }
-
-    #[test]
-    fn test_extract_short_uuid() {
-        // With date prefix
-        assert_eq!(
-            extract_short_uuid("220502-4c44126f-5f77-4051-acc3-83a574b75ca2"),
-            "4c44126f-5f77-4051-acc3-83a574b75ca2"
-        );
-
-        // Without date prefix
-        assert_eq!(
-            extract_short_uuid("4c44126f-5f77-4051-acc3-83a574b75ca2"),
-            "4c44126f-5f77-4051-acc3-83a574b75ca2"
-        );
-
-        // Short UUID already
-        assert_eq!(extract_short_uuid("abc123"), "abc123");
     }
 }

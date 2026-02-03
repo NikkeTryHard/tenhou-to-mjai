@@ -241,7 +241,7 @@ impl Database {
     }
 
     /// Extract short UUID from potentially full UUID (strips YYMMDD- prefix if present)
-    fn normalize_uuid(uuid: &str) -> &str {
+    pub fn normalize_uuid(uuid: &str) -> &str {
         // Full UUID format: "250101-a7d2bfbf-dac8-45b9-a667-861f82589725"
         // Short UUID format: "a7d2bfbf-dac8-45b9-a667-861f82589725"
         if uuid.len() > 7 && uuid.chars().nth(6) == Some('-') {

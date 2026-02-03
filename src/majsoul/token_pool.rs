@@ -90,6 +90,18 @@ impl TokenPool {
         self.tokens[idx].clone()
     }
 
+    /// Get the next token using round-robin selection, or None if pool is empty.
+    ///
+    /// This is a safe alternative to `next()` that doesn't panic on empty pools.
+    pub fn try_next(&self) -> Option<AccountToken> {
+        if self.tokens.is_empty() {
+            return None;
+        }
+
+        let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.tokens.len();
+        Some(self.tokens[idx].clone())
+    }
+
     /// Returns the number of tokens in the pool.
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -194,5 +206,31 @@ mod tests {
         let result = TokenPool::parse_tokens(content);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid uid"));
+    }
+
+    #[test]
+    fn test_token_pool_try_next() {
+        // Test with non-empty pool
+        let tokens = vec![
+            AccountToken {
+                uid: 1,
+                token: "token1".to_string(),
+                server: "en".to_string(),
+            },
+            AccountToken {
+                uid: 2,
+                token: "token2".to_string(),
+                server: "jp".to_string(),
+            },
+        ];
+
+        let pool = TokenPool::new(tokens);
+        assert_eq!(pool.try_next().unwrap().uid, 1);
+        assert_eq!(pool.try_next().unwrap().uid, 2);
+        assert_eq!(pool.try_next().unwrap().uid, 1); // wraps around
+
+        // Test with empty pool - should return None instead of panicking
+        let empty_pool = TokenPool::new(vec![]);
+        assert!(empty_pool.try_next().is_none());
     }
 }
