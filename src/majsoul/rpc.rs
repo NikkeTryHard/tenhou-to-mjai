@@ -384,6 +384,73 @@ mod requests {
         encode_varint(&mut buf, filter_id as u64);
         buf
     }
+
+    /// Build ReqLogin for CN native login (username/password)
+    pub fn build_login_request(
+        account: &str,
+        password_hash: &str,
+        random_key: &str,
+        version: &str,
+    ) -> Vec<u8> {
+        let mut buf = Vec::new();
+
+        // Field 1: account (string)
+        encode_string(&mut buf, 1, account);
+        // Field 2: password (string, hashed)
+        encode_string(&mut buf, 2, password_hash);
+        // Field 4: device { is_browser: true }
+        encode_nested_device_simple(&mut buf);
+        // Field 8: random_key (string)
+        encode_string(&mut buf, 8, random_key);
+        // Field 9: gen_access_token (bool = true)
+        encode_bool(&mut buf, 9, true);
+        // Field 10: currency_platforms (repeated int32 = [2])
+        encode_varint_field(&mut buf, 10, 2);
+        // Field 12: client_version_string
+        encode_string(&mut buf, 12, version);
+
+        buf
+    }
+
+    /// Build loginBeat request
+    pub fn build_login_beat_request(contract: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_string(&mut buf, 1, contract);
+        buf
+    }
+
+    fn encode_string(buf: &mut Vec<u8>, field: u32, value: &str) {
+        let tag = (field << 3) | 2;
+        encode_varint(buf, tag as u64);
+        encode_varint(buf, value.len() as u64);
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn encode_bool(buf: &mut Vec<u8>, field: u32, value: bool) {
+        let tag = (field << 3) | 0;
+        encode_varint(buf, tag as u64);
+        buf.push(if value { 1 } else { 0 });
+    }
+
+    fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
+        let tag = (field << 3) | 0;
+        encode_varint(buf, tag as u64);
+        encode_varint(buf, value);
+    }
+
+    /// Encode device message with just is_browser = true (for native login)
+    fn encode_nested_device_simple(buf: &mut Vec<u8>) {
+        // Field 4: device message with is_browser = true (field 5 in device)
+        let mut inner = Vec::new();
+        // Field 5: is_browser = true
+        inner.push(0x28); // (5 << 3) | 0
+        inner.push(0x01);
+
+        let tag = (4 << 3) | 2;
+        encode_varint(buf, tag as u64);
+        encode_varint(buf, inner.len() as u64);
+        buf.extend(inner);
+    }
 }
 
 pub struct MajsoulRpc {
@@ -731,6 +798,116 @@ impl MajsoulRpc {
     pub async fn close(self) -> Result<()> {
         self.write.lock().await.close().await?;
         Ok(())
+    }
+
+    /// Login with username/password (CN server native auth)
+    pub async fn login_native(&self, username: &str, password: &str, version: &str) -> Result<()> {
+        use crate::majsoul::auth::hash_password;
+
+        // Step 0: Send heartbeat first (required to establish session)
+        info!("Sending heartbeat");
+        let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
+        debug!("Heartbeat response: {} bytes", hb_response.len());
+
+        let password_hash = hash_password(password);
+        let random_key = Uuid::new_v4().to_string();
+        let version_string = format!("web-{}", version.replace(".w", ""));
+
+        info!("Authenticating with native login (account={})", username);
+
+        // Build ReqLogin protobuf
+        let request = requests::build_login_request(
+            username,
+            &password_hash,
+            &random_key,
+            &version_string,
+        );
+
+        let response = self.call(".lq.Lobby.login", &request).await?;
+
+        debug!(
+            "login response ({} bytes): {:02x?}",
+            response.len(),
+            &response[..std::cmp::min(100, response.len())]
+        );
+
+        // Check for error
+        if let Some(error_code) = Self::extract_error_code(&response) {
+            if error_code != 0 {
+                anyhow::bail!("CN native login failed with error code: {}", error_code);
+            }
+        }
+
+        // Extract access_token (field 2) for verification
+        if let Some(token) = Self::extract_string_field(&response, 2) {
+            info!("CN native login successful (token: {}...)", &token[..8.min(token.len())]);
+        } else {
+            info!("CN native login successful");
+        }
+
+        // Send loginSuccess
+        self.call(".lq.Lobby.loginSuccess", &[]).await?;
+
+        // Send loginBeat with contract
+        let contract = "DF2vkXCnfeXp4WoGSBGNcJBufZiMN3UP";
+        let beat_req = requests::build_login_beat_request(contract);
+        self.call(".lq.Lobby.loginBeat", &beat_req).await?;
+
+        Ok(())
+    }
+
+    /// Extract error code from protobuf response
+    /// Handles both nested (0a <len> 08 <code>) and direct (08 <code>) formats
+    fn extract_error_code(data: &[u8]) -> Option<u8> {
+        if data.len() >= 4 && data[0] == 0x0a && data[2] == 0x08 {
+            // Nested error in field 1
+            Some(data[3])
+        } else if data.len() >= 2 && data[0] == 0x08 {
+            // Direct error code
+            Some(data[1])
+        } else {
+            None
+        }
+    }
+
+    /// Extract string field from protobuf response by field number
+    fn extract_string_field(data: &[u8], target_field: u32) -> Option<String> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let tag = data[pos];
+            pos += 1;
+            let field_num = (tag >> 3) as u32;
+            let wire_type = tag & 0x07;
+
+            if wire_type == 2 {
+                // Length-delimited
+                let mut len: usize = 0;
+                let mut shift = 0;
+                while pos < data.len() {
+                    let b = data[pos];
+                    pos += 1;
+                    len |= ((b & 0x7f) as usize) << shift;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                    shift += 7;
+                }
+                if field_num == target_field && pos + len <= data.len() {
+                    return Some(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                }
+                pos += len;
+            } else if wire_type == 0 {
+                // Varint - skip
+                while pos < data.len() && data[pos] & 0x80 != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            } else {
+                // Unknown wire type, stop parsing
+                break;
+            }
+        }
+        None
     }
 }
 

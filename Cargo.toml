@@ -27,6 +27,9 @@ chromiumoxide = { version = "0.8", features = ["tokio-runtime"], default-feature
 base64 = "0.22"
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }
