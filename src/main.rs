@@ -346,6 +346,21 @@ enum MajsoulCommands {
         #[arg(long, default_value = "10000")]
         restart_every: usize,
     },
+
+    /// Resolve phantom UUIDs via browser injection
+    ResolvePhantoms {
+        /// Maximum UUIDs to resolve
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between requests in ms
+        #[arg(long, default_value = "2000")]
+        delay_ms: u64,
+
+        /// Server region: en, jp
+        #[arg(long, default_value = "en")]
+        server: String,
+    },
 }
 
 #[tokio::main]
@@ -1428,6 +1443,26 @@ async fn main() -> Result<()> {
                 let (success, failed) = downloader.download_with_pool(db, &pool, limit).await?;
 
                 info!("Bulk download complete: {} success, {} failed", success, failed);
+            }
+            MajsoulCommands::ResolvePhantoms { limit, delay_ms, server } => {
+                let phantoms = db.get_orphan_short_uuids(limit, Some(16))?;
+                if phantoms.is_empty() {
+                    info!("No phantom UUIDs to resolve");
+                    return Ok(());
+                }
+
+                info!("Resolving {} phantom UUIDs via browser...", phantoms.len());
+
+                let results = majsoul::browser::resolve_phantom_uuids(&server, &phantoms, delay_ms).await?;
+
+                let mut resolved = 0;
+                for (short, full) in results {
+                    if db.set_orphan_full_uuid(&short, &full)? {
+                        resolved += 1;
+                    }
+                }
+
+                info!("Resolved {} phantom UUIDs", resolved);
             }
         },
     }
