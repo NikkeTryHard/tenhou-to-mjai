@@ -88,7 +88,7 @@ mod wrapper {
         }
     }
 
-    fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
+    pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
         let mut value: u64 = 0;
         let mut shift = 0;
         let mut pos = 0;
@@ -197,6 +197,49 @@ mod requests {
         buf.push(0x12);
         encode_varint(&mut buf, access_token.len() as u64);
         buf.extend_from_slice(access_token.as_bytes());
+        buf
+    }
+
+    /// Native login with uid + token (from URL redirect)
+    pub fn login_with_token(token: &str, uid: u64, version: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: account (uid as string)
+        let uid_str = uid.to_string();
+        buf.push(0x0a);
+        encode_varint(&mut buf, uid_str.len() as u64);
+        buf.extend_from_slice(uid_str.as_bytes());
+        // Field 2: password (empty for token login)
+        buf.push(0x12);
+        buf.push(0x00);
+        // Field 3: reconnect = false
+        buf.push(0x18);
+        buf.push(0x00);
+        // Field 4: device
+        let device = encode_device();
+        buf.push(0x22);
+        encode_varint(&mut buf, device.len() as u64);
+        buf.extend_from_slice(&device);
+        // Field 5: random_key
+        let random_key = Uuid::new_v4().to_string();
+        buf.push(0x2a);
+        encode_varint(&mut buf, random_key.len() as u64);
+        buf.extend_from_slice(random_key.as_bytes());
+        // Field 6: client_version
+        let version_str = format!("web-{}", version);
+        let mut client_version = Vec::new();
+        client_version.push(0x0a);
+        encode_varint(&mut client_version, version_str.len() as u64);
+        client_version.extend_from_slice(version_str.as_bytes());
+        buf.push(0x32);
+        encode_varint(&mut buf, client_version.len() as u64);
+        buf.extend_from_slice(&client_version);
+        // Field 9: type = 0 (token login)
+        buf.push(0x48);
+        buf.push(0x00);
+        // Field 10: access_token
+        buf.push(0x52);
+        encode_varint(&mut buf, token.len() as u64);
+        buf.extend_from_slice(token.as_bytes());
         buf
     }
 
@@ -316,6 +359,31 @@ mod requests {
         buf.extend_from_slice(uuid.as_bytes());
         buf
     }
+
+    /// Fetch public game record list from ranked rooms
+    /// type: 0=all, 1=Bronze, 2=Silver, 3=Gold, 4=Jade, 5=Throne
+    pub fn fetch_game_record_list(start: u32, count: u32, room_type: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: start (pagination offset)
+        buf.push(0x08);
+        encode_varint(&mut buf, start as u64);
+        // Field 2: count (number of records)
+        buf.push(0x10);
+        encode_varint(&mut buf, count as u64);
+        // Field 3: type (room type)
+        buf.push(0x18);
+        encode_varint(&mut buf, room_type as u64);
+        buf
+    }
+
+    /// Fetch live games list (spectatable)
+    pub fn fetch_game_live_list(filter_id: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        // Field 1: filter_id (0 = all, or specific room)
+        buf.push(0x08);
+        encode_varint(&mut buf, filter_id as u64);
+        buf
+    }
 }
 
 pub struct MajsoulRpc {
@@ -426,11 +494,11 @@ impl MajsoulRpc {
                 (&token[..last_dash], potential_uid)
             } else {
                 // No uid suffix, use token directly as access_token
-                return self.login_with_access_token(token, version, server).await;
+                return self.login_with_access_token(token, version, server, None).await;
             }
         } else {
             // No uid, try as direct access_token
-            return self.login_with_access_token(token, version, server).await;
+            return self.login_with_access_token(token, version, server, None).await;
         };
 
         info!("Authenticating with oauth2Auth (code={}, uid={})", &code[..8], uid);
@@ -463,10 +531,10 @@ impl MajsoulRpc {
         info!("Got access_token: {}...", &access_token[..8.min(access_token.len())]);
 
         // Step 2: oauth2Login with the real access_token
-        self.login_with_access_token(&access_token, version, "en").await
+        self.login_with_access_token(&access_token, version, "en", None).await
     }
 
-    async fn login_with_access_token(&self, access_token: &str, version: &str, server: &str) -> Result<Vec<u8>> {
+    async fn login_with_access_token(&self, access_token: &str, version: &str, server: &str, uid: Option<u64>) -> Result<Vec<u8>> {
         // Step 1: oauth2Check to validate token
         info!("Checking token with oauth2Check (server: {}, type: {})", server, requests::auth_type_for_server(server));
         let check_request = requests::oauth2_check(access_token, server);
@@ -474,8 +542,23 @@ impl MajsoulRpc {
         debug!("oauth2Check response: {:02x?}", &check_response[..std::cmp::min(50, check_response.len())]);
 
         // For CN/TW/HK with JWT token: exchange via oauth2Auth first
-        // JWT starts with "eyJ", UUID tokens are 36 chars
+        // JWT starts with "eyJ", UUID tokens are 36 chars, URL tokens are 32 hex
         let is_jwt = access_token.starts_with("eyJ") && access_token.len() > 100;
+        let is_url_token = access_token.len() == 32 && access_token.chars().all(|c| c.is_ascii_hexdigit());
+
+        // URL tokens (from redirect) use native login, not oauth2Login
+        if is_url_token {
+            info!("Using URL token with native login (uid: {})", uid.unwrap_or(0));
+            let login_request = requests::login_with_token(access_token, uid.unwrap_or(0), version);
+            let response = self.call(".lq.Lobby.login", &login_request).await?;
+
+            // Check for error
+            if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
+                anyhow::bail!("Native login failed (error {})", response[1]);
+            }
+            info!("Login successful (native token)");
+            return Ok(response);
+        }
 
         let final_token = if server == "cn" && is_jwt {
             info!("CN: exchanging Google JWT via oauth2Auth (type 20)...");
@@ -530,18 +613,19 @@ impl MajsoulRpc {
 
         if let Some(code) = error_code {
             if code != 0 {
-                // CN server error 109: two-step OAuth - extract liqi_access_token and retry
+                // Error 109: two-step OAuth - extract liqi_access_token and retry with same type
                 if code == 109 {
                     if let Some(liqi_token) = Self::extract_liqi_token(&response) {
-                        info!("TW/HK two-step OAuth: got liqi_access_token, retrying with type 16...");
-                        let retry_request = requests::oauth2_login_with_type(&liqi_token, version, 16);
+                        let auth_type = requests::auth_type_for_server(server);
+                        info!("Two-step OAuth: got liqi_access_token, retrying with type {}...", auth_type);
+                        let retry_request = requests::oauth2_login_with_type(&liqi_token, version, auth_type);
                         let retry_response = self.call(".lq.Lobby.oauth2Login", &retry_request).await?;
                         info!("oauth2Login retry response ({} bytes)", retry_response.len());
                         // Check retry response for errors
                         if retry_response.len() >= 4 && retry_response[0] == 0x0a && retry_response[2] == 0x08 && retry_response[3] != 0 {
-                            anyhow::bail!("CN login retry failed (error {})", retry_response[3]);
+                            anyhow::bail!("Login retry failed (error {})", retry_response[3]);
                         }
-                        info!("Login successful (CN two-step)");
+                        info!("Login successful (two-step)");
                         return Ok(retry_response);
                     }
                 }
@@ -621,8 +705,185 @@ impl MajsoulRpc {
         Ok(response)
     }
 
+    /// Fetch public game list from ranked rooms (Throne, Jade, Gold, etc.)
+    /// room_type: 0=all, 1=Bronze, 2=Silver, 3=Gold, 4=Jade, 5=Throne
+    pub async fn fetch_game_record_list(&self, start: u32, count: u32, room_type: u32) -> Result<Vec<u8>> {
+        let request = requests::fetch_game_record_list(start, count, room_type);
+        let response = self.call(".lq.Lobby.fetchGameRecordList", &request).await?;
+        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
+            anyhow::bail!("fetchGameRecordList error {}", response[1]);
+        }
+        debug!("Fetched game record list ({} bytes)", response.len());
+        Ok(response)
+    }
+
+    /// Fetch live games (spectatable)
+    pub async fn fetch_game_live_list(&self, filter_id: u32) -> Result<Vec<u8>> {
+        let request = requests::fetch_game_live_list(filter_id);
+        let response = self.call(".lq.Lobby.fetchGameLiveList", &request).await?;
+        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
+            anyhow::bail!("fetchGameLiveList error {}", response[1]);
+        }
+        debug!("Fetched live game list ({} bytes)", response.len());
+        Ok(response)
+    }
+
     pub async fn close(self) -> Result<()> {
         self.write.lock().await.close().await?;
         Ok(())
+    }
+}
+
+/// Skip a protobuf field based on wire type, returning bytes consumed
+/// Wire types: 0=varint, 1=64-bit, 2=length-delimited, 5=32-bit
+fn skip_field(data: &[u8], wire_type: u8) -> Result<usize> {
+    match wire_type {
+        0 => {
+            // Varint: skip bytes until MSB is 0
+            let (_, len) = wrapper::decode_varint(data)?;
+            Ok(len)
+        }
+        1 => {
+            // 64-bit fixed
+            if data.len() < 8 {
+                anyhow::bail!("Buffer too short for 64-bit fixed");
+            }
+            Ok(8)
+        }
+        2 => {
+            // Length-delimited
+            let (len, varint_bytes) = wrapper::decode_varint(data)?;
+            Ok(varint_bytes + len as usize)
+        }
+        5 => {
+            // 32-bit fixed
+            if data.len() < 4 {
+                anyhow::bail!("Buffer too short for 32-bit fixed");
+            }
+            Ok(4)
+        }
+        _ => anyhow::bail!("Unsupported wire type {}", wire_type),
+    }
+}
+
+/// Extract full UUID from fetchGameRecord response
+/// Response structure: Field 2 (head) contains Field 1 (uuid)
+pub fn extract_full_uuid_from_record(data: &[u8]) -> Result<String> {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+
+        if wire_type == 2 {
+            // Length-delimited
+            let (len, varint_bytes) = wrapper::decode_varint(&data[pos..])?;
+            pos += varint_bytes;
+            let len = len as usize;
+
+            if field_num == 2 && pos + len <= data.len() {
+                // Field 2 is head - parse nested message for uuid (field 1)
+                let head_data = &data[pos..pos + len];
+                if let Ok(uuid) = extract_uuid_from_head(head_data) {
+                    return Ok(uuid);
+                }
+            }
+            pos += len;
+        } else {
+            // Skip field based on wire type
+            let skip = skip_field(&data[pos..], wire_type)?;
+            pos += skip;
+        }
+    }
+    anyhow::bail!("Full UUID not found in fetchGameRecord response")
+}
+
+fn extract_uuid_from_head(data: &[u8]) -> Result<String> {
+    let mut pos = 0;
+
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        let field_num = tag >> 3;
+        let wire_type = tag & 0x07;
+
+        if wire_type == 2 {
+            // Length-delimited
+            let (len, varint_bytes) = wrapper::decode_varint(&data[pos..])?;
+            pos += varint_bytes;
+            let len = len as usize;
+
+            if field_num == 1 && pos + len <= data.len() {
+                // Field 1 is uuid
+                return Ok(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+            }
+            pos += len;
+        } else {
+            // Skip field based on wire type
+            let skip = skip_field(&data[pos..], wire_type)?;
+            pos += skip;
+        }
+    }
+    anyhow::bail!("UUID not found in head")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_full_uuid_from_record() {
+        // Simulated fetchGameRecord response structure:
+        // Field 2 (head): contains nested message with Field 1 (uuid)
+        // Build: 0x12 <len> 0x0a <uuid_len> <uuid_bytes>
+        let uuid = "250101-a7d2bfbf-dac8-45b9-a667-861f82589725";
+        let mut head = vec![0x0a]; // Field 1: uuid
+        wrapper::encode_varint(&mut head, uuid.len() as u64);
+        head.extend_from_slice(uuid.as_bytes());
+
+        let mut response = vec![0x12]; // Field 2: head
+        wrapper::encode_varint(&mut response, head.len() as u64);
+        response.extend_from_slice(&head);
+
+        let result = extract_full_uuid_from_record(&response).unwrap();
+        assert_eq!(result, uuid);
+    }
+
+    #[test]
+    fn test_extract_full_uuid_with_fixed_wire_types() {
+        // Test that parser correctly skips wire types 1 (64-bit) and 5 (32-bit)
+        // before finding the UUID in field 2
+        let uuid = "250101-a7d2bfbf-dac8-45b9-a667-861f82589725";
+
+        // Build head message with uuid
+        let mut head = vec![0x0a]; // Field 1: uuid (wire type 2)
+        wrapper::encode_varint(&mut head, uuid.len() as u64);
+        head.extend_from_slice(uuid.as_bytes());
+
+        // Build response with various wire types before field 2 (head)
+        let mut response = Vec::new();
+
+        // Field 3, wire type 1 (64-bit fixed): tag = (3 << 3) | 1 = 0x19
+        response.push(0x19);
+        response.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]); // 8 bytes
+
+        // Field 4, wire type 5 (32-bit fixed): tag = (4 << 3) | 5 = 0x25
+        response.push(0x25);
+        response.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]); // 4 bytes
+
+        // Field 5, wire type 0 (varint): tag = (5 << 3) | 0 = 0x28
+        response.push(0x28);
+        response.push(0x42); // varint value 66
+
+        // Field 2 (head): tag = (2 << 3) | 2 = 0x12
+        response.push(0x12);
+        wrapper::encode_varint(&mut response, head.len() as u64);
+        response.extend_from_slice(&head);
+
+        // This should work - parser must skip wire types 1 and 5 correctly
+        let result = extract_full_uuid_from_record(&response).unwrap();
+        assert_eq!(result, uuid);
     }
 }
