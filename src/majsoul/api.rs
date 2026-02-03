@@ -171,7 +171,10 @@ impl AmaeKoromoClient {
         let mut all_games = Vec::new();
         let mut player_ids = HashSet::new();
         let mut api_calls = 0u32;
-        let mut current_end_ms = day_end_ms;
+
+        // Cap end timestamp at current time (API returns fewer results with future timestamps)
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut current_end_ms = day_end_ms.min(now_ms);
 
         loop {
             let url = format!(
