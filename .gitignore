@@ -24,3 +24,4 @@ amae-koromo-scripts/
 # Scripts (local dev helpers)
 scripts/
 *.sh
+.worktrees/
