@@ -2,8 +2,11 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Amae-Koromo API returns max 200 records per player_records request
+const AMAE_KOROMO_PAGE_LIMIT: i64 = 200;
+
 pub struct Database {
-    conn: Connection,
+    pub conn: Connection,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,14 @@ impl Database {
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
+    }
+
+    pub fn enable_wal_mode(&self) -> Result<()> {
+        // journal_mode returns the mode name as string
+        let _: String = self.conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+        // busy_timeout returns the timeout value as integer
+        let _: i64 = self.conn.query_row("PRAGMA busy_timeout = 5000", [], |row| row.get(0))?;
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -79,12 +90,26 @@ impl Database {
                 record_count INTEGER DEFAULT 0,
                 PRIMARY KEY (date, mode_id)
             );
+
+            -- Throne room players for full UUID fetching
+            CREATE TABLE IF NOT EXISTS throne_players (
+                account_id INTEGER PRIMARY KEY,
+                nickname TEXT,
+                fetched_at TEXT
+            );
             ",
         )?;
 
         // Schema migration: add columns if they don't exist (for existing databases)
         let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN num_players INTEGER", []);
         let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN is_hanchan INTEGER", []);
+        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN full_uuid TEXT", []);
+
+        // Create index on full_uuid after migration ensures column exists
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_majsoul_logs_full_uuid ON majsoul_logs(full_uuid)",
+            [],
+        )?;
 
         Ok(())
     }
@@ -215,6 +240,19 @@ impl Database {
         Ok(result > 0)
     }
 
+    /// Extract short UUID from potentially full UUID (strips YYMMDD- prefix if present)
+    fn normalize_uuid(uuid: &str) -> &str {
+        // Full UUID format: "250101-a7d2bfbf-dac8-45b9-a667-861f82589725"
+        // Short UUID format: "a7d2bfbf-dac8-45b9-a667-861f82589725"
+        if uuid.len() > 7 && uuid.chars().nth(6) == Some('-') {
+            // Check if first 6 chars are digits (YYMMDD)
+            if uuid[..6].chars().all(|c| c.is_ascii_digit()) {
+                return &uuid[7..];
+            }
+        }
+        uuid
+    }
+
     pub fn insert_majsoul_log(
         &self,
         uuid: &str,
@@ -222,10 +260,36 @@ impl Database {
         start_time: i64,
         mode_id: Option<i32>,
     ) -> Result<bool> {
+        let short_uuid = Self::normalize_uuid(uuid);
         let result = self.conn.execute(
             "INSERT OR IGNORE INTO majsoul_logs (uuid, player_id, start_time, mode_id) VALUES (?1, ?2, ?3, ?4)",
-            params![uuid, player_id, start_time, mode_id],
+            params![short_uuid, player_id, start_time, mode_id],
         )?;
+        Ok(result > 0)
+    }
+
+    /// Insert majsoul log with full UUID (from player_records API)
+    /// Normalizes to short UUID for primary key, stores full UUID separately
+    pub fn insert_majsoul_log_with_full_uuid(
+        &self,
+        full_uuid: &str,
+        player_id: i64,
+        start_time: i64,
+        mode_id: Option<i32>,
+    ) -> Result<bool> {
+        let short_uuid = Self::normalize_uuid(full_uuid);
+        // Try insert first
+        let result = self.conn.execute(
+            "INSERT OR IGNORE INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![short_uuid, player_id, start_time, mode_id, full_uuid],
+        )?;
+        // If already exists, update full_uuid if it was missing
+        if result == 0 {
+            self.conn.execute(
+                "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2 AND full_uuid IS NULL",
+                params![full_uuid, short_uuid],
+            )?;
+        }
         Ok(result > 0)
     }
 
@@ -398,5 +462,391 @@ impl Database {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// Get UUIDs without resolved paipu URLs
+    pub fn get_majsoul_unresolved_paipu(&self, limit: Option<usize>) -> Result<Vec<(String, i64)>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT uuid, player_id FROM majsoul_logs WHERE paipu_url IS NULL ORDER BY start_time LIMIT {}",
+                n
+            ),
+            None => "SELECT uuid, player_id FROM majsoul_logs WHERE paipu_url IS NULL ORDER BY start_time".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Update paipu URL for a UUID
+    pub fn set_majsoul_paipu_url(&self, uuid: &str, paipu_url: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_logs SET paipu_url = ?1 WHERE uuid = ?2",
+            params![paipu_url, uuid],
+        )?;
+        Ok(())
+    }
+
+    /// Get all resolved paipu URLs
+    pub fn get_majsoul_resolved_paipu(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT paipu_url FROM majsoul_logs WHERE paipu_url IS NOT NULL ORDER BY start_time"
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Count resolved vs unresolved paipu URLs
+    pub fn count_majsoul_paipu_status(&self) -> Result<(i64, i64)> {
+        let resolved: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE paipu_url IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let unresolved: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE paipu_url IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((resolved, unresolved))
+    }
+
+    // Throne player methods for full UUID fetching
+
+    /// Insert or update a throne player
+    pub fn upsert_throne_player(&self, account_id: i64, nickname: &str) -> Result<bool> {
+        let result = self.conn.execute(
+            "INSERT OR IGNORE INTO throne_players (account_id, nickname) VALUES (?1, ?2)",
+            params![account_id, nickname],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// Get unfetched throne players
+    pub fn get_unfetched_throne_players(&self, limit: Option<usize>) -> Result<Vec<i64>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT account_id FROM throne_players WHERE fetched_at IS NULL LIMIT {}",
+                n
+            ),
+            None => "SELECT account_id FROM throne_players WHERE fetched_at IS NULL".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Mark a throne player as fetched
+    pub fn mark_throne_player_fetched(&self, account_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE throne_players SET fetched_at = datetime('now') WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count how many games we have for a specific player
+    pub fn count_player_games(&self, account_id: i64, mode_id: i32) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE player_id = ?1 AND mode_id = ?2",
+            params![account_id, mode_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Get throne players who were fetched but may have hit the page limit cap
+    pub fn get_throne_players_needing_refetch(&self, limit: Option<usize>) -> Result<Vec<i64>> {
+        let sql = match limit {
+            Some(n) => format!(
+                r#"
+                SELECT tp.account_id
+                FROM throne_players tp
+                WHERE tp.fetched_at IS NOT NULL
+                AND (
+                    SELECT COUNT(*) FROM majsoul_logs ml
+                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
+                ) = {}
+                LIMIT {}
+                "#,
+                AMAE_KOROMO_PAGE_LIMIT,
+                n
+            ),
+            None => format!(
+                r#"
+                SELECT tp.account_id
+                FROM throne_players tp
+                WHERE tp.fetched_at IS NOT NULL
+                AND (
+                    SELECT COUNT(*) FROM majsoul_logs ml
+                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
+                ) = {}
+                "#,
+                AMAE_KOROMO_PAGE_LIMIT
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Reset fetched_at for a player so they can be re-fetched
+    pub fn reset_throne_player_fetched(&self, account_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE throne_players SET fetched_at = NULL WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reset fetched_at for all players who hit the page limit cap
+    pub fn reset_capped_throne_players(&self) -> Result<usize> {
+        let sql = format!(
+            r#"
+            UPDATE throne_players
+            SET fetched_at = NULL
+            WHERE fetched_at IS NOT NULL
+            AND account_id IN (
+                SELECT player_id FROM majsoul_logs
+                WHERE mode_id = 16
+                GROUP BY player_id
+                HAVING COUNT(*) = {}
+            )
+            "#,
+            AMAE_KOROMO_PAGE_LIMIT
+        );
+        let result = self.conn.execute(&sql, [])?;
+        Ok(result)
+    }
+
+    /// Update full_uuid for a majsoul log (by short uuid match)
+    /// Alias for set_orphan_full_uuid - kept for API compatibility
+    pub fn set_majsoul_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
+        self.set_orphan_full_uuid(short_uuid, full_uuid)
+    }
+
+    /// Count throne player stats
+    pub fn count_throne_players(&self) -> Result<(i64, i64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM throne_players",
+            [],
+            |row| row.get(0),
+        )?;
+        let fetched: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM throne_players WHERE fetched_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, fetched))
+    }
+
+    /// Count majsoul logs with full_uuid
+    pub fn count_majsoul_full_uuids(&self) -> Result<(i64, i64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs",
+            [],
+            |row| row.get(0),
+        )?;
+        let with_full: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE full_uuid IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, with_full))
+    }
+
+    /// Helper for simple count queries
+    pub fn conn_query_row(&self, sql: &str) -> Result<i64> {
+        let count: i64 = self.conn.query_row(sql, [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    /// Populate throne_players from existing majsoul_logs (extracts player IDs)
+    pub fn populate_throne_players(&self) -> Result<usize> {
+        // Get distinct player_ids from majsoul_logs where mode_id = 16 (throne)
+        let count = self.conn.execute(
+            "INSERT OR IGNORE INTO throne_players (account_id)
+             SELECT DISTINCT player_id FROM majsoul_logs WHERE mode_id = 16",
+            [],
+        )?;
+        Ok(count)
+    }
+
+    /// Get players who have orphaned games (games without full_uuid)
+    /// Returns player_ids that have at least one orphaned game
+    pub fn get_players_with_orphans(&self, limit: Option<usize>) -> Result<Vec<i64>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT DISTINCT player_id FROM majsoul_logs
+                 WHERE full_uuid IS NULL AND mode_id = 16
+                 ORDER BY player_id LIMIT {}",
+                n
+            ),
+            None => "SELECT DISTINCT player_id FROM majsoul_logs
+                     WHERE full_uuid IS NULL AND mode_id = 16
+                     ORDER BY player_id".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Count orphaned games (games without full_uuid)
+    pub fn count_orphaned_games(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// Update orphaned game's full_uuid by matching on start_time and player_id
+    /// Returns true if an orphan was updated
+    pub fn update_orphan_full_uuid(
+        &self,
+        player_id: i64,
+        start_time: i64,
+        full_uuid: &str,
+    ) -> Result<bool> {
+        let result = self.conn.execute(
+            "UPDATE majsoul_logs SET full_uuid = ?1
+             WHERE player_id = ?2 AND start_time = ?3 AND full_uuid IS NULL",
+            params![full_uuid, player_id, start_time],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// Get orphan short UUIDs that need resolution (no full_uuid)
+    /// If mode_id is None, get orphans for all modes; if Some(id), filter by that mode
+    pub fn get_orphan_short_uuids(&self, limit: Option<usize>, mode_id: Option<i32>) -> Result<Vec<String>> {
+        let mut sql = String::from("SELECT uuid FROM majsoul_logs WHERE full_uuid IS NULL");
+
+        if let Some(mode) = mode_id {
+            sql.push_str(&format!(" AND mode_id = {}", mode));
+        }
+
+        sql.push_str(" ORDER BY start_time");
+
+        if let Some(n) = limit {
+            sql.push_str(&format!(" LIMIT {}", n));
+        }
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Set full_uuid for an orphan by its short uuid
+    pub fn set_orphan_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
+        let result = self.conn.execute(
+            "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2 AND full_uuid IS NULL",
+            params![full_uuid, short_uuid],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// Cross-match orphan UUIDs by start_time against known full UUIDs (Throne mode only)
+    /// Returns the number of orphans that were matched and updated
+    pub fn cross_match_orphan_uuids(&self) -> Result<usize> {
+        use std::collections::HashMap;
+
+        // Build map of start_time -> full_uuid from all Throne records with full_uuid
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT start_time, full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL AND mode_id = 16"
+        )?;
+        let uuid_map: HashMap<i64, String> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Find Throne orphans and try to match
+        let mut orphan_stmt = self.conn.prepare(
+            "SELECT uuid, start_time FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16"
+        )?;
+        let orphans: Vec<(String, i64)> = orphan_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut matched = 0usize;
+        for (uuid, start_time) in &orphans {
+            if let Some(full_uuid) = uuid_map.get(start_time) {
+                self.conn.execute(
+                    "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2",
+                    params![full_uuid, uuid],
+                )?;
+                matched += 1;
+            }
+        }
+
+        Ok(matched)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_orphan_short_uuids() {
+        let db = Database::open(":memory:").unwrap();
+        // Insert test data
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES ('short1', 1, 100, 16, NULL)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES ('short2', 2, 200, 16, 'full-uuid')",
+            [],
+        ).unwrap();
+
+        let orphans = db.get_orphan_short_uuids(Some(10), Some(16)).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0], "short1");
+    }
+
+    #[test]
+    fn test_set_orphan_full_uuid() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES ('short1', 1, 100, 16, NULL)",
+            [],
+        ).unwrap();
+
+        let updated = db.set_orphan_full_uuid("short1", "250101-full-uuid-here").unwrap();
+        assert!(updated);
+
+        // Verify it was set
+        let full: String = db.conn.query_row(
+            "SELECT full_uuid FROM majsoul_logs WHERE uuid = 'short1'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(full, "250101-full-uuid-here");
     }
 }

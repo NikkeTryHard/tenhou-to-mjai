@@ -151,6 +151,21 @@ enum MajsoulCommands {
     /// Show Majsoul stats
     Stats,
 
+    /// Fetch public game UUIDs from ranked rooms (Throne, Jade, Gold)
+    FetchPublic {
+        /// Room type: throne, jade, gold, silver, bronze, all
+        #[arg(long, default_value = "throne")]
+        room: String,
+
+        /// Number of games to fetch
+        #[arg(short, long, default_value = "100")]
+        count: u32,
+
+        /// Server region: en, jp, cn
+        #[arg(long, default_value = "en")]
+        server: String,
+    },
+
     /// Download game records
     ///
     /// Uses cached token from `majsoul auth` if --token not provided.
@@ -231,6 +246,87 @@ enum MajsoulCommands {
         #[arg(long, default_value = "true")]
         skip_fetched: bool,
     },
+
+    /// Resolve short UUIDs to full paipu URLs via Amae-Koromo
+    ResolvePaipu {
+        /// Maximum UUIDs to resolve (default: all unresolved)
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "300")]
+        delay_ms: u64,
+    },
+
+    /// Export resolved paipu URLs to file
+    ExportPaipu {
+        /// Output file path
+        #[arg(short, long, default_value = "paipu_urls.txt")]
+        output: PathBuf,
+    },
+
+    /// Fetch full UUIDs by querying player records (parallel fetch, sequential write)
+    FetchFullUuids {
+        /// Number of concurrent API requests
+        #[arg(short, long, default_value = "10")]
+        concurrent: usize,
+
+        /// Maximum players to process
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between batches in ms
+        #[arg(long, default_value = "100")]
+        delay_ms: u64,
+    },
+
+    /// Recover orphaned games by re-fetching players with pagination
+    RecoverOrphans {
+        /// Number of concurrent API requests
+        #[arg(short, long, default_value = "5")]
+        concurrent: usize,
+
+        /// Maximum players to process
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between batches in ms
+        #[arg(long, default_value = "200")]
+        delay_ms: u64,
+    },
+
+    /// Resolve short UUIDs to full UUIDs via Majsoul RPC
+    ResolveUuids {
+        /// Maximum UUIDs to resolve
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Concurrent RPC requests (default: 4)
+        #[arg(short, long, default_value = "4")]
+        concurrent: usize,
+
+        /// Delay between request batches in ms
+        #[arg(long, default_value = "200")]
+        delay_ms: u64,
+
+        /// Server region: en, jp (default: en)
+        #[arg(long, default_value = "en")]
+        server: String,
+    },
+
+    /// Exhaustive scrape: fetch ALL Throne games (runs until no new games found)
+    ScrapeAll {
+        /// Requests per second (stay under 5 to be safe)
+        #[arg(long, default_value = "4")]
+        rps: u32,
+
+        /// Start date for date fetcher (YYYYMMDD)
+        #[arg(long, default_value = "20190801")]
+        start: String,
+    },
+
+    /// Reset fetch status for players who hit the 200-game cap
+    ResetCappedPlayers,
 }
 
 #[tokio::main]
@@ -388,6 +484,56 @@ async fn main() -> Result<()> {
                     println!("  {} (mode {}): {} days", room_name, mode_id, days);
                 }
             }
+            MajsoulCommands::FetchPublic { room, count, server } => {
+                use crate::majsoul::browser::CachedToken;
+                use crate::majsoul::gateway::discover_gateway;
+                use crate::majsoul::rpc::MajsoulRpc;
+
+                let room_type: u32 = match room.to_lowercase().as_str() {
+                    "throne" => 5,
+                    "jade" => 4,
+                    "gold" => 3,
+                    "silver" => 2,
+                    "bronze" => 1,
+                    "all" => 0,
+                    _ => anyhow::bail!("Invalid room type: {}. Use: throne, jade, gold, silver, bronze, all", room),
+                };
+
+                // Get token
+                let access_token = match CachedToken::load()? {
+                    Some(cached) => {
+                        info!("Using cached token (server: {})", cached.server);
+                        cached.access_token
+                    }
+                    None => anyhow::bail!("No cached token. Run `majsoul auth` first."),
+                };
+
+                info!("Fetching {} public {} room games from {} server...", count, room, server);
+
+                // Connect and login
+                let client = reqwest::Client::new();
+                let (endpoint, version) = discover_gateway(&client, &server).await?;
+                let rpc = MajsoulRpc::connect(&endpoint).await?;
+                rpc.login(&access_token, &version, &server).await?;
+
+                // Fetch public game list
+                let response = rpc.fetch_game_record_list(0, count, room_type).await?;
+                info!("GameRecordList: {} bytes", response.len());
+
+                // Also try live games
+                let live_response = rpc.fetch_game_live_list(0).await?;
+                info!("GameLiveList: {} bytes", live_response.len());
+
+                // Debug: dump responses
+                if response.len() > 0 {
+                    info!("RecordList preview: {:02x?}", &response[..response.len().min(100)]);
+                }
+                if live_response.len() > 0 {
+                    info!("LiveList preview: {:02x?}", &live_response[..live_response.len().min(200)]);
+                }
+
+                info!("Done");
+            }
             MajsoulCommands::Auth { force, server } => {
                 use crate::majsoul::browser::{capture_token_interactive, CachedToken};
 
@@ -430,40 +576,45 @@ async fn main() -> Result<()> {
                 // Browser mode: use browser's authenticated session directly (bypasses token issues)
                 if browser {
                     use tracing::warn;
-                    let server = server.unwrap_or_else(|| "cn".to_string());
-                    info!("Using browser-based download for {} server", server);
+
+                    // Default to EN server if not specified
+                    let server = server.unwrap_or_else(|| "en".to_string());
+
+                    info!("Using browser-based batch download for {} server", server);
 
                     let uuids = db.get_majsoul_undownloaded(limit)?;
                     if uuids.is_empty() {
-                        info!("No pending downloads");
-                        return Ok(());
+                        info!("No pending downloads in DB - will fetch game list from server");
+                    } else {
+                        info!("Will download {} records from DB (browser stays open)", uuids.len());
                     }
 
-                    info!("Downloading {} records via browser (login required)", uuids.len());
+                    // Single browser session for all downloads
+                    // If uuids is empty, browser will fetch game list from server
+                    let results = majsoul::browser::fetch_game_records_batch(&server, &uuids, delay_ms).await?;
+
                     let mut success = 0;
                     let mut failed = 0;
 
-                    for uuid in &uuids {
-                        match majsoul::browser::fetch_game_record_via_browser(&server, uuid).await {
+                    for (uuid, result) in results {
+                        match result {
                             Ok(data) => {
-                                if let Err(e) = db.mark_majsoul_downloaded(uuid, &data) {
+                                if let Err(e) = db.mark_majsoul_downloaded(&uuid, &data) {
                                     warn!("Failed to save {}: {}", uuid, e);
                                     failed += 1;
                                 } else {
                                     success += 1;
-                                    info!("Downloaded {} ({} bytes)", uuid, data.len());
+                                    info!("Saved {} ({} bytes)", uuid, data.len());
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to fetch {}: {}", uuid, e);
-                                db.mark_majsoul_download_error(uuid)?;
+                                warn!("Failed {}: {}", uuid, e);
+                                db.mark_majsoul_download_error(&uuid)?;
                                 failed += 1;
                             }
                         }
-                        if delay_ms > 0 {
-                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                        }
                     }
+
                     info!("Downloaded {} records ({} failed)", success, failed);
                     return Ok(());
                 }
@@ -531,6 +682,10 @@ async fn main() -> Result<()> {
                 let mut total_new = 0;
                 let mut current_date = start_date;
 
+                // Use 6-hour chunks to avoid API's 500 record cap per request
+                const CHUNK_HOURS: i64 = 6;
+                let chunk_ms = CHUNK_HOURS * 60 * 60 * 1000;
+
                 while current_date <= end_date {
                     let date_str = current_date.format("%Y-%m-%d").to_string();
 
@@ -540,43 +695,688 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    let start_ms = current_date
+                    let day_start_ms = current_date
                         .and_hms_opt(0, 0, 0)
                         .unwrap()
                         .and_utc()
                         .timestamp_millis();
-                    let end_ms = current_date
+                    let day_end_ms = current_date
                         .and_hms_opt(23, 59, 59)
                         .unwrap()
                         .and_utc()
                         .timestamp_millis();
 
-                    match client.get_room_records(start_ms, end_ms, mode_id, 1000).await {
-                        Ok(records) => {
-                            let mut new_count = 0;
-                            for r in &records {
-                                if db.insert_majsoul_log(&r.uuid, 0, r.start_time, Some(r.mode_id))? {
-                                    new_count += 1;
+                    // Fetch in 6-hour chunks to stay under 500 record API limit
+                    let mut day_total = 0;
+                    let mut day_new = 0;
+                    let mut chunk_start = day_start_ms;
+
+                    while chunk_start < day_end_ms {
+                        let chunk_end = (chunk_start + chunk_ms).min(day_end_ms);
+
+                        match client.get_room_records(chunk_start, chunk_end, mode_id, 500).await {
+                            Ok(records) => {
+                                for r in &records {
+                                    // Use first player's account_id for paipu URL generation
+                                    let account_id = r.players.first().map(|p| p.account_id).unwrap_or(0);
+                                    if db.insert_majsoul_log(&r.uuid, account_id, r.start_time, Some(r.mode_id))? {
+                                        day_new += 1;
+                                    }
+                                }
+                                day_total += records.len();
+
+                                // Warn if we hit the cap (might be missing records)
+                                if records.len() >= 500 {
+                                    tracing::warn!(
+                                        "{} chunk {}-{}: hit 500 cap, may be missing records!",
+                                        date_str,
+                                        chunk_start,
+                                        chunk_end
+                                    );
                                 }
                             }
-                            info!(
-                                "{}: {} records ({} new)",
-                                date_str,
-                                records.len(),
-                                new_count
-                            );
-                            total_new += new_count;
-                            db.mark_majsoul_room_fetched_with_count(&date_str, mode_id, records.len() as i32)?;
+                            Err(e) => {
+                                tracing::warn!("Failed to fetch {} chunk: {}", date_str, e);
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("Failed to fetch {}: {}", date_str, e);
-                        }
+
+                        chunk_start = chunk_end;
                     }
+
+                    info!(
+                        "{}: {} records ({} new)",
+                        date_str,
+                        day_total,
+                        day_new
+                    );
+                    total_new += day_new;
+                    db.mark_majsoul_room_fetched_with_count(&date_str, mode_id, day_total as i32)?;
 
                     current_date += chrono::Duration::days(1);
                 }
 
                 info!("Total new UUIDs stored: {}", total_new);
+            }
+            MajsoulCommands::ResolvePaipu { limit, delay_ms } => {
+                let unresolved = db.get_majsoul_unresolved_paipu(limit)?;
+                if unresolved.is_empty() {
+                    info!("No unresolved paipu URLs");
+                    return Ok(());
+                }
+
+                info!("Resolving {} UUIDs to paipu URLs...", unresolved.len());
+
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+
+                let mut resolved = 0;
+                let mut failed = 0;
+
+                for (uuid, player_id) in &unresolved {
+                    let url = format!(
+                        "https://5-data.amae-koromo.com/api/v2/pl4/view_game/1/16/{}/{}",
+                        uuid, player_id
+                    );
+
+                    match client.get(&url).send().await {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let headers = resp.headers().clone();
+
+                            // Debug: print first few
+                            if resolved + failed < 3 {
+                                info!("UUID {} -> status {}, headers: {:?}", uuid, status, headers.get("location"));
+                            }
+
+                            if let Some(location) = headers.get("location") {
+                                if let Ok(loc_str) = location.to_str() {
+                                    db.set_majsoul_paipu_url(uuid, loc_str)?;
+                                    resolved += 1;
+                                    if resolved % 100 == 0 {
+                                        info!("Resolved {}/{}", resolved, unresolved.len());
+                                    }
+                                } else {
+                                    failed += 1;
+                                }
+                            } else {
+                                failed += 1;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to resolve {}: {}", uuid, e);
+                            failed += 1;
+                        }
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+
+                info!("Resolved {} paipu URLs ({} failed)", resolved, failed);
+            }
+            MajsoulCommands::ExportPaipu { output } => {
+                let urls = db.get_majsoul_resolved_paipu()?;
+                if urls.is_empty() {
+                    info!("No resolved paipu URLs to export. Run `majsoul resolve-paipu` first.");
+                    return Ok(());
+                }
+
+                std::fs::write(&output, urls.join("\n"))?;
+                info!("Exported {} paipu URLs to {:?}", urls.len(), output);
+            }
+            MajsoulCommands::FetchFullUuids { concurrent, limit, delay_ms } => {
+                use futures::stream::{self, StreamExt};
+
+                // First, populate throne_players from existing majsoul_logs if needed
+                let player_count: i64 = db.conn_query_row(
+                    "SELECT COUNT(*) FROM throne_players",
+                )?;
+
+                if player_count == 0 {
+                    info!("Populating throne_players from existing logs...");
+                    db.populate_throne_players()?;
+                }
+
+                let (total_players, fetched_players) = db.count_throne_players()?;
+                info!("Throne players: {} total, {} fetched, {} remaining",
+                    total_players, fetched_players, total_players - fetched_players);
+
+                let players = db.get_unfetched_throne_players(limit)?;
+                if players.is_empty() {
+                    info!("No unfetched players remaining");
+                    return Ok(());
+                }
+
+                info!("Fetching records for {} players ({} concurrent)...", players.len(), concurrent);
+
+                let client = reqwest::Client::builder()
+                    .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()?;
+
+                let mut total_records = 0;
+                let mut total_new = 0;
+                let mut processed = 0;
+
+                // Process in batches
+                for chunk in players.chunks(concurrent) {
+                    let futures: Vec<_> = chunk.iter().map(|&player_id| {
+                        let client = client.clone();
+                        async move {
+                            let url = format!(
+                                "https://5-data.amae-koromo.com/api/v2/pl4/player_records/{}/0/{}?mode=16",
+                                player_id,
+                                chrono::Utc::now().timestamp_millis()
+                            );
+                            let result = client.get(&url).send().await;
+                            (player_id, result)
+                        }
+                    }).collect();
+
+                    let results = futures::future::join_all(futures).await;
+
+                    // Sequential DB writes
+                    for (player_id, result) in results {
+                        match result {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<Vec<majsoul::GameRecord>>().await {
+                                    Ok(records) => {
+                                        let mut new_for_player = 0;
+                                        for r in &records {
+                                            // Insert with full UUID directly (player_records returns full UUIDs)
+                                            if db.insert_majsoul_log_with_full_uuid(
+                                                &r.uuid,
+                                                player_id,
+                                                r.start_time,
+                                                Some(r.mode_id),
+                                            )? {
+                                                new_for_player += 1;
+                                            }
+                                        }
+                                        total_records += records.len();
+                                        total_new += new_for_player;
+                                        db.mark_throne_player_fetched(player_id)?;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Failed to parse records for {}: {}", player_id, e);
+                                    }
+                                }
+                            }
+                            Ok(resp) => {
+                                tracing::warn!("HTTP {} for player {}", resp.status(), player_id);
+                            }
+                            Err(e) => {
+                                tracing::warn!("Request failed for {}: {}", player_id, e);
+                            }
+                        }
+                        processed += 1;
+                    }
+
+                    if processed % 50 == 0 {
+                        info!("Progress: {}/{} players, {} records, {} new full UUIDs",
+                            processed, players.len(), total_records, total_new);
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
+
+                info!("Done: {} players processed, {} records fetched, {} new full UUIDs",
+                    processed, total_records, total_new);
+            }
+            MajsoulCommands::RecoverOrphans { concurrent, limit, delay_ms } => {
+                use tracing::warn;
+
+                // Get unfetched players (includes reset 200-limit players)
+                let players = db.get_unfetched_throne_players(limit)?;
+                let orphan_count = db.count_orphaned_games()?;
+
+                if players.is_empty() {
+                    info!("No unfetched players. Running cross-player match only...");
+                } else {
+                    info!("=== ORPHAN RECOVERY (Pagination) ===");
+                    info!("Orphaned games: {}", orphan_count);
+                    info!("Unfetched players: {}", players.len());
+                    info!("Concurrent requests: {}", concurrent);
+                    info!("Fetching ALL games with pagination, then cross-matching...\n");
+
+                    let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+
+                    let mut total_records = 0usize;
+                    let mut total_new = 0usize;
+                    let mut total_api_calls = 0u32;
+                    let mut processed = 0usize;
+
+                    for chunk in players.chunks(concurrent) {
+                        let futures: Vec<_> = chunk.iter().map(|&player_id| {
+                            let client = &client;
+                            async move {
+                                let result = client.get_player_records_paginated(player_id, 16).await;
+                                (player_id, result)
+                            }
+                        }).collect();
+
+                        let results = futures::future::join_all(futures).await;
+
+                        for (player_id, result) in results {
+                            match result {
+                                Ok((records, api_calls)) => {
+                                    total_api_calls += api_calls;
+                                    let mut new_for_player = 0;
+                                    for r in &records {
+                                        // INSERT with full_uuid (will update existing or add new)
+                                        if db.insert_majsoul_log_with_full_uuid(
+                                            &r.uuid, player_id, r.start_time, Some(r.mode_id)
+                                        )? {
+                                            new_for_player += 1;
+                                        }
+                                    }
+                                    total_records += records.len();
+                                    total_new += new_for_player;
+                                    db.mark_throne_player_fetched(player_id)?;
+                                    if api_calls > 1 {
+                                        info!("Player {}: {} games ({} API calls, {} new)",
+                                            player_id, records.len(), api_calls, new_for_player);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to fetch player {}: {}", player_id, e);
+                                }
+                            }
+                            processed += 1;
+                        }
+
+                        if processed % 100 == 0 || processed == players.len() {
+                            info!("Progress: {}/{} players | {} records | {} new full UUIDs | {} API calls",
+                                processed, players.len(), total_records, total_new, total_api_calls);
+                        }
+                    }
+
+                    info!("\nFetch complete. {} records, {} new full UUIDs", total_records, total_new);
+                }
+
+                // Phase 2: Cross-player matching by start_time
+                info!("\n=== CROSS-PLAYER MATCHING ===");
+                let before_orphans = db.count_orphaned_games()?;
+
+                let matched = db.cross_match_orphan_uuids()?;
+
+                let after_orphans = db.count_orphaned_games()?;
+                info!("\n=== RECOVERY COMPLETE ===");
+                info!("Cross-player matched: {}", matched);
+                info!("Orphans before: {}", before_orphans);
+                info!("Orphans after: {}", after_orphans);
+                info!("Total recovered: {}", before_orphans - after_orphans);
+            }
+            MajsoulCommands::ResolveUuids { limit, concurrent, delay_ms, server } => {
+                use crate::majsoul::browser::CachedToken;
+                use crate::majsoul::gateway::discover_gateway;
+                use crate::majsoul::rpc::{MajsoulRpc, extract_full_uuid_from_record};
+                use futures::stream::{self, StreamExt};
+                use std::sync::Arc;
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                use tokio::sync::Mutex;
+
+                // Load cached token
+                let cached = match CachedToken::load()? {
+                    Some(t) => t,
+                    None => anyhow::bail!("No cached token. Run `majsoul auth` first."),
+                };
+                info!("Using cached token (server: {})", cached.server);
+
+                // Get orphan UUIDs
+                let orphans = db.get_orphan_short_uuids(limit, Some(16))?;
+                if orphans.is_empty() {
+                    info!("No orphan UUIDs to resolve!");
+                    return Ok(());
+                }
+
+                info!("=== UUID RESOLUTION VIA RPC ===");
+                info!("Orphans to resolve: {}", orphans.len());
+                info!("Concurrent requests: {}", concurrent);
+                info!("Server: {}", server);
+
+                // Connect to gateway
+                let client = reqwest::Client::new();
+                let (endpoint, version) = discover_gateway(&client, &server).await?;
+                info!("Gateway: {}", endpoint);
+
+                let rpc = MajsoulRpc::connect(&endpoint).await?;
+                rpc.login(&cached.access_token, &version, &server).await?;
+                info!("Logged in successfully\n");
+
+                // Wrap RPC and DB in Arc for sharing across concurrent tasks
+                let rpc = Arc::new(rpc);
+                let db = Arc::new(Mutex::new(db));
+                let resolved = Arc::new(AtomicUsize::new(0));
+                let failed = Arc::new(AtomicUsize::new(0));
+                let processed = Arc::new(AtomicUsize::new(0));
+                let total = orphans.len();
+
+                // Process orphans with true parallelism using buffer_unordered
+                stream::iter(orphans.into_iter().enumerate())
+                    .map(|(i, short_uuid)| {
+                        let rpc = Arc::clone(&rpc);
+                        let db = Arc::clone(&db);
+                        let resolved = Arc::clone(&resolved);
+                        let failed = Arc::clone(&failed);
+                        let processed = Arc::clone(&processed);
+
+                        async move {
+                            // Optional delay between batches
+                            if delay_ms > 0 && i > 0 && i % concurrent == 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+
+                            match rpc.fetch_game_record(&short_uuid).await {
+                                Ok(data) => {
+                                    match extract_full_uuid_from_record(&data) {
+                                        Ok(full_uuid) => {
+                                            let db_guard = db.lock().await;
+                                            if db_guard.set_orphan_full_uuid(&short_uuid, &full_uuid).unwrap_or(false) {
+                                                resolved.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Failed to parse {}: {}", short_uuid, e);
+                                            failed.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("RPC failed for {}: {}", short_uuid, e);
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+
+                            let current = processed.fetch_add(1, Ordering::Relaxed) + 1;
+                            if current % 100 == 0 || current == total {
+                                let db_guard = db.lock().await;
+                                let remaining = db_guard.count_orphaned_games().unwrap_or(0);
+                                info!(
+                                    "Progress: {}/{} | Resolved: {} | Failed: {} | Remaining: {}",
+                                    current, total,
+                                    resolved.load(Ordering::Relaxed),
+                                    failed.load(Ordering::Relaxed),
+                                    remaining
+                                );
+                            }
+                        }
+                    })
+                    .buffer_unordered(concurrent)
+                    .collect::<Vec<()>>()
+                    .await;
+
+                let final_resolved = resolved.load(Ordering::Relaxed);
+                let final_failed = failed.load(Ordering::Relaxed);
+                let db_guard = db.lock().await;
+                let remaining = db_guard.count_orphaned_games()?;
+
+                info!("\n=== RESOLUTION COMPLETE ===");
+                info!("Resolved: {}", final_resolved);
+                info!("Failed: {}", final_failed);
+                info!("Remaining orphans: {}", remaining);
+            }
+            MajsoulCommands::ScrapeAll { rps, start } => {
+                use std::sync::Arc;
+                use tokio::sync::Mutex;
+                use tracing::warn;
+
+                // Enable WAL mode for better concurrency
+                db.enable_wal_mode()?;
+
+                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
+                let delay_ms = 1000 / rps as u64;
+
+                info!("=== EXHAUSTIVE THRONE SCRAPER ===");
+                info!("Start date: {}", start_date);
+                info!("Rate: {} req/s ({}ms delay)", rps, delay_ms);
+                info!("Running until no new games found...\n");
+
+                let db = Arc::new(Mutex::new(db));
+                let client = Arc::new(
+                    reqwest::Client::builder()
+                        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
+                        .timeout(std::time::Duration::from_secs(30))
+                        .build()?
+                );
+                let api_client = Arc::new(majsoul::AmaeKoromoClient::new(delay_ms)?);
+
+                // Retry helper with exponential backoff
+                async fn fetch_with_retry(
+                    client: &reqwest::Client,
+                    url: &str,
+                    max_retries: u32,
+                ) -> Result<Vec<majsoul::GameRecord>> {
+                    let mut attempt = 0;
+                    loop {
+                        attempt += 1;
+                        match client.get(url).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    match resp.json::<Vec<majsoul::GameRecord>>().await {
+                                        Ok(records) => return Ok(records),
+                                        Err(e) => {
+                                            if attempt >= max_retries {
+                                                anyhow::bail!("JSON parse failed after {} attempts: {}", attempt, e);
+                                            }
+                                            tracing::warn!("Parse error (attempt {}): {}", attempt, e);
+                                        }
+                                    }
+                                } else if resp.status() == 429 {
+                                    // Rate limited - wait longer
+                                    tracing::warn!("Rate limited (429), waiting 30s...");
+                                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                } else if resp.status().is_server_error() {
+                                    if attempt >= max_retries {
+                                        anyhow::bail!("Server error {} after {} attempts", resp.status(), attempt);
+                                    }
+                                    tracing::warn!("Server error {} (attempt {})", resp.status(), attempt);
+                                } else {
+                                    anyhow::bail!("HTTP {}", resp.status());
+                                }
+                            }
+                            Err(e) => {
+                                if attempt >= max_retries {
+                                    anyhow::bail!("Network error after {} attempts: {}", attempt, e);
+                                }
+                                tracing::warn!("Network error (attempt {}): {}", attempt, e);
+                            }
+                        }
+                        // Exponential backoff: 1s, 2s, 4s, 8s...
+                        let backoff = std::time::Duration::from_secs(1 << (attempt - 1).min(4));
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+
+                let mut round = 0;
+                loop {
+                    round += 1;
+                    let mut new_this_round = 0;
+
+                    info!("=== Round {} ===", round);
+
+                    // Phase 1: Date fetcher - get games by date range
+                    let dates_to_fetch = {
+                        let db_guard = db.lock().await;
+                        let today = chrono::Local::now().date_naive();
+                        let mut current_date = start_date;
+                        let mut dates = Vec::new();
+
+                        while current_date <= today {
+                            let date_str = current_date.format("%Y-%m-%d").to_string();
+                            if !db_guard.is_majsoul_room_fetched(&date_str, 16)? {
+                                dates.push(current_date);
+                            }
+                            current_date += chrono::Duration::days(1);
+                        }
+                        dates
+                    };
+
+                    if !dates_to_fetch.is_empty() {
+                        info!("[Dates] {} unfetched dates to process", dates_to_fetch.len());
+
+                        for date in dates_to_fetch {
+                            let date_str = date.format("%Y-%m-%d").to_string();
+                            let day_start_ms = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+                            let day_end_ms = date.and_hms_opt(23, 59, 59).unwrap().and_utc().timestamp_millis();
+
+                            // 6-hour chunks to avoid 500 cap
+                            let chunk_ms: i64 = 6 * 60 * 60 * 1000;
+                            let mut chunk_start = day_start_ms;
+                            let mut day_new = 0;
+                            let mut all_chunks_ok = true;
+
+                            while chunk_start < day_end_ms {
+                                let chunk_end = (chunk_start + chunk_ms).min(day_end_ms);
+                                let url = format!(
+                                    "https://5-data.amae-koromo.com/api/v2/pl4/games/{}/{}?mode=16&limit=500",
+                                    chunk_start, chunk_end
+                                );
+
+                                match fetch_with_retry(&client, &url, 3).await {
+                                    Ok(records) => {
+                                        // Warn if we hit the cap
+                                        if records.len() >= 500 {
+                                            warn!("{} chunk hit 500 cap - may be missing records!", date_str);
+                                        }
+                                        let db_guard = db.lock().await;
+                                        for r in &records {
+                                            let player_id = r.players.first().map(|p| p.account_id).unwrap_or(0);
+                                            if db_guard.insert_majsoul_log(&r.uuid, player_id, r.start_time, Some(r.mode_id))? {
+                                                day_new += 1;
+                                            }
+                                            for p in &r.players {
+                                                let _ = db_guard.upsert_throne_player(p.account_id, &p.nickname);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("[Dates] {} chunk {}-{} FAILED: {}", date_str, chunk_start, chunk_end, e);
+                                        all_chunks_ok = false;
+                                    }
+                                }
+                                chunk_start = chunk_end;
+                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            }
+
+                            // Only mark as fetched if ALL chunks succeeded
+                            if all_chunks_ok {
+                                let db_guard = db.lock().await;
+                                db_guard.mark_majsoul_room_fetched_with_count(&date_str, 16, day_new as i32)?;
+                                if day_new > 0 {
+                                    info!("[Dates] {}: {} new games", date_str, day_new);
+                                }
+                            } else {
+                                warn!("[Dates] {} NOT marked complete due to failures - will retry next round", date_str);
+                            }
+                            new_this_round += day_new;
+                        }
+                    } else {
+                        info!("[Dates] All dates already fetched");
+                    }
+
+                    // Phase 2: Player expander - BFS to get full UUIDs (WITH PAGINATION)
+                    {
+                        let players = {
+                            let db = db.lock().await;
+                            db.get_unfetched_throne_players(None)?
+                        };
+
+                        if !players.is_empty() {
+                            info!("[Players] {} unfetched players to process (with pagination)", players.len());
+
+                            let mut processed = 0;
+                            let total_players = players.len();
+                            let concurrent = 4; // Limit concurrent requests for pagination
+
+                            for chunk in players.chunks(concurrent) {
+                                let futures: Vec<_> = chunk.iter().map(|&player_id| {
+                                    let api_client = api_client.clone();
+                                    async move {
+                                        let result = api_client.get_player_records_paginated(player_id, 16).await;
+                                        (player_id, result)
+                                    }
+                                }).collect();
+
+                                let results = futures::future::join_all(futures).await;
+
+                                let db_guard = db.lock().await;
+                                for (player_id, result) in results {
+                                    match result {
+                                        Ok((records, api_calls)) => {
+                                            if api_calls > 1 {
+                                                info!("[Players] {} fetched {} games in {} API calls",
+                                                    player_id, records.len(), api_calls);
+                                            }
+                                            for r in &records {
+                                                if db_guard.insert_majsoul_log_with_full_uuid(
+                                                    &r.uuid, player_id, r.start_time, Some(r.mode_id)
+                                                )? {
+                                                    new_this_round += 1;
+                                                }
+                                                // Discover new players
+                                                for p in &r.players {
+                                                    let _ = db_guard.upsert_throne_player(p.account_id, &p.nickname);
+                                                }
+                                            }
+                                            let _ = db_guard.mark_throne_player_fetched(player_id);
+                                        }
+                                        Err(e) => {
+                                            warn!("[Players] {} fetch error: {}", player_id, e);
+                                        }
+                                    }
+                                }
+                                drop(db_guard);
+                                processed += chunk.len();
+                                if processed % 100 == 0 || processed == total_players {
+                                    info!("[Players] {}/{} processed, {} new full UUIDs", processed, total_players, new_this_round);
+                                }
+                            }
+                        } else {
+                            info!("[Players] All players already fetched");
+                        }
+                    }
+
+                    // Check stats
+                    let (total, with_full) = {
+                        let db = db.lock().await;
+                        db.count_majsoul_full_uuids()?
+                    };
+                    let (total_players, fetched_players) = {
+                        let db = db.lock().await;
+                        db.count_throne_players()?
+                    };
+
+                    // Phase 3: Cross-match orphans with newly fetched full UUIDs
+                    {
+                        let db_guard = db.lock().await;
+
+                        let matched = db_guard.cross_match_orphan_uuids()?;
+
+                        if matched > 0 {
+                            info!("[Cross-match] Filled {} orphan full_uuids via timestamp matching", matched);
+                            new_this_round += matched;
+                        }
+                    }
+
+                    info!("\n[Round {} Summary]", round);
+                    info!("  New games this round: {}", new_this_round);
+                    info!("  Total games: {} ({} with full UUID)", total, with_full);
+                    info!("  Players: {} ({} fetched)\n", total_players, fetched_players);
+
+                    // Convergence check
+                    if new_this_round == 0 {
+                        info!("=== CONVERGENCE REACHED ===");
+                        info!("No new games found. Scraping complete!");
+                        info!("Total unique games with paipu: {}", with_full);
+                        break;
+                    }
+                }
+            }
+            MajsoulCommands::ResetCappedPlayers => {
+                let count = db.reset_capped_throne_players()?;
+                info!("Reset {} players who hit the 200-game cap", count);
+                info!("Run 'majsoul scrape-all' to re-fetch with pagination");
             }
         },
     }
