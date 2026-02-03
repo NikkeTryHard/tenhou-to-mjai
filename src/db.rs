@@ -2,6 +2,9 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// Amae-Koromo API returns max 200 records per player_records request
+const AMAE_KOROMO_PAGE_LIMIT: i64 = 200;
+
 pub struct Database {
     pub conn: Connection,
 }
@@ -554,13 +557,88 @@ impl Database {
         Ok(())
     }
 
-    /// Update full_uuid for a majsoul log (by short uuid match)
-    pub fn set_majsoul_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
-        let result = self.conn.execute(
-            "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2 AND full_uuid IS NULL",
-            params![full_uuid, short_uuid],
+    /// Count how many games we have for a specific player
+    pub fn count_player_games(&self, account_id: i64, mode_id: i32) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE player_id = ?1 AND mode_id = ?2",
+            params![account_id, mode_id],
+            |row| row.get(0),
         )?;
-        Ok(result > 0)
+        Ok(count)
+    }
+
+    /// Get throne players who were fetched but may have hit the page limit cap
+    pub fn get_throne_players_needing_refetch(&self, limit: Option<usize>) -> Result<Vec<i64>> {
+        let sql = match limit {
+            Some(n) => format!(
+                r#"
+                SELECT tp.account_id
+                FROM throne_players tp
+                WHERE tp.fetched_at IS NOT NULL
+                AND (
+                    SELECT COUNT(*) FROM majsoul_logs ml
+                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
+                ) = {}
+                LIMIT {}
+                "#,
+                AMAE_KOROMO_PAGE_LIMIT,
+                n
+            ),
+            None => format!(
+                r#"
+                SELECT tp.account_id
+                FROM throne_players tp
+                WHERE tp.fetched_at IS NOT NULL
+                AND (
+                    SELECT COUNT(*) FROM majsoul_logs ml
+                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
+                ) = {}
+                "#,
+                AMAE_KOROMO_PAGE_LIMIT
+            ),
+        };
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Reset fetched_at for a player so they can be re-fetched
+    pub fn reset_throne_player_fetched(&self, account_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE throne_players SET fetched_at = NULL WHERE account_id = ?1",
+            params![account_id],
+        )?;
+        Ok(())
+    }
+
+    /// Reset fetched_at for all players who hit the page limit cap
+    pub fn reset_capped_throne_players(&self) -> Result<usize> {
+        let sql = format!(
+            r#"
+            UPDATE throne_players
+            SET fetched_at = NULL
+            WHERE fetched_at IS NOT NULL
+            AND account_id IN (
+                SELECT player_id FROM majsoul_logs
+                WHERE mode_id = 16
+                GROUP BY player_id
+                HAVING COUNT(*) = {}
+            )
+            "#,
+            AMAE_KOROMO_PAGE_LIMIT
+        );
+        let result = self.conn.execute(&sql, [])?;
+        Ok(result)
+    }
+
+    /// Update full_uuid for a majsoul log (by short uuid match)
+    /// Alias for set_orphan_full_uuid - kept for API compatibility
+    pub fn set_majsoul_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
+        self.set_orphan_full_uuid(short_uuid, full_uuid)
     }
 
     /// Count throne player stats
@@ -690,6 +768,43 @@ impl Database {
             params![full_uuid, short_uuid],
         )?;
         Ok(result > 0)
+    }
+
+    /// Cross-match orphan UUIDs by start_time against known full UUIDs (Throne mode only)
+    /// Returns the number of orphans that were matched and updated
+    pub fn cross_match_orphan_uuids(&self) -> Result<usize> {
+        use std::collections::HashMap;
+
+        // Build map of start_time -> full_uuid from all Throne records with full_uuid
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT start_time, full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL AND mode_id = 16"
+        )?;
+        let uuid_map: HashMap<i64, String> = stmt
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Find Throne orphans and try to match
+        let mut orphan_stmt = self.conn.prepare(
+            "SELECT uuid, start_time FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16"
+        )?;
+        let orphans: Vec<(String, i64)> = orphan_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut matched = 0usize;
+        for (uuid, start_time) in &orphans {
+            if let Some(full_uuid) = uuid_map.get(start_time) {
+                self.conn.execute(
+                    "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2",
+                    params![full_uuid, uuid],
+                )?;
+                matched += 1;
+            }
+        }
+
+        Ok(matched)
     }
 }
 

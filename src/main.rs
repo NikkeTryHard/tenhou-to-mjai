@@ -324,6 +324,9 @@ enum MajsoulCommands {
         #[arg(long, default_value = "20190801")]
         start: String,
     },
+
+    /// Reset fetch status for players who hit the 200-game cap
+    ResetCappedPlayers,
 }
 
 #[tokio::main]
@@ -995,44 +998,7 @@ async fn main() -> Result<()> {
                 info!("\n=== CROSS-PLAYER MATCHING ===");
                 let before_orphans = db.count_orphaned_games()?;
 
-                // This is done in Rust to avoid SQLite timeout
-                info!("Building UUID map...");
-                let uuid_map: std::collections::HashMap<i64, String> = {
-                    let mut stmt = db.conn.prepare(
-                        "SELECT DISTINCT start_time, full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL"
-                    )?;
-                    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                    let mut map = std::collections::HashMap::new();
-                    for row in rows {
-                        let (st, uuid): (i64, String) = row?;
-                        map.insert(st, uuid);
-                    }
-                    map
-                };
-                info!("Map has {} unique start_times with full_uuid", uuid_map.len());
-
-                // Update orphans
-                let mut matched = 0i64;
-                {
-                    let mut stmt = db.conn.prepare(
-                        "SELECT uuid, start_time FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16"
-                    )?;
-                    let orphans: Vec<(String, i64)> = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-
-                    info!("Checking {} orphans against map...", orphans.len());
-
-                    for (uuid, start_time) in orphans {
-                        if let Some(full_uuid) = uuid_map.get(&start_time) {
-                            db.conn.execute(
-                                "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2",
-                                rusqlite::params![full_uuid, uuid],
-                            )?;
-                            matched += 1;
-                        }
-                    }
-                }
+                let matched = db.cross_match_orphan_uuids()?;
 
                 let after_orphans = db.count_orphaned_games()?;
                 info!("\n=== RECOVERY COMPLETE ===");
@@ -1173,6 +1139,7 @@ async fn main() -> Result<()> {
                         .timeout(std::time::Duration::from_secs(30))
                         .build()?
                 );
+                let api_client = Arc::new(majsoul::AmaeKoromoClient::new(delay_ms)?);
 
                 // Retry helper with exponential backoff
                 async fn fetch_with_retry(
@@ -1308,7 +1275,7 @@ async fn main() -> Result<()> {
                         info!("[Dates] All dates already fetched");
                     }
 
-                    // Phase 2: Player expander - BFS to get full UUIDs
+                    // Phase 2: Player expander - BFS to get full UUIDs (WITH PAGINATION)
                     {
                         let players = {
                             let db = db.lock().await;
@@ -1316,20 +1283,17 @@ async fn main() -> Result<()> {
                         };
 
                         if !players.is_empty() {
-                            info!("[Players] {} unfetched players to process", players.len());
+                            info!("[Players] {} unfetched players to process (with pagination)", players.len());
 
                             let mut processed = 0;
                             let total_players = players.len();
-                            for chunk in players.chunks(10) {
+                            let concurrent = 4; // Limit concurrent requests for pagination
+
+                            for chunk in players.chunks(concurrent) {
                                 let futures: Vec<_> = chunk.iter().map(|&player_id| {
-                                    let client = client.clone();
+                                    let api_client = api_client.clone();
                                     async move {
-                                        let url = format!(
-                                            "https://5-data.amae-koromo.com/api/v2/pl4/player_records/{}/0/{}?mode=16",
-                                            player_id,
-                                            chrono::Utc::now().timestamp_millis()
-                                        );
-                                        let result = client.get(&url).send().await;
+                                        let result = api_client.get_player_records_paginated(player_id, 16).await;
                                         (player_id, result)
                                     }
                                 }).collect();
@@ -1339,35 +1303,26 @@ async fn main() -> Result<()> {
                                 let db_guard = db.lock().await;
                                 for (player_id, result) in results {
                                     match result {
-                                        Ok(resp) if resp.status().is_success() => {
-                                            match resp.json::<Vec<majsoul::GameRecord>>().await {
-                                                Ok(records) => {
-                                                    for r in &records {
-                                                        if db_guard.insert_majsoul_log_with_full_uuid(
-                                                            &r.uuid, player_id, r.start_time, Some(r.mode_id)
-                                                        )? {
-                                                            new_this_round += 1;
-                                                        }
-                                                        // Discover new players
-                                                        for p in &r.players {
-                                                            let _ = db_guard.upsert_throne_player(p.account_id, &p.nickname);
-                                                        }
-                                                    }
-                                                    let _ = db_guard.mark_throne_player_fetched(player_id);
+                                        Ok((records, api_calls)) => {
+                                            if api_calls > 1 {
+                                                info!("[Players] {} fetched {} games in {} API calls",
+                                                    player_id, records.len(), api_calls);
+                                            }
+                                            for r in &records {
+                                                if db_guard.insert_majsoul_log_with_full_uuid(
+                                                    &r.uuid, player_id, r.start_time, Some(r.mode_id)
+                                                )? {
+                                                    new_this_round += 1;
                                                 }
-                                                Err(e) => {
-                                                    warn!("[Players] {} parse error: {}", player_id, e);
+                                                // Discover new players
+                                                for p in &r.players {
+                                                    let _ = db_guard.upsert_throne_player(p.account_id, &p.nickname);
                                                 }
                                             }
-                                        }
-                                        Ok(resp) if resp.status() == 429 => {
-                                            warn!("[Players] Rate limited on player {}", player_id);
-                                        }
-                                        Ok(resp) => {
-                                            warn!("[Players] {} HTTP {}", player_id, resp.status());
+                                            let _ = db_guard.mark_throne_player_fetched(player_id);
                                         }
                                         Err(e) => {
-                                            warn!("[Players] {} network error: {}", player_id, e);
+                                            warn!("[Players] {} fetch error: {}", player_id, e);
                                         }
                                     }
                                 }
@@ -1376,7 +1331,6 @@ async fn main() -> Result<()> {
                                 if processed % 100 == 0 || processed == total_players {
                                     info!("[Players] {}/{} processed, {} new full UUIDs", processed, total_players, new_this_round);
                                 }
-                                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             }
                         } else {
                             info!("[Players] All players already fetched");
@@ -1393,6 +1347,18 @@ async fn main() -> Result<()> {
                         db.count_throne_players()?
                     };
 
+                    // Phase 3: Cross-match orphans with newly fetched full UUIDs
+                    {
+                        let db_guard = db.lock().await;
+
+                        let matched = db_guard.cross_match_orphan_uuids()?;
+
+                        if matched > 0 {
+                            info!("[Cross-match] Filled {} orphan full_uuids via timestamp matching", matched);
+                            new_this_round += matched;
+                        }
+                    }
+
                     info!("\n[Round {} Summary]", round);
                     info!("  New games this round: {}", new_this_round);
                     info!("  Total games: {} ({} with full UUID)", total, with_full);
@@ -1406,6 +1372,11 @@ async fn main() -> Result<()> {
                         break;
                     }
                 }
+            }
+            MajsoulCommands::ResetCappedPlayers => {
+                let count = db.reset_capped_throne_players()?;
+                info!("Reset {} players who hit the 200-game cap", count);
+                info!("Run 'majsoul scrape-all' to re-fetch with pagination");
             }
         },
     }
