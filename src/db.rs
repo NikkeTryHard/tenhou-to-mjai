@@ -97,6 +97,24 @@ impl Database {
                 nickname TEXT,
                 fetched_at TEXT
             );
+
+            -- Two-phase pipeline tables
+            CREATE TABLE IF NOT EXISTS majsoul_pipeline_players (
+                player_id INTEGER PRIMARY KEY,
+                nickname TEXT,
+                first_seen_date TEXT,
+                scraped_at TEXT,
+                game_count INTEGER DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS majsoul_day_fetch_state (
+                date TEXT PRIMARY KEY,
+                fetched_at TEXT,
+                game_count INTEGER DEFAULT 0,
+                player_count INTEGER DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_majsoul_pipeline_players_scraped ON majsoul_pipeline_players(scraped_at);
             ",
         )?;
 
@@ -841,6 +859,152 @@ impl Database {
 
         Ok(matched)
     }
+
+    // ==================== Two-Phase Pipeline Methods ====================
+
+    /// Check if a day has been fetched (Phase 1)
+    pub fn is_day_fetched(&self, date: &str) -> Result<bool> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_day_fetch_state WHERE date = ?1",
+            params![date],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Begin a transaction (for batching writes)
+    pub fn begin_transaction(&self) -> Result<()> {
+        self.conn.execute("BEGIN TRANSACTION", [])?;
+        Ok(())
+    }
+
+    /// Commit the current transaction
+    pub fn commit(&self) -> Result<()> {
+        self.conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
+    /// Mark a day as fetched with stats
+    pub fn mark_day_fetched(&self, date: &str, game_count: i32, player_count: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO majsoul_day_fetch_state (date, fetched_at, game_count, player_count)
+             VALUES (?1, datetime('now'), ?2, ?3)",
+            params![date, game_count, player_count],
+        )?;
+        Ok(())
+    }
+
+    /// Get unfetched days in a date range (returns YYYYMMDD strings)
+    pub fn get_unfetched_days(&self, start: &str, end: &str) -> Result<Vec<String>> {
+        use chrono::NaiveDate;
+        use std::collections::HashSet;
+
+        let start_date = NaiveDate::parse_from_str(start, "%Y%m%d")
+            .map_err(|e| anyhow::anyhow!("Invalid start date: {}", e))?;
+        let end_date = NaiveDate::parse_from_str(end, "%Y%m%d")
+            .map_err(|e| anyhow::anyhow!("Invalid end date: {}", e))?;
+
+        // Query all fetched dates in range at once (single query instead of N+1)
+        let mut stmt = self.conn.prepare(
+            "SELECT date FROM majsoul_day_fetch_state WHERE date >= ?1 AND date <= ?2"
+        )?;
+        let fetched_dates: HashSet<String> = stmt
+            .query_map(params![start, end], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Generate all dates and filter out fetched ones
+        let mut unfetched = Vec::new();
+        let mut current = start_date;
+        while current <= end_date {
+            let date_str = current.format("%Y%m%d").to_string();
+            if !fetched_dates.contains(&date_str) {
+                unfetched.push(date_str);
+            }
+            current += chrono::Duration::days(1);
+        }
+
+        Ok(unfetched)
+    }
+
+    /// Count day fetch progress
+    pub fn count_day_fetch_progress(&self) -> Result<(i64, i64, i64)> {
+        let days: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_day_fetch_state",
+            [],
+            |row| row.get(0),
+        )?;
+        let games: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(game_count), 0) FROM majsoul_day_fetch_state",
+            [],
+            |row| row.get(0),
+        )?;
+        let players: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(player_count), 0) FROM majsoul_day_fetch_state",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((days, games, players))
+    }
+
+    /// Upsert a player discovered during Phase 1 (day fetching)
+    pub fn upsert_player_for_scraping(
+        &self,
+        player_id: i64,
+        nickname: &str,
+        first_seen_date: &str,
+    ) -> Result<bool> {
+        let result = self.conn.execute(
+            "INSERT INTO majsoul_pipeline_players (player_id, nickname, first_seen_date)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(player_id) DO UPDATE SET
+                nickname = COALESCE(excluded.nickname, nickname)",
+            params![player_id, nickname, first_seen_date],
+        )?;
+        Ok(result > 0)
+    }
+
+    /// Get unscraped player IDs (Phase 2)
+    pub fn get_unscraped_players(&self, limit: Option<usize>) -> Result<Vec<i64>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT player_id FROM majsoul_pipeline_players WHERE scraped_at IS NULL ORDER BY player_id LIMIT {}",
+                n
+            ),
+            None => "SELECT player_id FROM majsoul_pipeline_players WHERE scraped_at IS NULL ORDER BY player_id".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    /// Mark a player as scraped with game count
+    pub fn mark_player_scraped(&self, player_id: i64, game_count: i32) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_pipeline_players SET scraped_at = datetime('now'), game_count = ?1 WHERE player_id = ?2",
+            params![game_count, player_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count player scraping progress
+    pub fn count_player_scrape_progress(&self) -> Result<(i64, i64)> {
+        let total: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_pipeline_players",
+            [],
+            |row| row.get(0),
+        )?;
+        let scraped: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_pipeline_players WHERE scraped_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((total, scraped))
+    }
 }
 
 #[cfg(test)]
@@ -943,5 +1107,52 @@ mod tests {
 
         let count = db.count_majsoul_downloadable().unwrap();
         assert_eq!(count, 2); // short1 and short3 have full_uuid and is_downloaded = 0
+    }
+
+    #[test]
+    fn test_day_fetch_state() {
+        let db = Database::open(":memory:").unwrap();
+
+        // Not fetched initially
+        assert!(!db.is_day_fetched("20250101").unwrap());
+
+        // Mark as fetched
+        db.mark_day_fetched("20250101", 150, 42).unwrap();
+        assert!(db.is_day_fetched("20250101").unwrap());
+
+        // Get unfetched days
+        let unfetched = db.get_unfetched_days("20250101", "20250103").unwrap();
+        assert_eq!(unfetched.len(), 2); // 20250102, 20250103
+
+        // Count progress
+        let (days, games, players) = db.count_day_fetch_progress().unwrap();
+        assert_eq!(days, 1);
+        assert_eq!(games, 150);
+        assert_eq!(players, 42);
+    }
+
+    #[test]
+    fn test_player_scraping_methods() {
+        let db = Database::open(":memory:").unwrap();
+
+        // Upsert player
+        db.upsert_player_for_scraping(12345, "TestPlayer", "20250101").unwrap();
+
+        // Get unscraped players
+        let unscraped = db.get_unscraped_players(Some(10)).unwrap();
+        assert_eq!(unscraped.len(), 1);
+        assert_eq!(unscraped[0], 12345);
+
+        // Mark as scraped
+        db.mark_player_scraped(12345, 50).unwrap();
+
+        // Should be empty now
+        let unscraped = db.get_unscraped_players(Some(10)).unwrap();
+        assert!(unscraped.is_empty());
+
+        // Count stats
+        let (total, scraped) = db.count_player_scrape_progress().unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(scraped, 1);
     }
 }

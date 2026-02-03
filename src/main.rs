@@ -361,6 +361,36 @@ enum MajsoulCommands {
         #[arg(long, default_value = "en")]
         server: String,
     },
+
+    /// Phase 1: Fetch all player IDs by day (fast, parallel-safe)
+    FetchDays {
+        /// Start date (YYYYMMDD)
+        #[arg(long)]
+        start: String,
+
+        /// End date (YYYYMMDD), defaults to yesterday
+        #[arg(long)]
+        end: Option<String>,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "100")]
+        delay_ms: u64,
+    },
+
+    /// Phase 2: Scrape full game history for unscraped players (slow, resumable)
+    ScrapePlayers {
+        /// Maximum players to scrape
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Number of concurrent player fetches
+        #[arg(short, long, default_value = "5")]
+        concurrent: usize,
+
+        /// Delay between API requests in ms
+        #[arg(long, default_value = "200")]
+        delay_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -469,15 +499,34 @@ async fn main() -> Result<()> {
                 info!("Stored {} new UUIDs in database", new_count);
             }
             MajsoulCommands::Stats => {
+                println!("=== Majsoul Pipeline Stats ===\n");
+
+                // Phase 1: Day fetch progress
+                let (days, day_games, day_players) = db.count_day_fetch_progress()?;
+                println!("Phase 1 (Day Fetch):");
+                println!("  Days fetched:     {}", days);
+                println!("  Games seen:       {}", day_games);
+                println!("  Players seen:     {}", day_players);
+
+                // Phase 2: Player scrape progress
+                let (total_players, scraped_players) = db.count_player_scrape_progress()?;
+                let remaining_players = total_players - scraped_players;
+                println!("\nPhase 2 (Player Scrape):");
+                println!("  Total players:    {}", total_players);
+                println!("  Scraped:          {}", scraped_players);
+                println!("  Remaining:        {}", remaining_players);
+
+                // Game logs
                 let (total, downloaded, converted) = db.count_majsoul_logs()?;
-                println!("Majsoul logs:");
+                println!("\nGame Logs:");
                 println!("  Total UUIDs:      {}", total);
                 println!("  Downloaded:       {}", downloaded);
                 println!("  Converted:        {}", converted);
                 println!("  Pending download: {}", total - downloaded);
                 println!("  Pending convert:  {}", downloaded - converted);
 
-                println!("\nBy room:");
+                // By mode
+                println!("\nBy Room:");
                 let by_mode = db.count_majsoul_logs_by_mode()?;
                 for (mode_id, count) in by_mode {
                     let room_name = match mode_id {
@@ -487,18 +536,6 @@ async fn main() -> Result<()> {
                         _ => "Other",
                     };
                     println!("  {} (mode {}): {}", room_name, mode_id, count);
-                }
-
-                println!("\nRoom fetch progress (days):");
-                let fetch_days = db.count_majsoul_room_fetch_days()?;
-                for (mode_id, days) in fetch_days {
-                    let room_name = match mode_id {
-                        16 => "Throne",
-                        12 => "Jade",
-                        9 => "Gold",
-                        _ => "Other",
-                    };
-                    println!("  {} (mode {}): {} days", room_name, mode_id, days);
                 }
             }
             MajsoulCommands::FetchPublic { room, count, server } => {
@@ -1478,6 +1515,169 @@ async fn main() -> Result<()> {
                 }
 
                 info!("Resolved {} phantom UUIDs", resolved);
+            }
+            MajsoulCommands::FetchDays { start, end, delay_ms } => {
+                let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;
+                let end_date = match end {
+                    Some(e) => NaiveDate::parse_from_str(&e, "%Y%m%d")?,
+                    None => chrono::Local::now().date_naive() - chrono::Duration::days(1),
+                };
+
+                info!("=== PHASE 1: Fetch Days ===");
+                info!("Range: {} to {}", start_date, end_date);
+
+                let unfetched_days = db.get_unfetched_days(
+                    &start_date.format("%Y%m%d").to_string(),
+                    &end_date.format("%Y%m%d").to_string(),
+                )?;
+
+                if unfetched_days.is_empty() {
+                    info!("All days already fetched!");
+                    return Ok(());
+                }
+
+                info!("Unfetched days: {}", unfetched_days.len());
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let mut total_games = 0usize;
+                let mut total_new_players = 0usize;
+
+                for (i, date) in unfetched_days.iter().enumerate() {
+                    match client.fetch_day_games(date).await {
+                        Ok((games, player_ids, api_calls)) => {
+                            let game_count = games.len();
+                            let player_count = player_ids.len();
+
+                            // Store players in a single transaction for performance
+                            db.begin_transaction()?;
+                            let mut new_players = 0;
+                            for game in &games {
+                                for player in &game.players {
+                                    if db.upsert_player_for_scraping(
+                                        player.account_id,
+                                        &player.nickname,
+                                        date,
+                                    )? {
+                                        new_players += 1;
+                                    }
+                                }
+                            }
+                            db.commit()?;
+
+                            // Mark day as fetched
+                            db.mark_day_fetched(date, game_count as i32, player_count as i32)?;
+
+                            total_games += game_count;
+                            total_new_players += new_players;
+
+                            info!(
+                                "[{}/{}] {}: {} games, {} players ({} new), {} API calls",
+                                i + 1,
+                                unfetched_days.len(),
+                                date,
+                                game_count,
+                                player_count,
+                                new_players,
+                                api_calls
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to fetch {}: {}", date, e);
+                        }
+                    }
+                }
+
+                let (days_done, _, _) = db.count_day_fetch_progress()?;
+                let (total_players_db, scraped) = db.count_player_scrape_progress()?;
+
+                info!("\n=== Phase 1 Complete ===");
+                info!("Days fetched: {}", days_done);
+                info!("Total games seen: {}", total_games);
+                info!("New players discovered: {}", total_new_players);
+                info!("Total players in DB: {} ({} scraped)", total_players_db, scraped);
+                info!("\nRun 'majsoul scrape-players' for Phase 2");
+            }
+            MajsoulCommands::ScrapePlayers { limit, concurrent, delay_ms } => {
+                let unscraped = db.get_unscraped_players(limit)?;
+
+                if unscraped.is_empty() {
+                    info!("All players already scraped!");
+                    let (total, scraped) = db.count_player_scrape_progress()?;
+                    info!("Total: {}, Scraped: {}", total, scraped);
+                    return Ok(());
+                }
+
+                info!("=== PHASE 2: Scrape Players ===");
+                info!("Unscraped players: {}", unscraped.len());
+                info!("Concurrent: {}", concurrent);
+
+                let client = majsoul::AmaeKoromoClient::new(delay_ms)?;
+                let mut processed = 0usize;
+                let mut total_games = 0usize;
+                let mut total_new_uuids = 0usize;
+                let total_players = unscraped.len();
+
+                for chunk in unscraped.chunks(concurrent) {
+                    let futures: Vec<_> = chunk.iter().map(|&player_id| {
+                        let client = &client;
+                        async move {
+                            let result = client.get_player_records_paginated(player_id, 16).await;
+                            (player_id, result)
+                        }
+                    }).collect();
+
+                    let results = futures::future::join_all(futures).await;
+
+                    for (player_id, result) in results {
+                        match result {
+                            Ok((records, api_calls)) => {
+                                let mut new_for_player = 0;
+                                for r in &records {
+                                    if db.insert_majsoul_log_with_full_uuid(
+                                        &r.uuid,
+                                        player_id,
+                                        r.start_time,
+                                        Some(r.mode_id),
+                                    )? {
+                                        new_for_player += 1;
+                                    }
+                                }
+
+                                db.mark_player_scraped(player_id, records.len() as i32)?;
+                                total_games += records.len();
+                                total_new_uuids += new_for_player;
+
+                                if api_calls > 1 || records.len() > 100 {
+                                    info!(
+                                        "Player {}: {} games ({} API calls, {} new)",
+                                        player_id, records.len(), api_calls, new_for_player
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to scrape player {}: {}", player_id, e);
+                            }
+                        }
+                        processed += 1;
+                    }
+
+                    if processed % 100 == 0 || processed == total_players {
+                        let (total_p, scraped_p) = db.count_player_scrape_progress()?;
+                        info!(
+                            "Progress: {}/{} players | {} games | {} new UUIDs | {}/{} total scraped",
+                            processed, total_players, total_games, total_new_uuids, scraped_p, total_p
+                        );
+                    }
+                }
+
+                let (total_logs, downloaded, _) = db.count_majsoul_logs()?;
+                let (total_p, scraped_p) = db.count_player_scrape_progress()?;
+
+                info!("\n=== Phase 2 Complete ===");
+                info!("Players scraped: {}/{}", scraped_p, total_p);
+                info!("Total games in DB: {}", total_logs);
+                info!("Games downloaded: {}", downloaded);
+                info!("New UUIDs this run: {}", total_new_uuids);
             }
         },
     }
