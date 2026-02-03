@@ -360,6 +360,41 @@ impl Database {
         Ok(())
     }
 
+    /// Get undownloaded Majsoul logs that have a full_uuid (required for download).
+    ///
+    /// Returns full_uuid values for records where:
+    /// - is_downloaded = 0
+    /// - full_uuid IS NOT NULL
+    pub fn get_majsoul_undownloaded_with_full_uuid(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<String>> {
+        let sql = match limit {
+            Some(n) => format!(
+                "SELECT full_uuid FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL ORDER BY start_time LIMIT {}",
+                n
+            ),
+            None => "SELECT full_uuid FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL ORDER BY start_time".to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        let mut uuids = Vec::new();
+        for uuid in rows {
+            uuids.push(uuid?);
+        }
+        Ok(uuids)
+    }
+
+    /// Count Majsoul logs that are downloadable (have full_uuid but not yet downloaded).
+    pub fn count_majsoul_downloadable(&self) -> Result<i64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     /// Get unconverted Majsoul logs (downloaded but not yet converted)
     pub fn get_majsoul_unconverted(
         &self,
@@ -848,5 +883,65 @@ mod tests {
             |row| row.get(0),
         ).unwrap();
         assert_eq!(full, "250101-full-uuid-here");
+    }
+
+    #[test]
+    fn test_get_majsoul_undownloaded_with_full_uuid() {
+        let db = Database::open(":memory:").unwrap();
+
+        // Insert test data: mix of records with and without full_uuid
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short1', 1, 100, 16, '220101-full-uuid-1', 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short2', 1, 200, 16, NULL, 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short3', 1, 300, 16, '220101-full-uuid-3', 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short4', 1, 400, 16, '220101-full-uuid-4', 1)",
+            [],
+        ).unwrap();
+
+        // Get all undownloaded with full_uuid
+        let uuids = db.get_majsoul_undownloaded_with_full_uuid(None).unwrap();
+        assert_eq!(uuids.len(), 2);
+        assert_eq!(uuids[0], "220101-full-uuid-1");
+        assert_eq!(uuids[1], "220101-full-uuid-3");
+
+        // Test with limit
+        let uuids_limited = db.get_majsoul_undownloaded_with_full_uuid(Some(1)).unwrap();
+        assert_eq!(uuids_limited.len(), 1);
+        assert_eq!(uuids_limited[0], "220101-full-uuid-1");
+    }
+
+    #[test]
+    fn test_count_majsoul_downloadable() {
+        let db = Database::open(":memory:").unwrap();
+
+        // Insert test data
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short1', 1, 100, 16, '220101-full-uuid-1', 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short2', 1, 200, 16, NULL, 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short3', 1, 300, 16, '220101-full-uuid-3', 0)",
+            [],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid, is_downloaded) VALUES ('short4', 1, 400, 16, '220101-full-uuid-4', 1)",
+            [],
+        ).unwrap();
+
+        let count = db.count_majsoul_downloadable().unwrap();
+        assert_eq!(count, 2); // short1 and short3 have full_uuid and is_downloaded = 0
     }
 }
