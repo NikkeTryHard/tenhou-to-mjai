@@ -196,10 +196,6 @@ enum MajsoulCommands {
         /// Password for native login (required)
         #[arg(long)]
         password: String,
-
-        /// Use browser to download (bypasses token issues for CN server)
-        #[arg(long)]
-        browser: bool,
     },
 
     /// Convert downloaded Majsoul logs to MJAI format
@@ -625,52 +621,7 @@ async fn main() -> Result<()> {
                 server,
                 username,
                 password,
-                browser,
             } => {
-                // Browser mode: use browser's authenticated session directly (bypasses token issues)
-                if browser {
-                    use tracing::warn;
-
-                    info!("Using browser-based batch download for {} server", server);
-
-                    let uuids = db.get_majsoul_undownloaded(limit)?;
-                    if uuids.is_empty() {
-                        info!("No pending downloads in DB - will fetch game list from server");
-                    } else {
-                        info!("Will download {} records from DB (browser stays open)", uuids.len());
-                    }
-
-                    // Single browser session for all downloads
-                    // If uuids is empty, browser will fetch game list from server
-                    let results = majsoul::browser::fetch_game_records_batch(&server, &uuids, delay_ms).await?;
-
-                    let mut success = 0;
-                    let mut failed = 0;
-
-                    for (uuid, result) in results {
-                        match result {
-                            Ok(data) => {
-                                if let Err(e) = db.mark_majsoul_downloaded(&uuid, &data) {
-                                    warn!("Failed to save {}: {}", uuid, e);
-                                    failed += 1;
-                                } else {
-                                    success += 1;
-                                    info!("Saved {} ({} bytes)", uuid, data.len());
-                                }
-                            }
-                            Err(e) => {
-                                warn!("Failed {}: {}", uuid, e);
-                                db.mark_majsoul_download_error(&uuid)?;
-                                failed += 1;
-                            }
-                        }
-                    }
-
-                    info!("Downloaded {} records ({} failed)", success, failed);
-                    return Ok(());
-                }
-
-                // Native login mode
                 let downloader = majsoul::MajsoulDownloader::new(delay_ms);
                 let (success, failed) = downloader.download_logs(&db, &username, &password, limit, &server).await?;
                 info!("Downloaded {} records ({} failed)", success, failed);

@@ -9,24 +9,8 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
-/// Path to cached cookies file
-fn cookies_cache_path() -> Result<PathBuf> {
-    let config_dir = dirs::config_dir()
-        .context("Could not find config directory")?
-        .join("tenhou-scraper");
-    std::fs::create_dir_all(&config_dir)?;
-    Ok(config_dir.join("majsoul-cookies.json"))
-}
-
-/// Cached cookies for session persistence
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-pub struct CachedCookies {
-    pub cookies: Vec<serde_json::Value>,
-    pub server: String,
-    pub saved_at: i64,
-}
-
 /// Cached localStorage for session persistence (the real auth data)
+#[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct CachedSession {
     pub local_storage: std::collections::HashMap<String, String>,
@@ -44,6 +28,7 @@ fn session_cache_path() -> Result<PathBuf> {
     Ok(config_dir.join("majsoul-session.json"))
 }
 
+#[allow(dead_code)]
 impl CachedSession {
     /// Load cached session from disk
     pub fn load() -> Result<Option<Self>> {
@@ -67,28 +52,6 @@ impl CachedSession {
     }
 }
 
-impl CachedCookies {
-    /// Load cached cookies from disk
-    pub fn load() -> Result<Option<Self>> {
-        let path = cookies_cache_path()?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let data = std::fs::read_to_string(&path)?;
-        let cookies: CachedCookies = serde_json::from_str(&data)?;
-        Ok(Some(cookies))
-    }
-
-    /// Save cookies to disk
-    pub fn save(&self) -> Result<()> {
-        let path = cookies_cache_path()?;
-        let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
-        info!("Cookies saved to {:?} ({} cookies)", path, self.cookies.len());
-        Ok(())
-    }
-}
-
 /// Server URLs for different regions
 pub fn server_url(server: &str) -> &'static str {
     match server {
@@ -99,6 +62,7 @@ pub fn server_url(server: &str) -> &'static str {
 }
 
 /// Profile type for browser launch
+#[allow(dead_code)]
 pub enum BrowserProfile {
     /// Interactive headed browser for login
     Interactive,
@@ -196,6 +160,7 @@ async fn launch_browser_with_profile(
 }
 
 /// Backward-compatible launch (interactive headed)
+#[allow(dead_code)]
 async fn launch_browser(
 ) -> Result<(
     Browser,
@@ -205,6 +170,7 @@ async fn launch_browser(
 }
 
 /// Export full session (localStorage + cookies) from browser
+#[allow(dead_code)]
 pub async fn export_session_from_page(page: &chromiumoxide::Page, server: &str) -> Result<CachedSession> {
     use chromiumoxide::cdp::browser_protocol::network::GetCookiesParams;
 
@@ -249,6 +215,7 @@ pub async fn export_session_from_page(page: &chromiumoxide::Page, server: &str) 
 }
 
 /// Import full session (localStorage + cookies) into browser
+#[allow(dead_code)]
 pub async fn import_session_to_page(page: &chromiumoxide::Page, session: &CachedSession) -> Result<()> {
     use chromiumoxide::cdp::browser_protocol::network::{SetCookieParams, CookieSameSite};
 
@@ -295,6 +262,7 @@ pub async fn import_session_to_page(page: &chromiumoxide::Page, session: &Cached
 
 /// Fetch multiple game records using ONE browser session (kept alive)
 /// Browser opens, waits for lobby, fetches all UUIDs, then closes
+#[allow(dead_code)]
 pub async fn fetch_game_records_batch(
     server: &str,
     uuids: &[String],
@@ -822,6 +790,7 @@ pub async fn resolve_phantom_uuids(
 }
 
 /// Fetch a game record using the browser's authenticated session
+#[allow(dead_code)]
 pub async fn fetch_game_record_via_browser(
     server: &str,
     uuid: &str,
