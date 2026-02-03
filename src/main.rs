@@ -499,15 +499,34 @@ async fn main() -> Result<()> {
                 info!("Stored {} new UUIDs in database", new_count);
             }
             MajsoulCommands::Stats => {
+                println!("=== Majsoul Pipeline Stats ===\n");
+
+                // Phase 1: Day fetch progress
+                let (days, day_games, day_players) = db.count_day_fetch_progress()?;
+                println!("Phase 1 (Day Fetch):");
+                println!("  Days fetched:     {}", days);
+                println!("  Games seen:       {}", day_games);
+                println!("  Players seen:     {}", day_players);
+
+                // Phase 2: Player scrape progress
+                let (total_players, scraped_players) = db.count_player_scrape_progress()?;
+                let remaining_players = total_players - scraped_players;
+                println!("\nPhase 2 (Player Scrape):");
+                println!("  Total players:    {}", total_players);
+                println!("  Scraped:          {}", scraped_players);
+                println!("  Remaining:        {}", remaining_players);
+
+                // Game logs
                 let (total, downloaded, converted) = db.count_majsoul_logs()?;
-                println!("Majsoul logs:");
+                println!("\nGame Logs:");
                 println!("  Total UUIDs:      {}", total);
                 println!("  Downloaded:       {}", downloaded);
                 println!("  Converted:        {}", converted);
                 println!("  Pending download: {}", total - downloaded);
                 println!("  Pending convert:  {}", downloaded - converted);
 
-                println!("\nBy room:");
+                // By mode
+                println!("\nBy Room:");
                 let by_mode = db.count_majsoul_logs_by_mode()?;
                 for (mode_id, count) in by_mode {
                     let room_name = match mode_id {
@@ -517,18 +536,6 @@ async fn main() -> Result<()> {
                         _ => "Other",
                     };
                     println!("  {} (mode {}): {}", room_name, mode_id, count);
-                }
-
-                println!("\nRoom fetch progress (days):");
-                let fetch_days = db.count_majsoul_room_fetch_days()?;
-                for (mode_id, days) in fetch_days {
-                    let room_name = match mode_id {
-                        16 => "Throne",
-                        12 => "Jade",
-                        9 => "Gold",
-                        _ => "Other",
-                    };
-                    println!("  {} (mode {}): {} days", room_name, mode_id, days);
                 }
             }
             MajsoulCommands::FetchPublic { room, count, server } => {
