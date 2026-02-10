@@ -399,6 +399,56 @@ enum MajsoulCommands {
         server: String,
     },
 
+    /// Multi-account raw protobuf download (saves .pb files, no conversion)
+    RawDownload {
+        /// File with account emails (one per line)
+        #[arg(short, long, default_value = "accounts.txt")]
+        accounts: PathBuf,
+
+        /// Shared password for all accounts
+        #[arg(long)]
+        password: String,
+
+        /// File with all UUIDs to download (one per line)
+        #[arg(long, default_value = "todo.txt")]
+        todo: PathBuf,
+
+        /// Append-only log of completed UUIDs
+        #[arg(long, default_value = "completed.log")]
+        completed: PathBuf,
+
+        /// Output directory for .pb files
+        #[arg(short, long, default_value = "jade-raw")]
+        output: PathBuf,
+
+        /// Server region: cn, en, jp
+        #[arg(long, default_value = "cn")]
+        server: String,
+
+        /// Maximum games to download
+        #[arg(short, long)]
+        limit: Option<usize>,
+
+        /// Delay between requests per worker in ms
+        #[arg(long, default_value = "300")]
+        delay_ms: u64,
+    },
+
+    /// Convert raw .pb files to MJAI format (no database needed)
+    ConvertRaw {
+        /// Input directory containing .pb files
+        #[arg(short, long, default_value = "jade-raw")]
+        input: PathBuf,
+
+        /// Output directory for .mjai.json files
+        #[arg(short, long, default_value = "jade-mjai")]
+        output: PathBuf,
+
+        /// Delete .pb files after successful conversion
+        #[arg(long, default_value = "false")]
+        delete: bool,
+    },
+
     /// Phase 1: Fetch all player IDs by day (fast, parallel-safe)
     FetchDays {
         /// Start date (YYYYMMDD)
@@ -1074,7 +1124,7 @@ async fn main() -> Result<()> {
                                 tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                             }
 
-                            match rpc.fetch_game_record(&short_uuid).await {
+                            match rpc.fetch_game_record(&short_uuid, "").await {
                                 Ok(data) => {
                                     match extract_full_uuid_from_record(&data) {
                                         Ok(full_uuid) => {
@@ -1443,6 +1493,26 @@ async fn main() -> Result<()> {
                 ).await?;
 
                 info!("Downloaded {} games as Tenhou JSON ({} failed)", success, failed);
+            }
+            MajsoulCommands::RawDownload { accounts, password, todo, completed, output, server, limit, delay_ms } => {
+                use crate::majsoul::raw_download::raw_download;
+
+                let (success, failed) = raw_download(
+                    &accounts,
+                    &password,
+                    &todo,
+                    &completed,
+                    &output,
+                    &server,
+                    limit,
+                    delay_ms,
+                ).await?;
+
+                info!("Raw download complete: {} success, {} failed", success, failed);
+            }
+            MajsoulCommands::ConvertRaw { input, output, delete } => {
+                let (success, failed) = majsoul::convert::convert_raw_files(&input, &output, delete)?;
+                info!("Converted {} .pb files to MJAI ({} failed)", success, failed);
             }
             MajsoulCommands::FetchDays { start, end, delay_ms } => {
                 let start_date = NaiveDate::parse_from_str(&start, "%Y%m%d")?;

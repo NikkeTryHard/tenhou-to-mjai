@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-use super::proto::{extract_string, extract_varint, FieldIterator};
+use super::proto::{extract_string, extract_varint, decode_packed_varints, FieldIterator};
 use super::tiles::tile_str_to_mjai;
 
 /// Decoded RecordNewRound event
@@ -138,20 +138,26 @@ pub fn parse_new_round(data: &[u8]) -> Result<NewRound> {
             (1, 0) => chang = extract_varint(field.data)? as u32,
             (2, 0) => ju = extract_varint(field.data)? as u32,
             (3, 0) => ben = extract_varint(field.data)? as u32,
-            // Field 4: tiles0 (repeated string)
-            (4, 2) => tiles[0].push(tile_str_to_mjai(&extract_string(field.data))?),
-            // Field 5: tiles1
-            (5, 2) => tiles[1].push(tile_str_to_mjai(&extract_string(field.data))?),
-            // Field 6: tiles2
-            (6, 2) => tiles[2].push(tile_str_to_mjai(&extract_string(field.data))?),
-            // Field 7: tiles3
-            (7, 2) => tiles[3].push(tile_str_to_mjai(&extract_string(field.data))?),
-            // Field 8: dora
-            (8, 2) => dora_marker = tile_str_to_mjai(&extract_string(field.data))?,
-            // Field 10: scores (repeated int32)
-            (10, 0) => scores.push(extract_varint(field.data)? as i32),
-            // Field 11: liqibang
-            (11, 0) => liqibang = extract_varint(field.data)? as u32,
+            // Field 5: scores (packed repeated int32)
+            (5, 2) => scores.extend(decode_packed_varints(field.data)?),
+            // Field 5: scores (unpacked individual varint)
+            (5, 0) => scores.push(extract_varint(field.data)? as i32),
+            // Field 6: liqibang
+            (6, 0) => liqibang = extract_varint(field.data)? as u32,
+            // Field 7: tiles0 (repeated string)
+            (7, 2) => tiles[0].push(tile_str_to_mjai(&extract_string(field.data))?),
+            // Field 8: tiles1
+            (8, 2) => tiles[1].push(tile_str_to_mjai(&extract_string(field.data))?),
+            // Field 9: tiles2
+            (9, 2) => tiles[2].push(tile_str_to_mjai(&extract_string(field.data))?),
+            // Field 10: tiles3
+            (10, 2) => tiles[3].push(tile_str_to_mjai(&extract_string(field.data))?),
+            // Field 16: doras (repeated string) - use first as dora marker
+            (16, 2) => {
+                if dora_marker.is_empty() {
+                    dora_marker = tile_str_to_mjai(&extract_string(field.data))?;
+                }
+            }
             _ => {}
         }
     }
@@ -200,8 +206,8 @@ pub fn parse_discard_tile(data: &[u8]) -> Result<DiscardTile> {
             (1, 0) => seat = extract_varint(field.data)? as u32,
             (2, 2) => tile = tile_str_to_mjai(&extract_string(field.data))?,
             (3, 0) => is_liqi = extract_varint(field.data)? != 0,
-            (4, 0) => moqie = extract_varint(field.data)? != 0,
-            (6, 0) => is_wliqi = extract_varint(field.data)? != 0,
+            (5, 0) => moqie = extract_varint(field.data)? != 0,
+            (9, 0) => is_wliqi = extract_varint(field.data)? != 0,
             _ => {}
         }
     }
@@ -239,6 +245,11 @@ pub fn parse_chi_peng_gang(data: &[u8]) -> Result<ChiPengGang> {
                 };
             }
             (3, 2) => tiles.push(tile_str_to_mjai(&extract_string(field.data))?),
+            (4, 2) => {
+                for v in decode_packed_varints(field.data)? {
+                    froms.push(v as u32);
+                }
+            }
             (4, 0) => froms.push(extract_varint(field.data)? as u32),
             _ => {}
         }
@@ -299,14 +310,14 @@ fn parse_hule_info(data: &[u8]) -> Result<HuleInfo> {
     for field in FieldIterator::new(data) {
         let field = field?;
         match (field.number, field.wire_type) {
-            (2, 0) => seat = extract_varint(field.data)? as u32,
-            (3, 0) => zimo = extract_varint(field.data)? != 0,
-            (5, 2) => hand.push(tile_str_to_mjai(&extract_string(field.data))?),
-            (6, 2) => hu_tile = tile_str_to_mjai(&extract_string(field.data))?,
-            (8, 0) => fu = extract_varint(field.data)? as u32,
-            (10, 0) => point_rong = extract_varint(field.data)? as i32,
-            (11, 0) => point_zimo_qin = extract_varint(field.data)? as i32,
-            (12, 0) => point_zimo_xian = extract_varint(field.data)? as i32,
+            (1, 2) => hand.push(tile_str_to_mjai(&extract_string(field.data))?),
+            (3, 2) => hu_tile = tile_str_to_mjai(&extract_string(field.data))?,
+            (4, 0) => seat = extract_varint(field.data)? as u32,
+            (5, 0) => zimo = extract_varint(field.data)? != 0,
+            (13, 0) => fu = extract_varint(field.data)? as u32,
+            (15, 0) => point_rong = extract_varint(field.data)? as i32,
+            (16, 0) => point_zimo_qin = extract_varint(field.data)? as i32,
+            (17, 0) => point_zimo_xian = extract_varint(field.data)? as i32,
             _ => {}
         }
     }
@@ -333,8 +344,10 @@ pub fn parse_hule(data: &[u8]) -> Result<Hule> {
         let field = field?;
         match (field.number, field.wire_type) {
             (1, 2) => hules.push(parse_hule_info(field.data)?),
+            (3, 2) => delta_scores.extend(decode_packed_varints(field.data)?),
             (3, 0) => delta_scores.push(extract_varint(field.data)? as i32),
-            (4, 0) => scores.push(extract_varint(field.data)? as i32),
+            (5, 2) => scores.extend(decode_packed_varints(field.data)?),
+            (5, 0) => scores.push(extract_varint(field.data)? as i32),
             _ => {}
         }
     }
@@ -351,14 +364,39 @@ pub fn parse_no_tile(data: &[u8]) -> Result<NoTile> {
     let mut scores = Vec::new();
     let mut delta_scores = Vec::new();
 
-    // NoTile has a nested ScoreInfo message, we need to handle it
+    // NoTile field 3 is repeated ScoresInfo messages (not plain ints)
+    // ScoresInfo: field 2=old_scores, field 3=delta_scores, field 7=score
     for field in FieldIterator::new(data) {
         let field = field?;
         match (field.number, field.wire_type) {
-            // Field 3: scores (repeated ScoreInfo or simple int)
-            (3, 0) => scores.push(extract_varint(field.data)? as i32),
-            // Field 4: delta_scores
-            (4, 0) => delta_scores.push(extract_varint(field.data)? as i32),
+            // Field 3: ScoresInfo (repeated message)
+            (3, 2) => {
+                let mut old_score = 0i32;
+                let mut delta = 0i32;
+                let mut score = 0i32;
+                for inner in FieldIterator::new(field.data) {
+                    let inner = inner?;
+                    match (inner.number, inner.wire_type) {
+                        // old_scores (repeated, take first)
+                        (2, 0) => {
+                            if old_score == 0 {
+                                old_score = extract_varint(inner.data)? as i32;
+                            }
+                        }
+                        // delta_scores (repeated, take first)
+                        (3, 0) => {
+                            if delta == 0 {
+                                delta = extract_varint(inner.data)? as i32;
+                            }
+                        }
+                        // score (final score)
+                        (7, 0) => score = extract_varint(inner.data)? as u32 as i32,
+                        _ => {}
+                    }
+                }
+                scores.push(score as i32);
+                delta_scores.push(delta);
+            }
             _ => {}
         }
     }
@@ -392,7 +430,7 @@ pub fn parse_babei(data: &[u8]) -> Result<BaBei> {
         let field = field?;
         match (field.number, field.wire_type) {
             (1, 0) => seat = extract_varint(field.data)? as u32,
-            (2, 0) => moqie = extract_varint(field.data)? != 0,
+            (8, 0) => moqie = extract_varint(field.data)? != 0,
             _ => {}
         }
     }

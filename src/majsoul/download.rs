@@ -82,7 +82,7 @@ impl MajsoulDownloader {
         let mut failed = 0;
 
         for uuid in &uuids {
-            match rpc.fetch_game_record(uuid).await {
+            match rpc.fetch_game_record(uuid, "").await {
                 Ok(data) => {
                     if let Err(e) = db.mark_majsoul_downloaded(uuid, &data) {
                         warn!("Failed to save {}: {}", uuid, e);

@@ -19,6 +19,8 @@ use super::events::{
 };
 use super::proto::decode_game_record;
 
+pub use self::convert_raw_files as convert_raw;
+
 pub struct MajsoulConverter {
     output_dir: PathBuf,
 }
@@ -401,6 +403,139 @@ fn generate_ankan_tiles(tile: &str) -> Vec<String> {
         }
     }
     vec![tile.to_string(); 4]
+}
+
+/// Convert raw .pb files from a directory to MJAI format (no database needed)
+///
+/// Reads .pb files from `input_dir`, converts to .mjai.json in `output_dir`,
+/// and optionally deletes the .pb files after successful conversion.
+pub fn convert_raw_files(
+    input_dir: &Path,
+    output_dir: &Path,
+    delete_after: bool,
+) -> Result<(usize, usize)> {
+    fs::create_dir_all(output_dir)?;
+
+    // Collect all .pb files
+    let pb_files: Vec<PathBuf> = fs::read_dir(input_dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map_or(false, |ext| ext == "pb"))
+        .collect();
+
+    if pb_files.is_empty() {
+        tracing::info!("No .pb files found in {}", input_dir.display());
+        return Ok((0, 0));
+    }
+
+    // Filter out already-converted files
+    let pending: Vec<PathBuf> = pb_files
+        .into_iter()
+        .filter(|p| {
+            let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+            let mjai_path = output_dir.join(format!("{}.mjai.json", stem));
+            !mjai_path.exists()
+        })
+        .collect();
+
+    if pending.is_empty() {
+        tracing::info!("All files already converted");
+        return Ok((0, 0));
+    }
+
+    tracing::info!("Converting {} .pb files to MJAI", pending.len());
+
+    let pb = ProgressBar::new(pending.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) ({eta})")?
+            .progress_chars("#>-"),
+    );
+
+    let success = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+
+    let converter = MajsoulConverter::new(output_dir)?;
+
+    pending
+        .par_iter()
+        .progress_with(pb.clone())
+        .for_each(|pb_path| {
+            let stem = pb_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+
+            match convert_single_file(&converter, pb_path, output_dir) {
+                Ok(_) => {
+                    success.fetch_add(1, Ordering::Relaxed);
+                    if delete_after {
+                        let _ = fs::remove_file(pb_path);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to convert {}: {:#}", stem, e);
+                    failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+    pb.finish_with_message("Done");
+
+    Ok((
+        success.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    ))
+}
+
+/// Convert a single .pb file to MJAI .mjai.json
+fn convert_single_file(
+    converter: &MajsoulConverter,
+    pb_path: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    let raw_data = fs::read(pb_path).context("Failed to read .pb file")?;
+
+    if raw_data.len() < 20 {
+        anyhow::bail!("File too small ({} bytes)", raw_data.len());
+    }
+
+    let stem = pb_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Decode the protobuf game record
+    let record = decode_game_record(&raw_data)
+        .with_context(|| format!("Failed to decode: {}", stem))?;
+
+    if record.records.is_empty() {
+        anyhow::bail!("No game records found in {}", stem);
+    }
+
+    // Parse all record actions into game events
+    let mut events: Vec<GameEvent> = Vec::new();
+    for action in &record.records {
+        if let Some(event) = parse_record_action(&action.name, &action.data)? {
+            events.push(event);
+        }
+    }
+
+    // Convert game events to MJAI format
+    let mjai_events = converter.events_to_mjai(&record.player_names, &events)?;
+
+    // Write plain MJAI output (not gzipped - easier to work with)
+    let output_path = output_dir.join(format!("{}.mjai.json", stem));
+    let mut file = File::create(&output_path)?;
+
+    for event in mjai_events {
+        let line = serde_json::to_string(&event)?;
+        writeln!(file, "{}", line)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

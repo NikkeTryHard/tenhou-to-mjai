@@ -101,7 +101,7 @@ pub async fn download_as_json(
     let mut failed = 0;
 
     for uuid in &uuids {
-        match rpc.fetch_game_record(uuid).await {
+        match rpc.fetch_game_record(uuid, "").await {
             Ok(data) => {
                 // Get mode_id from database for this UUID
                 let mode_id = db.get_majsoul_mode_id(uuid).unwrap_or(16);

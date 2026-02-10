@@ -142,11 +142,12 @@ mod requests {
         buf
     }
 
-    pub fn fetch_game_record(uuid: &str) -> Vec<u8> {
+    pub fn fetch_game_record(uuid: &str, version: &str) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(0x0a);
-        encode_varint(&mut buf, uuid.len() as u64);
-        buf.extend_from_slice(uuid.as_bytes());
+        // Field 1: game_uuid
+        encode_string(&mut buf, 1, uuid);
+        // Field 2: client_version_string
+        encode_string(&mut buf, 2, version);
         buf
     }
 
@@ -282,7 +283,7 @@ impl MajsoulRpc {
             .headers_mut()
             .insert("Origin", MS_HOST.parse().unwrap());
 
-        info!("Connecting to {}", endpoint);
+        debug!("Connecting to {}", endpoint);
         let (ws_stream, _) = connect_async(request)
             .await
             .context("WebSocket connect failed")?;
@@ -309,7 +310,7 @@ impl MajsoulRpc {
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        info!("WebSocket closed");
+                        debug!("WebSocket closed");
                         break;
                     }
                     Err(e) => {
@@ -321,7 +322,7 @@ impl MajsoulRpc {
             }
         });
 
-        info!("Connected to Majsoul gateway");
+        debug!("Connected to Majsoul gateway");
         Ok(Self {
             write,
             pending,
@@ -359,11 +360,14 @@ impl MajsoulRpc {
         Ok(response)
     }
 
-    pub async fn fetch_game_record(&self, uuid: &str) -> Result<Vec<u8>> {
-        let request = requests::fetch_game_record(uuid);
+    pub async fn fetch_game_record(&self, uuid: &str, version: &str) -> Result<Vec<u8>> {
+        let request = requests::fetch_game_record(uuid, version);
         let response = self.call(".lq.Lobby.fetchGameRecord", &request).await?;
-        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
-            anyhow::bail!("fetchGameRecord error {}: {}", response[1], uuid);
+        // Check for error: direct (08 XX) or nested (0a LL 08 XX)
+        if let Some(code) = Self::extract_error_code(&response) {
+            if code != 0 {
+                anyhow::bail!("fetchGameRecord error {}: {}", code, uuid);
+            }
         }
         debug!("Fetched game record: {} ({} bytes)", uuid, response.len());
         Ok(response)
@@ -401,7 +405,7 @@ impl MajsoulRpc {
             .unwrap()
             .as_millis() as u64;
 
-        info!("Sending route connection (route_id: {}, timestamp: {})", route_id, timestamp);
+        debug!("Sending route connection (route_id: {}, timestamp: {})", route_id, timestamp);
 
         let request = requests::build_request_connection(route_id, timestamp);
         let response = self.call(".lq.Route.requestConnection", &request).await?;
@@ -414,7 +418,7 @@ impl MajsoulRpc {
             }
         }
 
-        info!("Route connection established");
+        debug!("Route connection established");
         Ok(())
     }
 
@@ -431,7 +435,7 @@ impl MajsoulRpc {
         self.route_connect(route_id).await?;
 
         // Step 2: Heartbeat via Lobby service (like original implementation)
-        info!("Sending heartbeat");
+        debug!("Sending heartbeat");
         let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
         debug!("Heartbeat response: {} bytes", hb_response.len());
 
@@ -439,7 +443,7 @@ impl MajsoulRpc {
         let random_key = Uuid::new_v4().to_string();
         let version_string = format!("web-{}", version.replace(".w", ""));
 
-        info!("Authenticating with native login (account={})", username);
+        debug!("Authenticating with native login (account={})", username);
 
         // Build ReqLogin protobuf
         let request = requests::build_login_request(
@@ -465,10 +469,10 @@ impl MajsoulRpc {
         }
 
         // Extract access_token (field 2) for verification
-        if let Some(token) = Self::extract_string_field(&response, 2) {
-            info!("CN native login successful (token: {}...)", &token[..8.min(token.len())]);
+        if let Some(_token) = Self::extract_string_field(&response, 2) {
+            debug!("Login successful (account={})", username);
         } else {
-            info!("CN native login successful");
+            debug!("Login successful (account={}, no token)", username);
         }
 
         // Send loginSuccess

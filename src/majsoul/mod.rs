@@ -8,6 +8,7 @@ pub mod gateway;
 pub mod json_download;
 pub mod parallel_download;
 pub mod proto;
+pub mod raw_download;
 pub mod rpc;
 pub mod tenhou_format;
 pub mod tiles;

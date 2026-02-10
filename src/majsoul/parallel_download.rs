@@ -120,7 +120,7 @@ impl ParallelDownloader {
             // Use Database::normalize_uuid for consistent key
             let short_uuid = Database::normalize_uuid(&uuid).to_string();
 
-            match current_rpc.fetch_game_record(&uuid).await {
+            match current_rpc.fetch_game_record(&uuid, "").await {
                 Ok(data) => {
                     let db_guard = db.lock().await;
                     if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
@@ -155,7 +155,7 @@ impl ParallelDownloader {
                         processed_since_restart = 0;
 
                         // Retry this UUID
-                        match current_rpc.fetch_game_record(&uuid).await {
+                        match current_rpc.fetch_game_record(&uuid, "").await {
                             Ok(data) => {
                                 let db_guard = db.lock().await;
                                 if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {

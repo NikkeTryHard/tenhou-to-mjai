@@ -132,6 +132,18 @@ pub fn extract_varint(data: &[u8]) -> Result<u64> {
     Ok(val)
 }
 
+/// Decode packed repeated varints from length-delimited data
+pub fn decode_packed_varints(data: &[u8]) -> Result<Vec<i32>> {
+    let mut result = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let (val, n) = decode_varint(&data[pos..])?;
+        result.push(val as i32);
+        pos += n;
+    }
+    Ok(result)
+}
+
 /// Decode Wrapper message: {name: string (field 1), data: bytes (field 2)}
 pub fn decode_wrapper(buf: &[u8]) -> Result<(String, Vec<u8>)> {
     let mut name = String::new();
@@ -196,11 +208,11 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                     match inner.number {
                         1 if inner.wire_type == 2 => uuid = extract_string(inner.data),
                         2 if inner.wire_type == 0 => start_time = extract_varint(inner.data)? as u32,
-                        4 if inner.wire_type == 2 => {
-                            // accounts (repeated PlayerAccount) - extract nickname (field 2)
+                        11 if inner.wire_type == 2 => {
+                            // accounts (repeated PlayerAccount) - extract nickname (field 3)
                             for acct_field in FieldIterator::new(inner.data) {
                                 let acct_field = acct_field?;
-                                if acct_field.number == 2 && acct_field.wire_type == 2 {
+                                if acct_field.number == 3 && acct_field.wire_type == 2 {
                                     player_names.push(extract_string(acct_field.data));
                                 }
                             }
@@ -222,8 +234,37 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     }
 
     // Decompress and decode records
-    let records = if let Some(compressed) = compressed_data {
-        decode_game_detail_records(&compressed)?
+    let records = if let Some(data_bytes) = compressed_data {
+        // Field 4 (data) is a Wrapper message: {name: string, data: bytes}
+        // The wrapper's data contains GameDetailRecords
+        let (_wrapper_name, wrapper_data) = decode_wrapper(&data_bytes)?;
+
+        // Parse GameDetailRecords: {records: repeated bytes (field 1),
+        //                           version: uint32 (field 2),
+        //                           actions: repeated GameAction (field 3)}
+        let mut version = 0u32;
+        let mut raw_records: Vec<Vec<u8>> = Vec::new();
+        let mut actions_data: Vec<Vec<u8>> = Vec::new();
+
+        for field in FieldIterator::new(&wrapper_data) {
+            let field = field?;
+            match (field.number, field.wire_type) {
+                (1, 2) => raw_records.push(field.data.to_vec()),
+                (2, 0) => version = extract_varint(field.data)? as u32,
+                (3, 2) => actions_data.push(field.data.to_vec()),
+                _ => {}
+            }
+        }
+
+        if version < 210715 && !raw_records.is_empty() {
+            // Old format: each record is a Wrapper (or gzipped Wrapper list)
+            decode_old_format_records(&raw_records)?
+        } else if !actions_data.is_empty() {
+            // New format: each action has a `result` field (field 3) which is a Wrapper
+            decode_new_format_actions(&actions_data)?
+        } else {
+            Vec::new()
+        }
     } else {
         Vec::new()
     };
@@ -236,19 +277,69 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     })
 }
 
-/// Decode GameDetailRecords (gzipped, contains repeated Wrapper messages)
-fn decode_game_detail_records(compressed: &[u8]) -> Result<Vec<RecordAction>> {
-    // Decompress
-    let mut decoder = GzDecoder::new(compressed);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .context("Failed to decompress game records")?;
+/// Decode old-format GameDetailRecords (version < 210715)
+/// Each record in the list is a serialized Wrapper message
+fn decode_old_format_records(raw_records: &[Vec<u8>]) -> Result<Vec<RecordAction>> {
+    let mut records = Vec::new();
+    for raw in raw_records {
+        // Each record bytes is a Wrapper {name: string, data: bytes}
+        let (name, data) = decode_wrapper(raw)?;
+        if !name.is_empty() {
+            records.push(RecordAction { name, data });
+        }
+    }
+    Ok(records)
+}
+
+/// Decode new-format GameDetailRecords (version >= 210715)
+/// Each action is a GameAction message with `result` field containing a Wrapper
+fn decode_new_format_actions(actions_data: &[Vec<u8>]) -> Result<Vec<RecordAction>> {
+    let mut records = Vec::new();
+    for action_bytes in actions_data {
+        // GameAction: {type: uint32 (field 1), result: bytes (field 3)}
+        let mut result_data: Option<Vec<u8>> = None;
+        for field in FieldIterator::new(action_bytes) {
+            let field = field?;
+            if field.number == 3 && field.wire_type == 2 {
+                result_data = Some(field.data.to_vec());
+            }
+        }
+
+        if let Some(result) = result_data {
+            if !result.is_empty() {
+                let (name, data) = decode_wrapper(&result)?;
+                if !name.is_empty() {
+                    records.push(RecordAction { name, data });
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Decode GameDetailRecords (may be gzipped or raw protobuf)
+///
+/// Data from the database is typically gzipped, but raw RPC responses
+/// (saved as .pb files) contain uncompressed protobuf.
+fn decode_game_detail_records(data: &[u8]) -> Result<Vec<RecordAction>> {
+    // Try raw protobuf first (check for gzip magic bytes 1f 8b)
+    let buf = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        // Gzipped — decompress
+        let mut decoder = GzDecoder::new(data);
+        let mut decompressed = Vec::new();
+        decoder
+            .read_to_end(&mut decompressed)
+            .context("Failed to decompress game records")?;
+        decompressed
+    } else {
+        // Already raw protobuf
+        data.to_vec()
+    };
 
     let mut records = Vec::new();
 
-    // Parse the decompressed protobuf
-    for field in FieldIterator::new(&decompressed) {
+    // Parse the protobuf — GameDetailRecords has field 1 (repeated Wrapper)
+    for field in FieldIterator::new(&buf) {
         let field = field?;
         if field.number == 1 && field.wire_type == 2 {
             // Each record is a Wrapper message
