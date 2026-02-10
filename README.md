@@ -2,8 +2,8 @@
 
 # Tenhou to MJAI
 
-This repository provides tools and datasets for converting **Tenhou mahjong game logs** into the **MJAI** format.
-It also includes preprocessed yearly datasets and Tenhou database files for AI research, data analysis, and mahjong strategy modeling.
+This repository provides tools and datasets for converting **Tenhou mahjong game logs** into the **MJAI** format, as well as tools for downloading and converting **Mahjong Soul (雀魂)** game records.
+It also includes preprocessed yearly Tenhou datasets for AI research, data analysis, and mahjong strategy modeling.
 
 ---
 
@@ -11,9 +11,8 @@ It also includes preprocessed yearly datasets and Tenhou database files for AI r
 
 * [Dataset Overview](#dataset-overview)
 * [Release Structure](#release-structure)
-* [File Size Notes](#file-size-notes)
 * [Understanding the MJAI Format](#understanding-the-mjai-format)
-* [CLI Tool: tenhou-scraper](#cli-tool-tenhou-scraper)
+* [Tools](#tools)
 * [Preparing Your Own Dataset](#preparing-your-own-dataset)
 * [Licenses](#licenses)
 * [Attribution](#attribution)
@@ -36,7 +35,7 @@ Complete collection of Tenhou phoenix room (鳳凰卓) game logs in MJAI format,
 | 2016 | 702MB | ~180k | 2025 | 861MB | 197,692 |
 | 2017 | 743MB | ~190k | 2026 | 60MB | 13,639 (Jan) |
 
-**Total: ~12GB, 18 yearly zips, 3M+ games**
+**Total: ~12GB, 18 yearly archives, 2.5M+ games**
 
 All datasets contain only **4-player (四人麻雀)** **hanchan (半荘戦)** games from the houou (phoenix) room.
 No 3-player or tonpuu (東風戦) matches are included.
@@ -60,24 +59,6 @@ Example structure of a yearly dataset:
 > Use tools like `gzip`, `gunzip`, or `7-Zip` to decompress them.
 
 Each release also includes a corresponding `YYYY.db` file containing Tenhou game metadata.
-
----
-
-## File Size Notes
-
-| Year      | ZIP File Size | DB File Size | Comment                             |
-| --------- | ------------- | ------------ | ----------------------------------- |
-| 2024      | ~1.2 GB       | ~1.54 GB     | Example year                        |
-| 2021      | ~819 MB       | varies       | Example year                        |
-| 2009–2025 | varies        | varies       | Each year has both `.zip` and `.db` |
-
-> [!IMPORTANT]
-> Compression ratios differ slightly by year.
-> File size variations (e.g., between 2020 and 2021) are **expected** and do not affect data integrity.
-
-> [!NOTE]
-> The provided `2024.zip` and `2024.db` are **examples**.
-> Each year from **2009 to 2025** includes its own `.zip` and `.db` files following the same structure.
 
 ---
 
@@ -136,9 +117,7 @@ For a complete and authoritative reference, please see the original [MJAI Protoc
 
 ---
 
-## CLI Tool: tenhou-scraper
-
-This repository includes `tenhou-scraper`, a Rust CLI for fetching, downloading, converting, and packaging mahjong logs.
+## Tools
 
 ### Installation
 
@@ -148,96 +127,46 @@ cd tenhou-to-mjai
 cargo build --release
 ```
 
-The binary will be at `./target/release/tenhou-scraper`.
+### tenhou-scraper (Rust CLI)
 
-### Commands
+Main CLI binary for both Tenhou and Majsoul pipelines.
 
-#### `fetch` - Fetch log IDs from Tenhou
+| Command Group | Description | Docs |
+|---------------|-------------|------|
+| `fetch`, `download`, `convert`, `package` | Tenhou houou log pipeline | [docs/tenhou-scraper.md](docs/tenhou-scraper.md) |
+| `majsoul fetch-days`, `scrape-players`, `scrape-all` | Majsoul UUID discovery | [docs/majsoul-scraper.md](docs/majsoul-scraper.md) |
+| `majsoul raw-download`, `bulk-download` | Majsoul game download | [docs/majsoul-scraper.md](docs/majsoul-scraper.md) |
+| `majsoul convert`, `convert-raw` | Majsoul → MJAI conversion | [docs/majsoul-scraper.md](docs/majsoul-scraper.md) |
+| `majsoul resolve-uuids`, `resolve-paipu` | UUID resolution | [docs/majsoul-scraper.md](docs/majsoul-scraper.md) |
+| `majsoul stats` | Pipeline statistics | [docs/majsoul-scraper.md](docs/majsoul-scraper.md) |
 
-Scrapes daily HTML.gz index files from Tenhou to collect game log IDs.
+Quick start (Tenhou):
 
 ```bash
-# Fetch all 2025 houou logs
 tenhou-scraper fetch --start 20250101 --end 20251231
-
-# Custom delay between requests (ms)
-tenhou-scraper fetch --start 20250101 --end 20250131 --delay-ms 500
-```
-
-#### `download` - Download XML content
-
-Downloads the actual game XML data for all pending logs.
-
-```bash
-# Download all pending logs
 tenhou-scraper download
-
-# Download with limit
-tenhou-scraper download --limit 1000
-
-# Custom delay (default: 200ms)
-tenhou-scraper download --delay-ms 300
-```
-
-#### `convert` - Convert to MJAI format
-
-Converts downloaded Tenhou XML logs to MJAI format (parallelized with rayon).
-
-```bash
-# Convert all downloaded logs
-tenhou-scraper convert --output mjai/
-
-# Convert with limit
-tenhou-scraper convert --output mjai/ --limit 100
-
-# Filter: only 4-player hanchan games
 tenhou-scraper convert --output mjai/ --players 4 --hanchan
-```
-
-#### `package` - Create zip archive
-
-Bundles converted MJAI files into a distributable zip archive.
-
-```bash
 tenhou-scraper package --input mjai/ --output houou-2025.zip
 ```
 
-#### `export` - Export XML from database
+### tensoul-download (Python)
 
-Exports raw XML content from the database to individual files.
+Multi-account Majsoul downloader and protobuf converter. See [docs/tensoul-download.md](docs/tensoul-download.md).
 
 ```bash
-tenhou-scraper export --output xml/ --limit 100
+cd tensoul-download && uv sync
+uv run python async_downloader.py --accounts accounts.txt --password "pass" --todo todo.txt
+uv run python convert_pb.py
 ```
 
-#### `stats` - Show database statistics
+### mjai-validator (Rust)
+
+Streaming validator for MJAI dataset archives. Validates all files inside `.tar.zst` archives without extracting to disk. See [docs/mjai-validator.md](docs/mjai-validator.md).
 
 ```bash
-tenhou-scraper stats
-```
-
-### Database
-
-Default database: `tenhou.db` in current directory. Override with `-d`:
-
-```bash
-tenhou-scraper -d custom.db stats
-```
-
-### Full Pipeline Example
-
-```bash
-# 1. Fetch all log IDs for a year
-tenhou-scraper fetch --start 20250101 --end 20251231
-
-# 2. Download XML content (takes hours with rate limiting)
-tenhou-scraper download
-
-# 3. Convert to MJAI format
-tenhou-scraper convert --output mjai/ --players 4 --hanchan
-
-# 4. Package for distribution
-tenhou-scraper package --input mjai/ --output houou-2025.zip
+cd dataset/mjai-validator && cargo build --release
+mjai-validator /path/to/dataset/mjai     # validate
+mjai-validator --clean /path/to/dataset  # remove invalid files
 ```
 
 ---
@@ -315,13 +244,14 @@ You may redistribute, remix, and build upon the data with proper attribution.
 
 ### Data Sources
 Data is derived from:
-* **Tenhou.net (天鳳)**
-* **houou-logs** and other related sources
+* **Tenhou.net (天鳳)** — Phoenix room (鳳凰卓) game logs
 
 ### Tooling
 This dataset was prepared using the following open-source tools. We extend our gratitude to their authors and contributors.
 *   **Mortal**: [https://github.com/Equim-chan/Mortal](https://github.com/Equim-chan/Mortal) - The target AI engine for the MJAI format.
 *   **mjai-reviewer**: [https://github.com/Equim-chan/mjai-reviewer](https://github.com/Equim-chan/mjai-reviewer) - Specifically, the `convlog` utility for JSON to MJAI conversion.
 *   **mjlog2json**: [https://github.com/tsubakisakura/mjlog2json](https://github.com/tsubakisakura/mjlog2json) - For converting raw Tenhou XML logs to JSON.
+*   **Amae-Koromo**: [https://amae-koromo.sapk.ch](https://amae-koromo.sapk.ch) - Mahjong Soul game record API.
+*   **tensoul-py-ng**: [https://github.com/unStatiK/tensoul-py-ng](https://github.com/unStatiK/tensoul-py-ng) - Majsoul protobuf to Tenhou JSON converter.
 
 All rights to original game data remain with their respective owners. Converted datasets are redistributed for **research and educational** use under CC BY 4.0.

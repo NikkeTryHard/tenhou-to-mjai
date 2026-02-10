@@ -7,12 +7,19 @@ CLAUDE.md
 # Output directories
 mjai/
 xml/
+jade-raw/
+jade-mjai/
+tenhou-json/
 
 # Packaged archives
 *.zip
 
+# Dataset archives (large binary files)
+dataset/mjai/*.tar.zst
+
 # Plans (local only)
 docs/plans/
+docs/orphan-uuid-recovery-approaches.md
 
 # Reference repos (cloned for research)
 Majsoul-to-NAGA/
@@ -25,3 +32,22 @@ amae-koromo-scripts/
 scripts/
 *.sh
 .worktrees/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# tensoul-download runtime files
+tensoul-download/accounts.txt
+tensoul-download/todo.txt
+tensoul-download/completed.log
+tensoul-download/completed_rust.log
+tensoul-download/failed.log
+tensoul-download/convert_failed.log
+tensoul-download/CLAUDE.md
+tensoul-download/*.db
+
+# Logs
+*.log

@@ -1,0 +1,19 @@
+[package]
+name = "mjai-validator"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zstd = { version = "0.13", features = ["zstdmt"] }
+tar = "0.4"
+phf = { version = "0.11", features = ["macros"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+target-cpu = "native"
+panic = "abort"
+strip = true
