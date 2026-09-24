@@ -232,11 +232,9 @@ Keep the Tenhou `.db` file alongside the yearly archive for metadata reference.
 This project’s code is licensed under the **Apache License 2.0**.
 See [`LICENSE`](LICENSE) for details.
 
-### Data License
+### Data Disclaimer
 
-The datasets are licensed under **Creative Commons Attribution 4.0 International (CC BY 4.0)**.
-See [`DATA_LICENSE`](DATA_LICENSE) for details.
-You may redistribute, remix, and build upon the data with proper attribution.
+Code and tooling in this repo are Apache-2.0. Match logs themselves are third-party historical records from Tenhou.net (C-EGG). No ownership claimed, no CC BY grant over the logs. Provided as-is for research and archival. See [`DATA_LICENSE`](DATA_LICENSE) for details. Downstream users check upstream terms for their own use.
 
 ---
 
@@ -254,4 +252,4 @@ This dataset was prepared using the following open-source tools. We extend our g
 *   **Amae-Koromo**: [https://amae-koromo.sapk.ch](https://amae-koromo.sapk.ch) - Mahjong Soul game record API.
 *   **tensoul-py-ng**: [https://github.com/unStatiK/tensoul-py-ng](https://github.com/unStatiK/tensoul-py-ng) - Majsoul protobuf to Tenhou JSON converter.
 
-All rights to original game data remain with their respective owners. Converted datasets are redistributed for **research and educational** use under CC BY 4.0.
+All rights to original game data remain with their respective owners. Converted logs are shared as-is for research and educational archival, no rights claimed, no affiliation with Tenhou / C-EGG.
