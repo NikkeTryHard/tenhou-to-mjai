@@ -40,6 +40,13 @@ Complete collection of Tenhou phoenix room (鳳凰卓) game logs in MJAI format,
 All datasets contain only **4-player (四人麻雀)** **hanchan (半荘戦)** games from the houou (phoenix) room.
 No 3-player or tonpuu (東風戦) matches are included.
 
+
+### Dataset Access (Torrent)
+
+Binaries moved off GitHub Releases to P2P for preservation. One torrent, all years, pick what you want in your client.
+
+magnet:?xt=urn:btih:a7256a6a069f75c78da3426295bbfd2c46eb1f25&xt=urn:btmh:12209378f66853cb311836615da4d1bf5d850f7bd8455e7b6838e57f2511260cf2e6&dn=tenhou-to-mjai&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.qu.ax:6969/announce
+
 ---
 
 ## Release Structure
