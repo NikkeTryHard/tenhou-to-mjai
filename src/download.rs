@@ -46,9 +46,14 @@ impl Downloader {
                 .progress_chars("#>-"),
         );
 
-        let results: Vec<_> = if concurrent > 1 {
-            // Parallel: no delay, just blast
-            stream::iter(ids)
+        let mut success = 0;
+        let mut failed = 0;
+
+        if concurrent > 1 {
+            // Parallel: persist each item as its download completes, so memory
+            // stays bounded to `concurrent` in-flight payloads and a crash or
+            // dropped DB connection only loses the in-flight items, not everything.
+            let mut pending = stream::iter(ids)
                 .map(|id| {
                     let client = self.client.clone();
                     let pb = pb.clone();
@@ -58,40 +63,44 @@ impl Downloader {
                         (id, result)
                     }
                 })
-                .buffer_unordered(concurrent)
-                .collect()
-                .await
+                .buffer_unordered(concurrent);
+
+            while let Some((id, result)) = pending.next().await {
+                match result {
+                    Ok(xml_data) => {
+                        let compressed = compress_gzip(&xml_data)?;
+                        db.mark_downloaded(&id, &compressed)?;
+                        success += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to download {}: {}", id, e);
+                        db.mark_download_error(&id)?;
+                        failed += 1;
+                    }
+                }
+            }
         } else {
-            // Sequential: respect delay
-            let mut results = Vec::new();
+            // Sequential: respect delay, persist immediately per item.
             for id in ids {
                 let result = download_single(&self.client, &id).await;
                 pb.inc(1);
-                results.push((id, result));
+                match result {
+                    Ok(xml_data) => {
+                        let compressed = compress_gzip(&xml_data)?;
+                        db.mark_downloaded(&id, &compressed)?;
+                        success += 1;
+                    }
+                    Err(e) => {
+                        warn!("Failed to download {}: {}", id, e);
+                        db.mark_download_error(&id)?;
+                        failed += 1;
+                    }
+                }
                 tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             }
-            results
-        };
+        }
 
         pb.finish_with_message("Done");
-
-        let mut success = 0;
-        let mut failed = 0;
-
-        for (id, result) in results {
-            match result {
-                Ok(xml_data) => {
-                    let compressed = compress_gzip(&xml_data)?;
-                    db.mark_downloaded(&id, &compressed)?;
-                    success += 1;
-                }
-                Err(e) => {
-                    warn!("Failed to download {}: {}", id, e);
-                    db.mark_download_error(&id)?;
-                    failed += 1;
-                }
-            }
-        }
 
         Ok((success, failed))
     }
