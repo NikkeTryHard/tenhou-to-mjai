@@ -2,7 +2,7 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
-/// Amae-Koromo API returns max 200 records per player_records request
+/// Amae-Koromo API returns max 200 records per `player_records` request
 const AMAE_KOROMO_PAGE_LIMIT: i64 = 200;
 
 pub struct Database {
@@ -17,7 +17,8 @@ pub struct LogEntry {
     pub is_hanchan: bool,
     pub is_downloaded: bool,
     pub is_converted: bool,
-    pub xml_data: Option<Vec<u8>>,
+    // Field is write-only by design: blobs are read back via SQL tuples, never via the struct.
+    pub _xml_data: Option<Vec<u8>>,
 }
 
 impl Database {
@@ -36,6 +37,19 @@ impl Database {
         Ok(())
     }
 
+    // 3 strikes then quarantine: transient net/parse flakes clear in 1-2, persistents need manual reset via reset_* .
+    pub const MAX_DOWNLOAD_ATTEMPTS: i64 = 3;
+    pub const MAX_CONVERT_ATTEMPTS: i64 = 3;
+
+    fn push_limit(sql: &mut String, values: &mut Vec<rusqlite::types::Value>, limit: Option<usize>) {
+        if let Some(n) = limit {
+            sql.push_str(" LIMIT ?");
+            values.push(rusqlite::types::Value::Integer(i64::try_from(n).unwrap_or(i64::MAX)));
+        }
+    }
+
+    // Allow: schema DDL plus tolerated-duplicate migrations are long by nature.
+    #[allow(clippy::too_many_lines)]
     fn init_schema(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -46,12 +60,22 @@ impl Database {
                 is_hanchan INTEGER NOT NULL,
                 is_downloaded INTEGER NOT NULL DEFAULT 0,
                 is_converted INTEGER NOT NULL DEFAULT 0,
+                download_attempts INTEGER NOT NULL DEFAULT 0,
+                convert_attempts INTEGER NOT NULL DEFAULT 0,
                 xml_data BLOB
             );
 
             CREATE TABLE IF NOT EXISTS fetch_state (
                 date TEXT PRIMARY KEY,
-                fetched_at TEXT NOT NULL
+                fetched_at TEXT NOT NULL,
+                checked_at TEXT
+            );
+
+            -- Per-date attempt timestamps for the 20-minute re-check throttle.
+            -- Separate from fetch_state so attempts never mark a date fetched.
+            CREATE TABLE IF NOT EXISTS fetch_attempts (
+                date TEXT PRIMARY KEY,
+                checked_at TEXT NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_logs_downloaded ON logs(is_downloaded);
@@ -67,13 +91,17 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS majsoul_logs (
                 uuid TEXT PRIMARY KEY,
-                player_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL CHECK (player_id > 0),
                 start_time INTEGER NOT NULL,
                 mode_id INTEGER,
                 num_players INTEGER,
                 is_hanchan INTEGER,
                 is_downloaded INTEGER DEFAULT 0,
                 is_converted INTEGER DEFAULT 0,
+                download_attempts INTEGER NOT NULL DEFAULT 0,
+                convert_attempts INTEGER NOT NULL DEFAULT 0,
+                full_uuid TEXT,
+                paipu_url TEXT DEFAULT NULL,
                 raw_data BLOB,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
@@ -93,7 +121,7 @@ impl Database {
 
             -- Throne room players for full UUID fetching
             CREATE TABLE IF NOT EXISTS throne_players (
-                account_id INTEGER PRIMARY KEY,
+                account_id INTEGER PRIMARY KEY CHECK (account_id > 0),
                 nickname TEXT,
                 fetched_at TEXT
             );
@@ -119,9 +147,34 @@ impl Database {
         )?;
 
         // Schema migration: add columns if they don't exist (for existing databases)
-        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN num_players INTEGER", []);
-        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN is_hanchan INTEGER", []);
-        let _ = self.conn.execute("ALTER TABLE majsoul_logs ADD COLUMN full_uuid TEXT", []);
+        // Each tolerates duplicate-column errors so old DBs migrate forward.
+        // Unexpected errors are logged, not swallowed silently.
+        for ddl in [
+            "ALTER TABLE majsoul_logs ADD COLUMN num_players INTEGER",
+            "ALTER TABLE majsoul_logs ADD COLUMN is_hanchan INTEGER",
+            "ALTER TABLE majsoul_logs ADD COLUMN full_uuid TEXT",
+            "ALTER TABLE majsoul_logs ADD COLUMN paipu_url TEXT",
+            "ALTER TABLE majsoul_logs ADD COLUMN download_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE majsoul_logs ADD COLUMN convert_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE logs ADD COLUMN download_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE logs ADD COLUMN convert_attempts INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE fetch_state ADD COLUMN checked_at TEXT",
+        ] {
+            if let Err(e) = self.conn.execute(ddl, []) {
+                // Tolerate only SQLite duplicate-column failures (old DBs migrating
+                // forward, or fresh DBs whose CREATE TABLE already has the column).
+                // Match the SqliteFailure variant + message, not bare Display: ErrorCode
+                // is too coarse here (duplicate column surfaces as generic SQLITE_ERROR).
+                let is_duplicate = matches!(
+                    &e,
+                    rusqlite::Error::SqliteFailure(_, Some(msg))
+                        if msg.contains("duplicate column name") || msg.contains("already exists")
+                );
+                if !is_duplicate {
+                    tracing::warn!("migration '{ddl}' failed: {e}");
+                }
+            }
+        }
 
         // Create index on full_uuid after migration ensures column exists
         self.conn.execute(
@@ -133,6 +186,7 @@ impl Database {
     }
 
     pub fn insert_log_id(&self, entry: &LogEntry) -> Result<bool> {
+        // IGNORE: re-fetch must never overwrite stored blobs/progress; fetch_state uses REPLACE to refresh timestamps.
         let result = self.conn.execute(
             "INSERT OR IGNORE INTO logs (id, date, num_players, is_hanchan, is_downloaded, is_converted)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -140,35 +194,28 @@ impl Database {
                 entry.id,
                 entry.date,
                 entry.num_players,
-                entry.is_hanchan as i32,
-                entry.is_downloaded as i32,
-                entry.is_converted as i32,
+                i32::from(entry.is_hanchan),
+                i32::from(entry.is_downloaded),
+                i32::from(entry.is_converted),
             ],
         )?;
         Ok(result > 0)
     }
 
     pub fn get_undownloaded_ids(&self, limit: Option<usize>) -> Result<Vec<String>> {
+        use rusqlite::types::Value;
+        // Retry queue: fresh rows plus error rows with attempts remaining.
+        let mut sql = String::from(
+            "SELECT id FROM logs WHERE (is_downloaded = 0 OR (is_downloaded = -1 AND download_attempts < ?)) ORDER BY id",
+        );
+        let mut values: Vec<Value> = vec![Value::Integer(Self::MAX_DOWNLOAD_ATTEMPTS)];
+        Self::push_limit(&mut sql, &mut values, limit);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut ids = Vec::new();
-
-        if let Some(n) = limit {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM logs WHERE is_downloaded <= 0 ORDER BY id LIMIT ?1")?;
-            let rows = stmt.query_map([n], |row| row.get(0))?;
-            for id in rows {
-                ids.push(id?);
-            }
-        } else {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT id FROM logs WHERE is_downloaded <= 0 ORDER BY id")?;
-            let rows = stmt.query_map([], |row| row.get(0))?;
-            for id in rows {
-                ids.push(id?);
-            }
+        for id in rows {
+            ids.push(id?);
         }
-
         Ok(ids)
     }
 
@@ -182,10 +229,34 @@ impl Database {
 
     pub fn mark_download_error(&self, id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE logs SET is_downloaded = -1 WHERE id = ?1",
+            "UPDATE logs SET is_downloaded = -1, download_attempts = download_attempts + 1 WHERE id = ?1",
             params![id],
         )?;
         Ok(())
+    }
+
+    pub fn mark_convert_error(&self, id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE logs SET is_converted = -1, convert_attempts = convert_attempts + 1 WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_download_errors(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE logs SET is_downloaded = 0, download_attempts = 0 WHERE is_downloaded = -1",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    pub fn reset_convert_errors(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE logs SET is_converted = 0, convert_attempts = 0 WHERE is_converted = -1",
+            [],
+        )?;
+        Ok(n)
     }
 
     pub fn get_unconverted_logs(
@@ -193,28 +264,65 @@ impl Database {
         limit: Option<usize>,
         num_players: Option<i32>,
         hanchan_only: bool,
+        after_id: Option<&str>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        use rusqlite::types::Value;
+        // Retry queue: fresh rows plus error rows with attempts remaining.
         let mut sql = String::from(
             "SELECT id, xml_data FROM logs
-             WHERE is_downloaded = 1 AND is_converted = 0 AND xml_data IS NOT NULL",
+             WHERE is_downloaded = 1 AND xml_data IS NOT NULL
+             AND (is_converted = 0 OR (is_converted = -1 AND convert_attempts < ?))",
         );
+        let mut values: Vec<Value> = vec![Value::Integer(Self::MAX_CONVERT_ATTEMPTS)];
 
         if let Some(players) = num_players {
-            sql.push_str(&format!(" AND num_players = {}", players));
+            sql.push_str(" AND num_players = ?");
+            values.push(Value::Integer(i64::from(players)));
         }
 
         if hanchan_only {
             sql.push_str(" AND is_hanchan = 1");
         }
 
-        sql.push_str(" ORDER BY id");
-
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {}", n));
+        // Cursor page: ids are unique, so `id > cursor` visits every queued
+        // row exactly once per run. Re-querying `LIMIT n` from the head would
+        // return still-queued failures forever and starve the table tail.
+        if let Some(cursor) = after_id {
+            sql.push_str(" AND id > ?");
+            values.push(Value::Text(cursor.to_owned()));
         }
 
+        sql.push_str(" ORDER BY id");
+
+        Self::push_limit(&mut sql, &mut values, limit);
+
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+
+        Ok(results)
+    }
+
+    /// Get downloaded Tenhou logs regardless of conversion state (for export).
+    pub fn get_downloaded_logs(&self, limit: Option<usize>) -> Result<Vec<(String, Vec<u8>)>> {
+        use rusqlite::types::Value;
+        let mut sql = String::from(
+            "SELECT id, xml_data FROM logs WHERE is_downloaded = 1 AND xml_data IS NOT NULL ORDER BY id",
+        );
+        let mut values: Vec<Value> = Vec::new();
+
+        Self::push_limit(&mut sql, &mut values, limit);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -249,6 +357,34 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// Record that a date file was attempted (success or failure) for Tenhou politeness.
+    /// Tenhou asks clients to re-check a file at most every 20 minutes; callers gate
+    /// on `was_fetch_checked_within`. Kept in a separate table so attempts never
+    /// mark a date fetched (a failed date must stay retryable).
+    pub fn record_fetch_attempt(&self, date: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO fetch_attempts (date, checked_at) VALUES (?1, datetime('now'))
+             ON CONFLICT(date) DO UPDATE SET checked_at = datetime('now')",
+            params![date],
+        )?;
+        Ok(())
+    }
+
+    /// True when the date was attempted within the last `minutes` minutes.
+    /// NOTE: full `FileIndex` size-gating (Tenhou rule 2) is deliberately NOT implemented:
+    /// list.cgi lists scc files HOURLY (sccYYYYMMDDHH.html.gz) while fetch downloads
+    /// DAILY sccYYYYMMDD.html.gz URLs, so no size entry corresponds to a fetched file.
+    /// This 20-minute attempt throttle (rule 1) is the enforceable subset.
+    pub fn was_fetch_checked_within(&self, date: &str, minutes: i64) -> Result<bool> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COUNT(*) FROM fetch_attempts
+             WHERE date = ?1 AND checked_at > datetime('now', ?2)",
+            params![date, format!("-{minutes} minutes")],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
     // Majsoul methods
     pub fn insert_majsoul_player(&self, id: i64, nickname: &str, level_id: Option<i32>) -> Result<bool> {
         let result = self.conn.execute(
@@ -262,12 +398,12 @@ impl Database {
     pub fn normalize_uuid(uuid: &str) -> &str {
         // Full UUID format: "250101-a7d2bfbf-dac8-45b9-a667-861f82589725"
         // Short UUID format: "a7d2bfbf-dac8-45b9-a667-861f82589725"
-        if uuid.len() > 7 && uuid.chars().nth(6) == Some('-') {
-            // Check if first 6 chars are digits (YYMMDD)
-            if uuid[..6].chars().all(|c| c.is_ascii_digit()) {
+        // Pure byte logic: b[6] == b'-' implies the ..6 / 7.. boundaries are ASCII-safe.
+        let b = uuid.as_bytes();
+        if b.len() > 7 && b[6] == b'-'
+            && uuid[..6].bytes().all(|c| c.is_ascii_digit()) {
                 return &uuid[7..];
             }
-        }
         uuid
     }
 
@@ -286,7 +422,7 @@ impl Database {
         Ok(result > 0)
     }
 
-    /// Insert majsoul log with full UUID (from player_records API)
+    /// Insert majsoul log with full UUID (from `player_records` API)
     /// Normalizes to short UUID for primary key, stores full UUID separately
     pub fn insert_majsoul_log_with_full_uuid(
         &self,
@@ -346,15 +482,15 @@ impl Database {
     }
 
     pub fn get_majsoul_undownloaded(&self, limit: Option<usize>) -> Result<Vec<String>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT uuid FROM majsoul_logs WHERE is_downloaded = 0 ORDER BY start_time LIMIT {}",
-                n
-            ),
-            None => "SELECT uuid FROM majsoul_logs WHERE is_downloaded = 0 ORDER BY start_time".to_string(),
-        };
+        use rusqlite::types::Value;
+        // Retry queue: fresh rows plus error rows with attempts remaining.
+        let mut sql = String::from(
+            "SELECT uuid FROM majsoul_logs WHERE (is_downloaded = 0 OR (is_downloaded = -1 AND download_attempts < ?)) ORDER BY start_time",
+        );
+        let mut values: Vec<Value> = vec![Value::Integer(Self::MAX_DOWNLOAD_ATTEMPTS)];
+        Self::push_limit(&mut sql, &mut values, limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut uuids = Vec::new();
         for uuid in rows {
             uuids.push(uuid?);
@@ -372,14 +508,40 @@ impl Database {
 
     pub fn mark_majsoul_download_error(&self, uuid: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE majsoul_logs SET is_downloaded = -1 WHERE uuid = ?1",
+            "UPDATE majsoul_logs SET is_downloaded = -1, download_attempts = download_attempts + 1 WHERE uuid = ?1",
             params![uuid],
         )?;
         Ok(())
     }
 
-    /// Get mode_id for a Majsoul log by UUID.
+    /// Persist a Majsoul convert failure for retry-then-quarantine (see `convert_logs`).
+    pub fn mark_majsoul_convert_error(&self, uuid: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE majsoul_logs SET is_converted = -1, convert_attempts = convert_attempts + 1 WHERE uuid = ?1",
+            params![uuid],
+        )?;
+        Ok(())
+    }
+
+    pub fn reset_majsoul_download_errors(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE majsoul_logs SET is_downloaded = 0, download_attempts = 0 WHERE is_downloaded = -1",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    pub fn reset_majsoul_convert_errors(&self) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE majsoul_logs SET is_converted = 0, convert_attempts = 0 WHERE is_converted = -1",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// Get `mode_id` for a Majsoul log by UUID.
     pub fn get_majsoul_mode_id(&self, uuid: &str) -> Result<i32> {
+        // NULL mode defaults to 16 (Throne), the dominant scrape target; keeps legacy rows downloadable.
         let mode_id: i32 = self.conn.query_row(
             "SELECT COALESCE(mode_id, 16) FROM majsoul_logs WHERE uuid = ?1 OR full_uuid = ?1",
             params![uuid],
@@ -388,24 +550,23 @@ impl Database {
         Ok(mode_id)
     }
 
-    /// Get undownloaded Majsoul logs that have a full_uuid (required for download).
+    /// Get undownloaded Majsoul logs that have a `full_uuid` (required for download).
     ///
-    /// Returns full_uuid values for records where:
-    /// - is_downloaded = 0
-    /// - full_uuid IS NOT NULL
+    /// Returns `full_uuid` values for records where:
+    /// - (`is_downloaded` = 0, or error with attempts remaining)
+    /// - `full_uuid` IS NOT NULL
     pub fn get_majsoul_undownloaded_with_full_uuid(
         &self,
         limit: Option<usize>,
     ) -> Result<Vec<String>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT full_uuid FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL ORDER BY start_time LIMIT {}",
-                n
-            ),
-            None => "SELECT full_uuid FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL ORDER BY start_time".to_string(),
-        };
+        use rusqlite::types::Value;
+        let mut sql = String::from(
+            "SELECT full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL AND (is_downloaded = 0 OR (is_downloaded = -1 AND download_attempts < ?)) ORDER BY start_time",
+        );
+        let mut values: Vec<Value> = vec![Value::Integer(Self::MAX_DOWNLOAD_ATTEMPTS)];
+        Self::push_limit(&mut sql, &mut values, limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut uuids = Vec::new();
         for uuid in rows {
             uuids.push(uuid?);
@@ -413,11 +574,11 @@ impl Database {
         Ok(uuids)
     }
 
-    /// Count Majsoul logs that are downloadable (have full_uuid but not yet downloaded).
+    /// Count Majsoul logs that are downloadable (have `full_uuid` but not yet downloaded).
     pub fn count_majsoul_downloadable(&self) -> Result<i64> {
         let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM majsoul_logs WHERE is_downloaded = 0 AND full_uuid IS NOT NULL",
-            [],
+            "SELECT COUNT(*) FROM majsoul_logs WHERE full_uuid IS NOT NULL AND (is_downloaded = 0 OR (is_downloaded = -1 AND download_attempts < ?1))",
+            params![Self::MAX_DOWNLOAD_ATTEMPTS],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -430,13 +591,18 @@ impl Database {
         num_players: Option<i32>,
         hanchan_only: bool,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        use rusqlite::types::Value;
+        // Retry queue: fresh rows plus error rows with attempts remaining.
         let mut sql = String::from(
             "SELECT uuid, raw_data FROM majsoul_logs
-             WHERE is_downloaded = 1 AND is_converted = 0 AND raw_data IS NOT NULL",
+             WHERE is_downloaded = 1 AND raw_data IS NOT NULL
+             AND (is_converted = 0 OR (is_converted = -1 AND convert_attempts < ?))",
         );
+        let mut values: Vec<Value> = vec![Value::Integer(Self::MAX_CONVERT_ATTEMPTS)];
 
         if let Some(players) = num_players {
-            sql.push_str(&format!(" AND num_players = {}", players));
+            sql.push_str(" AND num_players = ?");
+            values.push(Value::Integer(i64::from(players)));
         }
 
         if hanchan_only {
@@ -445,12 +611,12 @@ impl Database {
 
         sql.push_str(" ORDER BY start_time");
 
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {}", n));
-        }
+        Self::push_limit(&mut sql, &mut values, limit);
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
 
         let mut results = Vec::new();
         for row in rows {
@@ -481,16 +647,6 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Mark a date and mode as fetched
-    pub fn mark_majsoul_room_fetched(&self, date: &str, mode_id: i32) -> Result<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO majsoul_room_fetch_state (date, mode_id, fetched_at)
-             VALUES (?1, ?2, datetime('now'))",
-            params![date, mode_id],
-        )?;
-        Ok(())
-    }
-
     /// Mark a date and mode as fetched with record count
     pub fn mark_majsoul_room_fetched_with_count(&self, date: &str, mode_id: i32, count: i32) -> Result<()> {
         self.conn.execute(
@@ -514,30 +670,18 @@ impl Database {
         Ok(results)
     }
 
-    /// Count days fetched per mode
-    pub fn count_majsoul_room_fetch_days(&self) -> Result<Vec<(i32, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT mode_id, COUNT(*) FROM majsoul_room_fetch_state GROUP BY mode_id"
-        )?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
 
-    /// Get UUIDs without resolved paipu URLs
-    pub fn get_majsoul_unresolved_paipu(&self, limit: Option<usize>) -> Result<Vec<(String, i64)>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT uuid, player_id FROM majsoul_logs WHERE paipu_url IS NULL ORDER BY start_time LIMIT {}",
-                n
-            ),
-            None => "SELECT uuid, player_id FROM majsoul_logs WHERE paipu_url IS NULL ORDER BY start_time".to_string(),
-        };
+    /// Get UUIDs without resolved paipu URLs, with the `mode_id` needed to build the view URL.
+    pub fn get_majsoul_unresolved_paipu(&self, limit: Option<usize>) -> Result<Vec<(String, i64, i32)>> {
+        use rusqlite::types::Value;
+        // NULL mode defaults to 16 (Throne), the dominant scrape target; keeps legacy rows downloadable.
+        let mut sql = String::from(
+            "SELECT uuid, player_id, COALESCE(mode_id, 16) FROM majsoul_logs WHERE paipu_url IS NULL ORDER BY start_time",
+        );
+        let mut values: Vec<Value> = Vec::new();
+        Self::push_limit(&mut sql, &mut values, limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -567,20 +711,6 @@ impl Database {
         Ok(results)
     }
 
-    /// Count resolved vs unresolved paipu URLs
-    pub fn count_majsoul_paipu_status(&self) -> Result<(i64, i64)> {
-        let resolved: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM majsoul_logs WHERE paipu_url IS NOT NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        let unresolved: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM majsoul_logs WHERE paipu_url IS NULL",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok((resolved, unresolved))
-    }
 
     // Throne player methods for full UUID fetching
 
@@ -595,15 +725,12 @@ impl Database {
 
     /// Get unfetched throne players
     pub fn get_unfetched_throne_players(&self, limit: Option<usize>) -> Result<Vec<i64>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT account_id FROM throne_players WHERE fetched_at IS NULL LIMIT {}",
-                n
-            ),
-            None => "SELECT account_id FROM throne_players WHERE fetched_at IS NULL".to_string(),
-        };
+        use rusqlite::types::Value;
+        let mut sql = String::from("SELECT account_id FROM throne_players WHERE fetched_at IS NULL");
+        let mut values: Vec<Value> = Vec::new();
+        Self::push_limit(&mut sql, &mut values, limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -620,68 +747,11 @@ impl Database {
         Ok(())
     }
 
-    /// Count how many games we have for a specific player
-    pub fn count_player_games(&self, account_id: i64, mode_id: i32) -> Result<i64> {
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM majsoul_logs WHERE player_id = ?1 AND mode_id = ?2",
-            params![account_id, mode_id],
-            |row| row.get(0),
-        )?;
-        Ok(count)
-    }
-
-    /// Get throne players who were fetched but may have hit the page limit cap
-    pub fn get_throne_players_needing_refetch(&self, limit: Option<usize>) -> Result<Vec<i64>> {
-        let sql = match limit {
-            Some(n) => format!(
-                r#"
-                SELECT tp.account_id
-                FROM throne_players tp
-                WHERE tp.fetched_at IS NOT NULL
-                AND (
-                    SELECT COUNT(*) FROM majsoul_logs ml
-                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
-                ) = {}
-                LIMIT {}
-                "#,
-                AMAE_KOROMO_PAGE_LIMIT,
-                n
-            ),
-            None => format!(
-                r#"
-                SELECT tp.account_id
-                FROM throne_players tp
-                WHERE tp.fetched_at IS NOT NULL
-                AND (
-                    SELECT COUNT(*) FROM majsoul_logs ml
-                    WHERE ml.player_id = tp.account_id AND ml.mode_id = 16
-                ) = {}
-                "#,
-                AMAE_KOROMO_PAGE_LIMIT
-            ),
-        };
-
-        let mut stmt = self.conn.prepare(&sql)?;
-        let ids: Vec<i64> = stmt
-            .query_map([], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect();
-        Ok(ids)
-    }
-
-    /// Reset fetched_at for a player so they can be re-fetched
-    pub fn reset_throne_player_fetched(&self, account_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE throne_players SET fetched_at = NULL WHERE account_id = ?1",
-            params![account_id],
-        )?;
-        Ok(())
-    }
-
-    /// Reset fetched_at for all players who hit the page limit cap
+    /// Reset `fetched_at` for all players who hit the page limit cap
     pub fn reset_capped_throne_players(&self) -> Result<usize> {
-        let sql = format!(
-            r#"
+        // == page cap means the listing was truncated, so the player must be re-scraped.
+        let result = self.conn.execute(
+            "
             UPDATE throne_players
             SET fetched_at = NULL
             WHERE fetched_at IS NOT NULL
@@ -689,19 +759,12 @@ impl Database {
                 SELECT player_id FROM majsoul_logs
                 WHERE mode_id = 16
                 GROUP BY player_id
-                HAVING COUNT(*) = {}
+                HAVING COUNT(*) = ?1
             )
-            "#,
-            AMAE_KOROMO_PAGE_LIMIT
-        );
-        let result = self.conn.execute(&sql, [])?;
+            ",
+            params![AMAE_KOROMO_PAGE_LIMIT],
+        )?;
         Ok(result)
-    }
-
-    /// Update full_uuid for a majsoul log (by short uuid match)
-    /// Alias for set_orphan_full_uuid - kept for API compatibility
-    pub fn set_majsoul_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
-        self.set_orphan_full_uuid(short_uuid, full_uuid)
     }
 
     /// Count throne player stats
@@ -719,7 +782,7 @@ impl Database {
         Ok((total, fetched))
     }
 
-    /// Count majsoul logs with full_uuid
+    /// Count majsoul logs with `full_uuid`
     pub fn count_majsoul_full_uuids(&self) -> Result<(i64, i64)> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM majsoul_logs",
@@ -740,7 +803,7 @@ impl Database {
         Ok(count)
     }
 
-    /// Populate throne_players from existing majsoul_logs (extracts player IDs)
+    /// Populate `throne_players` from existing `majsoul_logs` (extracts player IDs)
     pub fn populate_throne_players(&self) -> Result<usize> {
         // Get distinct player_ids from majsoul_logs where mode_id = 16 (throne)
         let count = self.conn.execute(
@@ -751,30 +814,7 @@ impl Database {
         Ok(count)
     }
 
-    /// Get players who have orphaned games (games without full_uuid)
-    /// Returns player_ids that have at least one orphaned game
-    pub fn get_players_with_orphans(&self, limit: Option<usize>) -> Result<Vec<i64>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT DISTINCT player_id FROM majsoul_logs
-                 WHERE full_uuid IS NULL AND mode_id = 16
-                 ORDER BY player_id LIMIT {}",
-                n
-            ),
-            None => "SELECT DISTINCT player_id FROM majsoul_logs
-                     WHERE full_uuid IS NULL AND mode_id = 16
-                     ORDER BY player_id".to_string(),
-        };
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    /// Count orphaned games (games without full_uuid)
+    /// Count orphaned games (games without `full_uuid`)
     pub fn count_orphaned_games(&self) -> Result<i64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16",
@@ -784,39 +824,24 @@ impl Database {
         Ok(count)
     }
 
-    /// Update orphaned game's full_uuid by matching on start_time and player_id
-    /// Returns true if an orphan was updated
-    pub fn update_orphan_full_uuid(
-        &self,
-        player_id: i64,
-        start_time: i64,
-        full_uuid: &str,
-    ) -> Result<bool> {
-        let result = self.conn.execute(
-            "UPDATE majsoul_logs SET full_uuid = ?1
-             WHERE player_id = ?2 AND start_time = ?3 AND full_uuid IS NULL",
-            params![full_uuid, player_id, start_time],
-        )?;
-        Ok(result > 0)
-    }
-
-    /// Get orphan short UUIDs that need resolution (no full_uuid)
-    /// If mode_id is None, get orphans for all modes; if Some(id), filter by that mode
+    /// Get orphan short UUIDs that need resolution (no `full_uuid`)
+    /// If `mode_id` is None, get orphans for all modes; if Some(id), filter by that mode
     pub fn get_orphan_short_uuids(&self, limit: Option<usize>, mode_id: Option<i32>) -> Result<Vec<String>> {
+        use rusqlite::types::Value;
         let mut sql = String::from("SELECT uuid FROM majsoul_logs WHERE full_uuid IS NULL");
+        let mut values: Vec<Value> = Vec::new();
 
         if let Some(mode) = mode_id {
-            sql.push_str(&format!(" AND mode_id = {}", mode));
+            sql.push_str(" AND mode_id = ?");
+            values.push(Value::Integer(i64::from(mode)));
         }
 
         sql.push_str(" ORDER BY start_time");
 
-        if let Some(n) = limit {
-            sql.push_str(&format!(" LIMIT {}", n));
-        }
+        Self::push_limit(&mut sql, &mut values, limit);
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -824,7 +849,7 @@ impl Database {
         Ok(results)
     }
 
-    /// Set full_uuid for an orphan by its short uuid
+    /// Set `full_uuid` for an orphan by its short uuid
     pub fn set_orphan_full_uuid(&self, short_uuid: &str, full_uuid: &str) -> Result<bool> {
         let result = self.conn.execute(
             "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2 AND full_uuid IS NULL",
@@ -833,46 +858,80 @@ impl Database {
         Ok(result > 0)
     }
 
-    /// Cross-match orphan UUIDs by start_time against known full UUIDs (Throne mode only)
-    /// Returns the number of orphans that were matched and updated
-    pub fn cross_match_orphan_uuids(&self) -> Result<usize> {
-        use std::collections::HashMap;
+    /// Cross-match orphan UUIDs by (`player_id`, `start_time`) against known full UUIDs (Throne mode only).
+    ///
+    /// Returns `(matched, ambiguous)`: `matched` orphans were assigned a `full_uuid`;
+    /// `ambiguous` counts distinct (`player_id`, `start_time`) keys where matching was
+    /// skipped because the key was not unique on either side (no last-writer-win).
+    pub fn cross_match_orphan_uuids(&self) -> Result<(usize, usize)> {
+        use std::collections::{HashMap, HashSet};
 
-        // Build map of start_time -> full_uuid from all Throne records with full_uuid
+        // Build map of (player_id, start_time) -> full_uuid from Throne records with full_uuid.
+        // A key claimed by more than one full record is ambiguous: drop it entirely.
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT start_time, full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL AND mode_id = 16"
+            "SELECT player_id, start_time, full_uuid FROM majsoul_logs WHERE full_uuid IS NOT NULL AND mode_id = 16"
         )?;
-        let uuid_map: HashMap<i64, String> = stmt
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?
-            .filter_map(|r| r.ok())
+        let fulls: Vec<(i64, i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(std::result::Result::ok)
             .collect();
+        let mut uuid_map: HashMap<(i64, i64), String> = HashMap::new();
+        let mut ambiguous_keys: HashSet<(i64, i64)> = HashSet::new();
+        for (player_id, start_time, full_uuid) in fulls {
+            let key = (player_id, start_time);
+            if ambiguous_keys.contains(&key) {
+                continue;
+            }
+            if uuid_map.remove(&key).is_some() {
+                // Second full contender for this key: skip both, count as ambiguous.
+                ambiguous_keys.insert(key);
+            } else {
+                uuid_map.insert(key, full_uuid);
+            }
+        }
 
-        // Find Throne orphans and try to match
+        // Find Throne orphans and group them by key.
         let mut orphan_stmt = self.conn.prepare(
-            "SELECT uuid, start_time FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16"
+            "SELECT uuid, player_id, start_time FROM majsoul_logs WHERE full_uuid IS NULL AND mode_id = 16"
         )?;
-        let orphans: Vec<(String, i64)> = orphan_stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .filter_map(|r| r.ok())
+        let orphans: Vec<(String, i64, i64)> = orphan_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(std::result::Result::ok)
             .collect();
+        let mut groups: HashMap<(i64, i64), Vec<String>> = HashMap::new();
+        for (uuid, player_id, start_time) in orphans {
+            groups.entry((player_id, start_time)).or_default().push(uuid);
+        }
 
         let mut matched = 0usize;
-        for (uuid, start_time) in &orphans {
-            if let Some(full_uuid) = uuid_map.get(start_time) {
+        let mut ambiguous = 0usize;
+        for (key, uuids) in &groups {
+            if uuids.len() > 1 {
+                // Several orphans share one key: cannot attribute a single full_uuid.
+                ambiguous += 1;
+                continue;
+            }
+            if ambiguous_keys.contains(key) {
+                ambiguous += 1;
+                continue;
+            }
+            if let Some(full_uuid) = uuid_map.get(key) {
                 self.conn.execute(
                     "UPDATE majsoul_logs SET full_uuid = ?1 WHERE uuid = ?2",
-                    params![full_uuid, uuid],
+                    params![full_uuid, uuids[0]],
                 )?;
                 matched += 1;
             }
         }
 
-        Ok(matched)
+        Ok((matched, ambiguous))
     }
 
     // ==================== Two-Phase Pipeline Methods ====================
 
     /// Check if a day has been fetched (Phase 1)
+    // Test-only helper: exercised by day-fetch tests, never by shipped code paths.
+    #[allow(dead_code)]
     pub fn is_day_fetched(&self, date: &str) -> Result<bool> {
         let count: i32 = self.conn.query_row(
             "SELECT COUNT(*) FROM majsoul_day_fetch_state WHERE date = ?1",
@@ -910,9 +969,9 @@ impl Database {
         use std::collections::HashSet;
 
         let start_date = NaiveDate::parse_from_str(start, "%Y%m%d")
-            .map_err(|e| anyhow::anyhow!("Invalid start date: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Invalid start date: {e}"))?;
         let end_date = NaiveDate::parse_from_str(end, "%Y%m%d")
-            .map_err(|e| anyhow::anyhow!("Invalid end date: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Invalid end date: {e}"))?;
 
         // Query all fetched dates in range at once (single query instead of N+1)
         let mut stmt = self.conn.prepare(
@@ -920,7 +979,7 @@ impl Database {
         )?;
         let fetched_dates: HashSet<String> = stmt
             .query_map(params![start, end], |row| row.get(0))?
-            .filter_map(|r| r.ok())
+            .filter_map(std::result::Result::ok)
             .collect();
 
         // Generate all dates and filter out fetched ones
@@ -975,15 +1034,14 @@ impl Database {
 
     /// Get unscraped player IDs (Phase 2)
     pub fn get_unscraped_players(&self, limit: Option<usize>) -> Result<Vec<i64>> {
-        let sql = match limit {
-            Some(n) => format!(
-                "SELECT player_id FROM majsoul_pipeline_players WHERE scraped_at IS NULL ORDER BY player_id LIMIT {}",
-                n
-            ),
-            None => "SELECT player_id FROM majsoul_pipeline_players WHERE scraped_at IS NULL ORDER BY player_id".to_string(),
-        };
+        use rusqlite::types::Value;
+        let mut sql = String::from(
+            "SELECT player_id FROM majsoul_pipeline_players WHERE scraped_at IS NULL ORDER BY player_id",
+        );
+        let mut values: Vec<Value> = Vec::new();
+        Self::push_limit(&mut sql, &mut values, limit);
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(&values), |row| row.get(0))?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -1019,6 +1077,279 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_paipu_round_trip() {
+        let db = Database::open(":memory:").unwrap();
+        db.insert_majsoul_log("short-uuid-1", 42, 1_700_000_000, Some(12))
+            .unwrap();
+        // Unresolved row carries (uuid, player_id, mode_id).
+        let unresolved = db.get_majsoul_unresolved_paipu(None).unwrap();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].0, "short-uuid-1");
+        assert_eq!(unresolved[0].1, 42);
+        assert_eq!(unresolved[0].2, 12);
+        // NULL mode falls back to 16.
+        db.insert_majsoul_log("short-uuid-2", 43, 1_700_000_001, None)
+            .unwrap();
+        let unresolved = db.get_majsoul_unresolved_paipu(None).unwrap();
+        let fallback = unresolved.iter().find(|r| r.0 == "short-uuid-2").unwrap();
+        assert_eq!(fallback.2, 16);
+        // Resolve one; it leaves the queue and appears in the resolved list.
+        db.set_majsoul_paipu_url("short-uuid-1", "https://example/paipu/1")
+            .unwrap();
+        let unresolved = db.get_majsoul_unresolved_paipu(None).unwrap();
+        assert!(unresolved.iter().all(|r| r.0 != "short-uuid-1"));
+        let resolved = db.get_majsoul_resolved_paipu().unwrap();
+        assert_eq!(resolved, vec!["https://example/paipu/1".to_string()]);
+        // LIMIT binds instead of interpolating.
+        let limited = db.get_majsoul_unresolved_paipu(Some(1)).unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[test]
+    fn test_download_attempt_transitions() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO logs (id, date, num_players, is_hanchan) VALUES ('log1', '20240101', 4, 1)",
+                [],
+            )
+            .unwrap();
+        // Fresh row is queued.
+        assert_eq!(db.get_undownloaded_ids(None).unwrap(), vec!["log1".to_string()]);
+        // One error: still queued.
+        db.mark_download_error("log1").unwrap();
+        assert_eq!(db.get_undownloaded_ids(None).unwrap(), vec!["log1".to_string()]);
+        // Two more errors (3 total): quarantined.
+        db.mark_download_error("log1").unwrap();
+        db.mark_download_error("log1").unwrap();
+        assert!(db.get_undownloaded_ids(None).unwrap().is_empty());
+        assert_eq!(db.count_majsoul_downloadable().unwrap(), 0);
+        // Reset re-queues.
+        assert_eq!(db.reset_download_errors().unwrap(), 1);
+        assert_eq!(db.get_undownloaded_ids(None).unwrap(), vec!["log1".to_string()]);
+    }
+
+    #[test]
+    fn test_convert_attempt_transitions() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO logs (id, date, num_players, is_hanchan, is_downloaded, xml_data) VALUES ('log1', '20240101', 4, 1, 1, X'0102')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(db.get_unconverted_logs(None, None, false, None).unwrap().len(), 1);
+        db.mark_convert_error("log1").unwrap();
+        assert_eq!(db.get_unconverted_logs(None, None, false, None).unwrap().len(), 1);
+        db.mark_convert_error("log1").unwrap();
+        db.mark_convert_error("log1").unwrap();
+        assert!(db.get_unconverted_logs(None, None, false, None).unwrap().is_empty());
+        assert_eq!(db.reset_convert_errors().unwrap(), 1);
+        assert_eq!(db.get_unconverted_logs(None, None, false, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_unconverted_logs_cursor_paging() {
+        let db = Database::open(":memory:").unwrap();
+        for id in ["a", "b", "c"] {
+            db.conn
+                .execute(
+                    "INSERT INTO logs (id, date, num_players, is_hanchan, is_downloaded, xml_data) VALUES (?1, '20240101', 4, 1, 1, X'0102')",
+                    params![id],
+                )
+                .unwrap();
+        }
+        // Head row stays queued as a retryable failure; the cursor still
+        // advances past it so the tail is visited exactly once per run.
+        db.mark_convert_error("a").unwrap();
+        let page1 = db.get_unconverted_logs(Some(1), None, false, None).unwrap();
+        assert_eq!(page1.len(), 1);
+        let cursor = page1[0].0.clone();
+        let page2 = db
+            .get_unconverted_logs(Some(10), None, false, Some(&cursor))
+            .unwrap();
+        let ids: Vec<&str> = page2.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c"]);
+        assert!(db
+            .get_unconverted_logs(Some(10), None, false, Some("c"))
+            .unwrap()
+            .is_empty());
+    }
+
+
+    #[test]
+    fn test_majsoul_attempt_transitions() {
+        let db = Database::open(":memory:").unwrap();
+        db.insert_majsoul_log_with_full_uuid("250101-full-uuid-1", 7, 100, Some(16))
+            .unwrap();
+        assert_eq!(db.get_majsoul_undownloaded(None).unwrap().len(), 1);
+        assert_eq!(
+            db.get_majsoul_undownloaded_with_full_uuid(None).unwrap().len(),
+            1
+        );
+        assert_eq!(db.count_majsoul_downloadable().unwrap(), 1);
+        db.mark_majsoul_download_error("full-uuid-1").unwrap();
+        assert_eq!(db.count_majsoul_downloadable().unwrap(), 1);
+        db.mark_majsoul_download_error("full-uuid-1").unwrap();
+        db.mark_majsoul_download_error("full-uuid-1").unwrap();
+        assert!(db.get_majsoul_undownloaded(None).unwrap().is_empty());
+        assert!(db
+            .get_majsoul_undownloaded_with_full_uuid(None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.count_majsoul_downloadable().unwrap(), 0);
+        assert_eq!(db.reset_majsoul_download_errors().unwrap(), 1);
+        assert_eq!(db.count_majsoul_downloadable().unwrap(), 1);
+        // Convert queue honors attempts too.
+        db.mark_majsoul_downloaded("full-uuid-1", b"raw").unwrap();
+        assert_eq!(db.get_majsoul_unconverted(None, None, false).unwrap().len(), 1);
+        db.mark_majsoul_convert_error("full-uuid-1").unwrap();
+        db.mark_majsoul_convert_error("full-uuid-1").unwrap();
+        db.mark_majsoul_convert_error("full-uuid-1").unwrap();
+        assert!(db
+            .get_majsoul_unconverted(None, None, false)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.reset_majsoul_convert_errors().unwrap(), 1);
+        assert_eq!(db.get_majsoul_unconverted(None, None, false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_get_downloaded_logs() {
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO logs (id, date, num_players, is_hanchan, is_downloaded, is_converted, xml_data) VALUES ('a', '20240101', 4, 1, 1, 0, X'0102')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO logs (id, date, num_players, is_hanchan, is_downloaded, is_converted, xml_data) VALUES ('b', '20240101', 4, 1, 1, 1, X'0304')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO logs (id, date, num_players, is_hanchan, is_downloaded, xml_data) VALUES ('c', '20240101', 4, 1, 0, X'0506')",
+                [],
+            )
+            .unwrap();
+        // Both downloaded rows surface regardless of conversion state; pending row excluded.
+        let rows = db.get_downloaded_logs(None).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "a");
+        assert_eq!(rows[1].0, "b");
+        let limited = db.get_downloaded_logs(Some(1)).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].0, "a");
+    }
+
+    #[test]
+    fn test_cross_match_unique_pair() {
+        let db = Database::open(":memory:").unwrap();
+        db.insert_majsoul_log_with_full_uuid("250101-full-uuid-9", 9, 500, Some(16))
+            .unwrap();
+        db.insert_majsoul_log("orphan-uuid-9", 9, 500, Some(16)).unwrap();
+        let (matched, ambiguous) = db.cross_match_orphan_uuids().unwrap();
+        assert_eq!((matched, ambiguous), (1, 0));
+        let full: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT full_uuid FROM majsoul_logs WHERE uuid = 'orphan-uuid-9'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(full.as_deref(), Some("250101-full-uuid-9"));
+    }
+
+    #[test]
+    fn test_cross_match_ambiguous_orphans() {
+        // Two orphans share one (player_id, start_time) key with a single full
+        // record: neither may be assigned; the key counts as ambiguous once.
+        let db = Database::open(":memory:").unwrap();
+        db.insert_majsoul_log_with_full_uuid("250101-full-uuid-1", 1, 100, Some(16))
+            .unwrap();
+        db.insert_majsoul_log("orphan-a", 1, 100, Some(16)).unwrap();
+        db.insert_majsoul_log("orphan-b", 1, 100, Some(16)).unwrap();
+        let (matched, ambiguous) = db.cross_match_orphan_uuids().unwrap();
+        assert_eq!((matched, ambiguous), (0, 1));
+        for uuid in ["orphan-a", "orphan-b"] {
+            let full: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT full_uuid FROM majsoul_logs WHERE uuid = ?1",
+                    rusqlite::params![uuid],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(full, None);
+        }
+    }
+
+    #[test]
+    fn test_cross_match_ambiguous_full_records() {
+        // Two full records in the same second for one player: an orphan with that
+        // key must not be cross-assigned to either contender.
+        let db = Database::open(":memory:").unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES ('short-a', 2, 200, 16, '250101-full-a')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO majsoul_logs (uuid, player_id, start_time, mode_id, full_uuid) VALUES ('short-b', 2, 200, 16, '250101-full-b')",
+                [],
+            )
+            .unwrap();
+        db.insert_majsoul_log("orphan-c", 2, 200, Some(16)).unwrap();
+        let (matched, ambiguous) = db.cross_match_orphan_uuids().unwrap();
+        assert_eq!((matched, ambiguous), (0, 1));
+        let full: Option<String> = db
+            .conn
+            .query_row(
+                "SELECT full_uuid FROM majsoul_logs WHERE uuid = 'orphan-c'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(full, None);
+    }
+
+    #[test]
+    fn test_normalize_uuid_multibyte_no_panic() {
+        // Byte 6 lands inside a multibyte char; the old char-index guard panicked here.
+        assert_eq!(Database::normalize_uuid("abcdeé-xyz"), "abcdeé-xyz");
+        assert_eq!(
+            Database::normalize_uuid("250101-a7d2bfbf-dac8-45b9-a667-861f82589725"),
+            "a7d2bfbf-dac8-45b9-a667-861f82589725"
+        );
+        assert_eq!(
+            Database::normalize_uuid("a7d2bfbf-dac8-45b9-a667-861f82589725"),
+            "a7d2bfbf-dac8-45b9-a667-861f82589725"
+        );
+        assert_eq!(Database::normalize_uuid("short"), "short");
+    }
+
+    #[test]
+    fn test_fetch_attempt_throttle_does_not_mark_fetched() {
+        let db = Database::open(":memory:").unwrap();
+        assert!(!db.was_fetch_checked_within("20240101", 20).unwrap());
+        db.record_fetch_attempt("20240101").unwrap();
+        assert!(db.was_fetch_checked_within("20240101", 20).unwrap());
+        assert!(!db.was_fetch_checked_within("20240102", 20).unwrap());
+        // An attempt must NOT count as fetched: failed dates stay retryable.
+        assert!(!db.is_date_fetched("20240101").unwrap());
+        // Marking fetched preserves the attempt record.
+        db.mark_date_fetched("20240101").unwrap();
+        assert!(db.is_date_fetched("20240101").unwrap());
+        assert!(db.was_fetch_checked_within("20240101", 20).unwrap());
+    }
 
     #[test]
     fn test_get_orphan_short_uuids() {

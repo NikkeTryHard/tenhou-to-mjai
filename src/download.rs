@@ -2,7 +2,6 @@ use anyhow::Result;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use futures::{stream, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -39,12 +38,7 @@ impl Downloader {
 
         info!("Downloading {} logs (concurrent: {})", ids.len(), concurrent);
 
-        let pb = ProgressBar::new(ids.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
-                .progress_chars("#>-"),
-        );
+        let pb = crate::util::progress_bar(ids.len() as u64)?;
 
         let mut success = 0;
         let mut failed = 0;
@@ -66,17 +60,10 @@ impl Downloader {
                 .buffer_unordered(concurrent);
 
             while let Some((id, result)) = pending.next().await {
-                match result {
-                    Ok(xml_data) => {
-                        let compressed = compress_gzip(&xml_data)?;
-                        db.mark_downloaded(&id, &compressed)?;
-                        success += 1;
-                    }
-                    Err(e) => {
-                        warn!("Failed to download {}: {}", id, e);
-                        db.mark_download_error(&id)?;
-                        failed += 1;
-                    }
+                if record_outcome(db, &id, result)? {
+                    success += 1;
+                } else {
+                    failed += 1;
                 }
             }
         } else {
@@ -84,17 +71,10 @@ impl Downloader {
             for id in ids {
                 let result = download_single(&self.client, &id).await;
                 pb.inc(1);
-                match result {
-                    Ok(xml_data) => {
-                        let compressed = compress_gzip(&xml_data)?;
-                        db.mark_downloaded(&id, &compressed)?;
-                        success += 1;
-                    }
-                    Err(e) => {
-                        warn!("Failed to download {}: {}", id, e);
-                        db.mark_download_error(&id)?;
-                        failed += 1;
-                    }
+                if record_outcome(db, &id, result)? {
+                    success += 1;
+                } else {
+                    failed += 1;
                 }
                 tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
             }
@@ -107,7 +87,7 @@ impl Downloader {
 }
 
 async fn download_single(client: &reqwest::Client, log_id: &str) -> Result<Vec<u8>> {
-    let url = format!("{}?{}", TENHOU_LOG_URL, log_id);
+    let url = format!("{TENHOU_LOG_URL}?{log_id}");
     let response = client.get(&url).send().await?;
 
     if !response.status().is_success() {
@@ -123,8 +103,30 @@ async fn download_single(client: &reqwest::Client, log_id: &str) -> Result<Vec<u
     Ok(text.into_bytes())
 }
 
+// Store gzipped: raw mjlog XML balloons the DB; convert/export decompress on read.
 fn compress_gzip(data: &[u8]) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data)?;
     Ok(encoder.finish()?)
+}
+
+fn record_outcome(db: &Database, id: &str, data: Result<Vec<u8>>) -> Result<bool> {
+    match data {
+        Ok(xml_data) => match compress_gzip(&xml_data) {
+            Ok(compressed) => {
+                db.mark_downloaded(id, &compressed)?;
+                Ok(true)
+            }
+            Err(e) => {
+                warn!("Failed to compress {}: {}", id, e);
+                db.mark_download_error(id)?;
+                Ok(false)
+            }
+        },
+        Err(e) => {
+            warn!("Failed to download {}: {}", id, e);
+            db.mark_download_error(id)?;
+            Ok(false)
+        }
+    }
 }

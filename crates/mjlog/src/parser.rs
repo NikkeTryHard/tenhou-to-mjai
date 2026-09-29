@@ -3,6 +3,7 @@ use num_traits::FromPrimitive;
 use percent_encoding::percent_decode_str;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
+use quick_xml::XmlVersion;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,6 +36,12 @@ pub enum MjlogError {
     InvalidYakuNum(u8),
     #[error("Invalid agari rank: {0}")]
     InvalidScoreRank(u8),
+    #[error("Invalid seed length: {0}")]
+    InvalidSeedLength(usize),
+    #[error("Invalid direction: {0}")]
+    InvalidDirection(u8),
+    #[error("Invalid yaku pair length: {0}")]
+    InvalidYakuPairLength(usize),
     #[error("Invalid owari")]
     InvalidOwari,
     #[error("Process instruction is not supported.")]
@@ -70,31 +77,26 @@ fn decode_percent_encoding(s: &str) -> String {
 }
 
 fn try_get_attribute_str(e: &BytesStart, attr_name: &str) -> MjlogResult<Option<String>> {
-    let attr_opt = e.try_get_attribute(attr_name)?;
-    if attr_opt.is_none() {
+    let Some(attr) = e.try_get_attribute(attr_name)? else {
         return Ok(None);
-    }
-    let attr = attr_opt.unwrap();
-    let unescaped_value = attr.unescape_value()?;
+    };
+    // `unescape_value` was removed in 0.42; `Implicit1_0` preserves its exact behavior.
+    let unescaped_value = attr.normalized_value(XmlVersion::Implicit1_0)?;
     Ok(Some(unescaped_value.to_string()))
 }
 
 fn try_get_attribute_value<T: std::str::FromStr>(e: &BytesStart, attr_name: &str) -> MjlogResult<Option<T>> {
-    let s_opt = try_get_attribute_str(e, attr_name)?;
-    if s_opt.is_none() {
+    let Some(s) = try_get_attribute_str(e, attr_name)? else {
         return Ok(None);
-    }
-    let s = s_opt.unwrap();
+    };
     let value = s.parse::<T>().map_err(|_| MjlogError::ParseError(s))?;
     Ok(Some(value))
 }
 
 fn try_get_attribute_csv<T: std::str::FromStr>(e: &BytesStart, attr_name: &str) -> MjlogResult<Option<Vec<T>>> {
-    let s_opt = try_get_attribute_str(e, attr_name)?;
-    if s_opt.is_none() {
+    let Some(s) = try_get_attribute_str(e, attr_name)? else {
         return Ok(None);
-    }
-    let s = s_opt.unwrap();
+    };
     let csv = parse_csv(&s).map_err(|_| MjlogError::ParseError(s))?;
     Ok(Some(csv))
 }
@@ -128,7 +130,7 @@ fn conv_go(e: &BytesStart) -> MjlogResult<Action> {
         hanchan: (t & 0x08) != 0,
         sanma: (t & 0x10) != 0,
         soku: (t & 0x40) != 0,
-        room: TenhouRoom::from_u8(room_type_index as u8).unwrap(), // always succeeds because there are enough bits
+        room: TenhouRoom::from_u8(room_type_index as u8).ok_or(MjlogError::InvalidDirection(room_type_index as u8))?,
     };
 
     Ok(Action::GO(ActionGO { settings, lobby }))
@@ -150,18 +152,22 @@ fn conv_uv(e: &BytesStart) -> MjlogResult<Action> {
         let rate = get_attribute_csv(e, "rate")?;
         let sx = get_attribute_csv(e, "sx")?;
 
+        let mut collected = Vec::with_capacity(4);
+        for x in names.iter() {
+            collected.push(x.clone().ok_or(MjlogError::InvalidNameNum(name_num))?);
+        }
         Ok(Action::UN1(ActionUN1 {
-            names: names.iter().map(|x| x.clone().unwrap()).collect(),
+            names: collected,
             dan,
             rate,
             sx,
         }))
     } else if name_num == 1 {
         // When reconnecting, only one of the values among n0 to n3 is valid.
-        let who = names.iter().position(|x| x.is_some()).unwrap();
+        let who = names.iter().position(|x| x.is_some()).ok_or(MjlogError::InvalidNameNum(name_num))?;
         Ok(Action::UN2(ActionUN2 {
             who: Player::new(who as u8),
-            name: names[who].clone().unwrap(),
+            name: names[who].clone().ok_or(MjlogError::InvalidNameNum(name_num))?,
         }))
     } else {
         Err(MjlogError::InvalidNameNum(name_num))
@@ -182,12 +188,20 @@ fn conv_taikyoku(e: &BytesStart) -> MjlogResult<Action> {
 
 fn conv_init(e: &BytesStart) -> MjlogResult<Action> {
     let seed: Vec<u8> = get_attribute_csv(e, "seed")?;
+    if seed.len() < 6 {
+        return Err(MjlogError::InvalidSeedLength(seed.len()));
+    }
     let ten = get_attribute_csv(e, "ten")?;
     let oya = get_attribute_value(e, "oya")?;
     let hai0 = get_attribute_csv(e, "hai0")?;
     let hai1 = get_attribute_csv(e, "hai1")?;
     let hai2 = get_attribute_csv(e, "hai2")?;
-    let hai3 = get_attribute_csv(e, "hai3")?; // Note: sanma has also hai3, but contains empty string
+    // Sanma INIT carries hai3 as missing or empty string; parse as empty vec.
+    let hai3: Vec<Hai> = match try_get_attribute_str(e, "hai3")? {
+        None => vec![],
+        Some(s) if s.is_empty() => vec![],
+        Some(s) => parse_csv(&s).map_err(|_| MjlogError::ParseError(s))?,
+    };
 
     Ok(Action::INIT(ActionINIT {
         seed: InitSeed {
@@ -219,7 +233,8 @@ fn conv_reach(e: &BytesStart) -> MjlogResult<Action> {
 
 fn conv_meld_from_u16(m: u16) -> MjlogResult<Meld> {
     // who called?
-    let dir = Direction::from_u8((m & 0x3) as u8).unwrap();
+    let dir_byte = (m & 0x3) as u8;
+    let dir = Direction::from_u8(dir_byte).ok_or(MjlogError::InvalidDirection(dir_byte))?;
 
     if m & 0x04 != 0 {
         // Chii
@@ -297,7 +312,7 @@ fn conv_meld_from_u16(m: u16) -> MjlogResult<Meld> {
         }
     } else if m & 0x20 != 0 {
         // North(not supported currently)
-        return Err(MjlogError::UnexpectedPeiNuki);
+        Err(MjlogError::UnexpectedPeiNuki)
     } else {
         // Daiminkan or Ankan
         let hai = Hai::new(((m & 0xff00) >> 8) as u8);
@@ -342,7 +357,9 @@ fn conv_score_rank(x: u8) -> MjlogResult<ScoreRank> {
 }
 
 fn conv_yaku_pair(chunk: &[u8]) -> MjlogResult<(Yaku, u8)> {
-    assert_eq!(chunk.len(), 2);
+    if chunk.len() != 2 {
+        return Err(MjlogError::InvalidYakuPairLength(chunk.len()));
+    }
 
     let yaku = Yaku::from_u8(chunk[0]).ok_or(MjlogError::InvalidYakuNum(chunk[0]))?;
     let han = chunk[1];
@@ -376,7 +393,14 @@ fn conv_agari(e: &BytesStart) -> MjlogResult<Action> {
 
     let m = m_vec.into_iter().map(conv_meld_from_u16).collect::<MjlogResult<Vec<Meld>>>()?;
     let score_rank = conv_score_rank(ten[2] as u8)?;
-    let yaku = yaku_vec.chunks_exact(2).map(conv_yaku_pair).collect::<MjlogResult<Vec<(Yaku, u8)>>>()?;
+    // Allow: mjlog yaku pairs are format-pinned to 2-element chunks.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let yaku_chunks = yaku_vec.chunks_exact(2);
+    // A non-empty remainder means a truncated/corrupt array, not a short-but-valid one — fail the whole log.
+    if !yaku_chunks.remainder().is_empty() {
+        return Err(MjlogError::InvalidYakuPairLength(yaku_vec.len()));
+    }
+    let yaku = yaku_chunks.map(conv_yaku_pair).collect::<MjlogResult<Vec<(Yaku, u8)>>>()?;
     let yakuman = yakuman_vec.into_iter().map(conv_yaku).collect::<MjlogResult<Vec<Yaku>>>()?;
 
     let agari = ActionAGARI {
@@ -433,15 +457,19 @@ fn conv_ryuukyoku(e: &BytesStart) -> MjlogResult<Action> {
     Ok(Action::RYUUKYOKU(ryuukyoku))
 }
 
-fn parse_hai_tag(n: &[u8]) -> Option<Action> {
-    if n.is_empty() {
+fn parse_hai_tag(n: &str) -> Option<Action> {
+    // Tag names are ASCII (T/U/V/W/D/E/F/G + digits), so byte-index b[0]/b[1..] stays safe after the &str migration.
+    let b = n.as_bytes();
+    if b.is_empty() {
         return None;
     }
 
-    let first_char = n[0] as char;
+    let first_char = b[0] as char;
     let index = ['T', 'U', 'V', 'W', 'D', 'E', 'F', 'G'].iter().position(|c| *c == first_char)? as u8;
-    let hai_str = std::str::from_utf8(&n[1..]).ok()?;
+    let hai_str = std::str::from_utf8(&b[1..]).ok()?;
     let hai = hai_str.parse::<Hai>().ok()?;
+    // Kita (hai >= 136, i.e. nuki) is not modeled: return None so the caller
+    // surfaces MjlogError::UnexpectedTag explicitly instead of panicking.
     if 136 <= hai.to_u8() {
         return None;
     }
@@ -455,18 +483,18 @@ fn parse_hai_tag(n: &[u8]) -> Option<Action> {
 
 fn conv_action(e: &BytesStart) -> MjlogResult<Action> {
     let event = match e.name().as_ref() {
-        b"SHUFFLE" => conv_shuffle(e)?,
-        b"GO" => conv_go(e)?,
-        b"UN" => conv_uv(e)?,
-        b"BYE" => conv_bye(e)?,
-        b"TAIKYOKU" => conv_taikyoku(e)?,
-        b"INIT" => conv_init(e)?,
-        b"REACH" => conv_reach(e)?,
-        b"N" => conv_n(e)?,
-        b"DORA" => conv_dora(e)?,
-        b"AGARI" => conv_agari(e)?,
-        b"RYUUKYOKU" => conv_ryuukyoku(e)?,
-        x => parse_hai_tag(x).ok_or(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string()))?,
+        "SHUFFLE" => conv_shuffle(e)?,
+        "GO" => conv_go(e)?,
+        "UN" => conv_uv(e)?,
+        "BYE" => conv_bye(e)?,
+        "TAIKYOKU" => conv_taikyoku(e)?,
+        "INIT" => conv_init(e)?,
+        "REACH" => conv_reach(e)?,
+        "N" => conv_n(e)?,
+        "DORA" => conv_dora(e)?,
+        "AGARI" => conv_agari(e)?,
+        "RYUUKYOKU" => conv_ryuukyoku(e)?,
+        x => parse_hai_tag(x).ok_or(MjlogError::UnexpectedTag(e.name().into_inner().to_owned()))?,
     };
     Ok(event)
 }
@@ -485,10 +513,12 @@ fn conv_mjloggm<R: std::io::BufRead>(reader: &mut Reader<R>, e: &BytesStart) -> 
             Event::PI(_) => return Err(MjlogError::UnexpectedPI),
             Event::CData(_) => return Err(MjlogError::UnexpectedCData),
             Event::Text(_) => return Err(MjlogError::UnexpectedText),
-            Event::Start(e) => return Err(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string())),
+            // quick-xml 0.42 splits entity refs into GeneralRef; mjlog never contains entities, so reject like Text.
+            Event::GeneralRef(_) => return Err(MjlogError::UnexpectedText),
+            Event::Start(e) => return Err(MjlogError::UnexpectedTag(e.name().into_inner().to_owned())),
             Event::Empty(e) => actions.push(conv_action(&e)?),
-            Event::End(e) if e.as_ref() == b"mjloggm" => return Ok(Mjlog { ver, actions }),
-            Event::End(e) => return Err(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string())),
+            Event::End(e) if e.name().into_inner() == "mjloggm" => return Ok(Mjlog { ver, actions }),
+            Event::End(e) => return Err(MjlogError::UnexpectedTag(e.name().into_inner().to_owned())),
         }
     }
 }
@@ -511,15 +541,64 @@ pub fn parse_mjlogs(text: &str) -> MjlogResult<Vec<Mjlog>> {
             Event::PI(_) => return Err(MjlogError::UnexpectedPI),
             Event::CData(_) => return Err(MjlogError::UnexpectedCData),
             Event::Text(_) => return Err(MjlogError::UnexpectedText),
+            // quick-xml 0.42 splits entity refs into GeneralRef; mjlog never contains entities, so reject like Text.
+            Event::GeneralRef(_) => return Err(MjlogError::UnexpectedText),
             Event::Start(e) => {
-                if e.name().as_ref() != b"mjloggm" {
-                    return Err(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string()));
+                if e.name().into_inner() != "mjloggm" {
+                    return Err(MjlogError::UnexpectedTag(e.name().into_inner().to_owned()));
                 }
 
                 mjlogs.push(conv_mjloggm(&mut reader, &e)?);
             }
-            Event::Empty(e) => return Err(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string())),
-            Event::End(e) => return Err(MjlogError::UnexpectedTag(String::from_utf8_lossy(e.name().as_ref()).to_string())),
+            Event::Empty(e) => return Err(MjlogError::UnexpectedTag(e.name().into_inner().to_owned())),
+            Event::End(e) => return Err(MjlogError::UnexpectedTag(e.name().into_inner().to_owned())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sanma_xml(hai3_attr: &str) -> String {
+        format!(
+            r#"<mjloggm ver="2.3"><INIT seed="0,0,0,1,1,2" ten="250,250,250,250" oya="0" hai0="1,2,3" hai1="4,5,6" hai2="7,8,9"{hai3_attr}/><RYUUKYOKU ba="0,0" sc="25000,0,25000,0,25000,0,25000,0"/></mjloggm>"#
+        )
+    }
+
+    #[test]
+    fn sanma_init_without_hai3_parses() {
+        // Missing hai3 (sanma server omits it) parses with an empty fourth hand.
+        let logs = parse_mjlogs(&sanma_xml("")).expect("sanma INIT must parse");
+        assert_eq!(logs.len(), 1);
+        let Action::INIT(init) = &logs[0].actions[0] else {
+            panic!("first action must be INIT");
+        };
+        assert_eq!(init.hai.len(), 4);
+        assert!(init.hai[3].is_empty());
+    }
+
+    #[test]
+    fn sanma_init_with_empty_hai3_parses() {
+        // Empty hai3="" (some sanma logs) also parses as an empty fourth hand.
+        let logs = parse_mjlogs(&sanma_xml(r#" hai3="""#)).expect("empty hai3 must parse");
+        let Action::INIT(init) = &logs[0].actions[0] else {
+            panic!("first action must be INIT");
+        };
+        assert!(init.hai[3].is_empty());
+    }
+
+    #[test]
+    fn short_seed_is_rejected() {
+        let xml = r#"<mjloggm ver="2.3"><INIT seed="0,0" ten="250,250,250,250" oya="0" hai0="1" hai1="2" hai2="3"/><RYUUKYOKU ba="0,0" sc="25000,0,25000,0,25000,0,25000,0"/></mjloggm>"#;
+        let err = parse_mjlogs(xml).expect_err("short seed must fail");
+        assert!(matches!(err, MjlogError::InvalidSeedLength(2)));
+    }
+
+    #[test]
+    fn odd_yaku_tail_is_rejected() {
+        // Yaku bytes must pair (yaku, han); a 3-byte tail leaves a remainder.
+        let err = conv_yaku_pair(&[1u8, 2, 3]).expect_err("odd yaku tail must fail");
+        assert!(matches!(err, MjlogError::InvalidYakuPairLength(3)));
     }
 }

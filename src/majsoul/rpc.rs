@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{oneshot, Mutex};
@@ -10,10 +10,100 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, Message},
     MaybeTlsStream, WebSocketStream,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-const MS_HOST: &str = "https://game.maj-soul.com";
+/// Origin URL for CN server WebSocket connections.
+pub const CN_ORIGIN: &str = "https://game.maj-soul.com";
+/// Origin URL for EN/JP server WebSocket connections.
+pub const EN_ORIGIN: &str = "https://mahjongsoul.game.yo-star.com";
+
+/// Per-server Origin header value for Majsoul WebSocket connections.
+// The gateway validates the WS Origin against its own host; sending the wrong server's Origin fails the handshake.
+pub fn origin_for_server(server: &str) -> &'static str {
+    match server {
+        "cn" => CN_ORIGIN,
+        _ => EN_ORIGIN,
+    }
+}
+
+/// Classified Majsoul RPC error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MajsoulError {
+    /// Server is rate-limiting us; caller should back off / lower rate.
+    RateLimited,
+    /// Client version rejected; caller should rediscover gateway and retry (bounded).
+    VersionMismatch,
+    /// Any other fatal server error code.
+    Fatal(i64),
+}
+
+/// Classify a numeric Majsoul error code.
+///
+/// Code 151 is the version-mismatch code (gateway rediscovery path).
+/// All other non-zero codes are treated as fatal except for the known
+/// rate-limit code 103 (too many requests), which maps to [`MajsoulError::RateLimited`].
+pub fn classify_error(code: i64) -> MajsoulError {
+    match code {
+        151 => MajsoulError::VersionMismatch,
+        // Observed rate-limit code on Lobby endpoints.
+        103 => MajsoulError::RateLimited,
+        n => MajsoulError::Fatal(n),
+    }
+}
+
+/// Extract the numeric error code from a `fetchGameRecord error {code}: {uuid}`
+/// style message. Prefers the `error {code}` token; falls back to the first
+/// standalone digit run so messages like `"oops 2151"` parse as 2151.
+/// Returns `None` when no numeric code is present. Classification is always
+/// numeric, so `"2151"` maps to `Fatal(2151)`, never the 151 path.
+pub fn parse_error_code_from_message(msg: &str) -> Option<i64> {
+    // Look for "error <digits>" token boundary.
+    if let Some(idx) = msg.find("error") {
+        let rest = msg[idx + "error".len()..].trim_start_matches([' ', ':']);
+        let mut digits = String::new();
+        for c in rest.chars() {
+            if c.is_ascii_digit() || (digits.is_empty() && c == '-') {
+                digits.push(c);
+            } else {
+                break;
+            }
+        }
+        if !digits.is_empty() && digits != "-" {
+            if let Ok(n) = digits.parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    // Fallback: first whitespace-delimited token that is all digits
+    // (UUID segments stay glued to dashes/hex, so they never match).
+    for tok in msg.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_ascii_digit());
+        if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = t.parse::<i64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+/// Classify an anyhow error produced by [`MajsoulRpc::fetch_game_record`].
+/// Returns `None` when the message carries no numeric code.
+pub fn classify_fetch_error(err: &anyhow::Error) -> Option<MajsoulError> {
+    parse_error_code_from_message(&err.to_string()).map(classify_error)
+}
+
+/// In-flight RPC response channel endpoints keyed by request index.
+type PendingTx = oneshot::Sender<Result<Vec<u8>, String>>;
+type PendingRx = oneshot::Receiver<Result<Vec<u8>, String>>;
+type PendingMap = HashMap<u32, PendingTx>;
+
+/// Checked `u64` → `usize` for hostile wire lengths; out-of-range bails
+/// (the bounds check after each site stays the real guard on 64-bit).
+fn usize_checked(v: u64) -> Result<usize> {
+    usize::try_from(v).map_err(|_| anyhow::anyhow!("length out of range: {v}"))
+}
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -37,39 +127,63 @@ mod wrapper {
     }
 
     pub fn decode(buf: &[u8]) -> Result<(String, Vec<u8>)> {
-        let mut pos = 0;
+        // Decoded via multi-byte varint tags so field numbers >= 16 work.
         let mut name = String::new();
         let mut data = Vec::new();
-
+        let mut pos = 0;
         while pos < buf.len() {
-            let tag = buf[pos];
-            pos += 1;
+            let (tag, tag_len) = decode_varint(&buf[pos..])?;
+            pos += tag_len;
             let field_num = tag >> 3;
-            let wire_type = tag & 0x07;
-
-            if wire_type != 2 {
-                if wire_type == 0 {
-                    while pos < buf.len() && buf[pos] & 0x80 != 0 {
-                        pos += 1;
+            let wire_type = (tag & 0x07) as u8;
+            match (field_num, wire_type) {
+                (1, 2) => {
+                    let (len, n) = decode_varint(&buf[pos..])?;
+                    pos += n;
+                    let end = pos + super::usize_checked(len)?;
+                    if end > buf.len() {
+                        anyhow::bail!("Buffer overflow");
                     }
-                    pos += 1;
+                    name = String::from_utf8_lossy(&buf[pos..end]).to_string();
+                    pos = end;
                 }
-                continue;
+                (2, 2) => {
+                    let (len, n) = decode_varint(&buf[pos..])?;
+                    pos += n;
+                    let end = pos + super::usize_checked(len)?;
+                    if end > buf.len() {
+                        anyhow::bail!("Buffer overflow");
+                    }
+                    data = buf[pos..end].to_vec();
+                    pos = end;
+                }
+                (_, 0) => {
+                    let (_, n) = decode_varint(&buf[pos..])?;
+                    pos += n;
+                }
+                (_, 1) => {
+                    if pos + 8 > buf.len() {
+                        anyhow::bail!("Buffer overflow in fixed64");
+                    }
+                    pos += 8;
+                }
+                (_, 2) => {
+                    let (len, n) = decode_varint(&buf[pos..])?;
+                    pos += n;
+                    let end = pos + super::usize_checked(len)?;
+                    if end > buf.len() {
+                        anyhow::bail!("Buffer overflow");
+                    }
+                    pos = end;
+                }
+                (_, 5) => {
+                    if pos + 4 > buf.len() {
+                        anyhow::bail!("Buffer overflow in fixed32");
+                    }
+                    pos += 4;
+                }
+                _ => anyhow::bail!("Unsupported wire type {wire_type}"),
             }
-
-            let (len, bytes_read) = decode_varint(&buf[pos..])?;
-            pos += bytes_read;
-            let end = pos + len as usize;
-            if end > buf.len() {
-                anyhow::bail!("Buffer overflow");
-            }
-
-            match field_num {
-                1 => name = String::from_utf8_lossy(&buf[pos..end]).to_string(),
-                2 => data = buf[pos..end].to_vec(),
-                _ => {}
-            }
-            pos = end;
         }
         Ok((name, data))
     }
@@ -98,7 +212,7 @@ mod wrapper {
             }
             let byte = buf[pos];
             pos += 1;
-            value |= ((byte & 0x7f) as u64) << shift;
+            value |= u64::from(byte & 0x7f) << shift;
             if byte & 0x80 == 0 {
                 break;
             }
@@ -110,37 +224,6 @@ mod wrapper {
 
 mod requests {
     use super::wrapper::encode_varint;
-
-    fn encode_device() -> Vec<u8> {
-        let mut buf = Vec::new();
-        // Field 1: platform = "pc" (was incorrectly field 2)
-        buf.push(0x0a);
-        buf.push(0x02);
-        buf.extend_from_slice(b"pc");
-        // Field 2: hardware = "pc" (was incorrectly field 3)
-        buf.push(0x12);
-        buf.push(0x02);
-        buf.extend_from_slice(b"pc");
-        // Field 3: os = "pc" (was incorrectly field 4 with "windows")
-        buf.push(0x1a);
-        buf.push(0x02);
-        buf.extend_from_slice(b"pc");
-        // Field 4: os_version = "" (was incorrectly field 5)
-        buf.push(0x22);
-        buf.push(0x00);
-        // Field 5: is_browser = true (was incorrectly field 6)
-        buf.push(0x28);
-        buf.push(0x01);
-        // Field 6: software = "Chrome" (was incorrectly field 7)
-        buf.push(0x32);
-        buf.push(0x06);
-        buf.extend_from_slice(b"Chrome");
-        // Field 7: sale_platform = "web" (was incorrectly field 8)
-        buf.push(0x3a);
-        buf.push(0x03);
-        buf.extend_from_slice(b"web");
-        buf
-    }
 
     pub fn fetch_game_record(uuid: &str, version: &str) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -157,13 +240,13 @@ mod requests {
         let mut buf = Vec::new();
         // Field 1: start (pagination offset)
         buf.push(0x08);
-        encode_varint(&mut buf, start as u64);
+        encode_varint(&mut buf, u64::from(start));
         // Field 2: count (number of records)
         buf.push(0x10);
-        encode_varint(&mut buf, count as u64);
+        encode_varint(&mut buf, u64::from(count));
         // Field 3: type (room type)
         buf.push(0x18);
-        encode_varint(&mut buf, room_type as u64);
+        encode_varint(&mut buf, u64::from(room_type));
         buf
     }
 
@@ -172,13 +255,13 @@ mod requests {
         let mut buf = Vec::new();
         // Field 1: filter_id (0 = all, or specific room)
         buf.push(0x08);
-        encode_varint(&mut buf, filter_id as u64);
+        encode_varint(&mut buf, u64::from(filter_id));
         buf
     }
 
-    /// Build ReqLogin for CN native login (username/password)
-    /// Field numbers from protobuf: account=1, password=2, device=4, random_key=5,
-    /// gen_access_token=7, currency_platforms=8, client_version_string=11
+    /// Build `ReqLogin` for CN native login (username/password)
+    /// Field numbers from protobuf: account=1, password=2, device=4, `random_key=5`,
+    /// `gen_access_token=7`, `currency_platforms=8`, `client_version_string=11`
     pub fn build_login_request(
         account: &str,
         password_hash: &str,
@@ -213,40 +296,37 @@ mod requests {
     }
 
     fn encode_string(buf: &mut Vec<u8>, field: u32, value: &str) {
-        let tag = (field << 3) | 2;
-        encode_varint(buf, tag as u64);
+        let tag = (u64::from(field) << 3) | 2;
+        encode_varint(buf, tag);
         encode_varint(buf, value.len() as u64);
         buf.extend_from_slice(value.as_bytes());
     }
 
     fn encode_bool(buf: &mut Vec<u8>, field: u32, value: bool) {
-        let tag = (field << 3) | 0;
-        encode_varint(buf, tag as u64);
-        buf.push(if value { 1 } else { 0 });
+        let tag = u64::from(field) << 3;
+        encode_varint(buf, tag);
+        buf.push(u8::from(value));
     }
 
     fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
-        let tag = (field << 3) | 0;
-        encode_varint(buf, tag as u64);
+        let tag = u64::from(field) << 3;
+        encode_varint(buf, tag);
         encode_varint(buf, value);
     }
 
-    /// Encode device message with just is_browser = true (for native login)
+    /// Encode device message with just `is_browser` = true (for native login)
     fn encode_nested_device_simple(buf: &mut Vec<u8>) {
-        // Field 4: device message with is_browser = true (field 5 in device)
-        let mut inner = Vec::new();
-        // Field 5: is_browser = true
-        inner.push(0x28); // (5 << 3) | 0
-        inner.push(0x01);
+        // Field 4: device is_browser=true (field 5); tag (5 << 3) | 0 = 0x28
+        let inner = vec![0x28, 0x01];
 
-        let tag = (4 << 3) | 2;
-        encode_varint(buf, tag as u64);
+        let tag = (u64::from(4u32) << 3) | 2;
+        encode_varint(buf, tag);
         encode_varint(buf, inner.len() as u64);
         buf.extend(inner);
     }
 
-    /// Build ReqRequestConnection for route handshake (required before login)
-    /// Field numbers from protobuf: type=2, route_id=3, timestamp=4
+    /// Build `ReqRequestConnection` for route handshake (required before login)
+    /// Field numbers from protobuf: type=2, `route_id=3`, timestamp=4
     pub fn build_request_connection(route_id: &str, timestamp: u64) -> Vec<u8> {
         let mut buf = Vec::new();
         // Field 2: type = 3 (varint)
@@ -257,41 +337,30 @@ mod requests {
         encode_varint_field(&mut buf, 4, timestamp);
         buf
     }
-
-    /// Build ReqHeartbeat for Route.heartbeat
-    pub fn build_heartbeat() -> Vec<u8> {
-        let mut buf = Vec::new();
-        encode_varint_field(&mut buf, 1, 0);  // delay
-        encode_varint_field(&mut buf, 2, 0);  // no_operation_counter
-        encode_varint_field(&mut buf, 3, 11); // platform (Web)
-        encode_varint_field(&mut buf, 4, 0);  // network_quality
-        buf
-    }
 }
 
 pub struct MajsoulRpc {
-    write: Arc<Mutex<futures_util::stream::SplitSink<WsStream, Message>>>,
-    pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>>,
-    req_idx: AtomicU16,
+    write: Arc<Mutex<futures::stream::SplitSink<WsStream, Message>>>,
+    pending: Arc<Mutex<PendingMap>>,
+    req_idx: AtomicU32,
     _read_task: tokio::task::JoinHandle<()>,
 }
 
 impl MajsoulRpc {
-    pub async fn connect(endpoint: &str) -> Result<Self> {
+    pub async fn connect(endpoint: &str, origin: &str) -> Result<Self> {
         let mut request = endpoint.into_client_request()?;
         request
             .headers_mut()
-            .insert("Origin", MS_HOST.parse().unwrap());
+            .insert("Origin", origin.parse().context("Invalid origin")?);
 
-        debug!("Connecting to {}", endpoint);
+        debug!("Connecting to {} (origin {})", endpoint, origin);
         let (ws_stream, _) = connect_async(request)
             .await
             .context("WebSocket connect failed")?;
 
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(Mutex::new(write));
-        let pending: Arc<Mutex<HashMap<u16, oneshot::Sender<Vec<u8>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
 
         let pending_clone = Arc::clone(&pending);
         let read_task = tokio::spawn(async move {
@@ -300,21 +369,49 @@ impl MajsoulRpc {
                     Ok(Message::Binary(data)) if data.len() >= 3 => {
                         if data[0] == 3 {
                             // RESPONSE
-                            let idx = u16::from_le_bytes([data[1], data[2]]);
-                            if let Ok((_, response_data)) = wrapper::decode(&data[3..]) {
-                                let mut pending = pending_clone.lock().await;
-                                if let Some(tx) = pending.remove(&idx) {
-                                    let _ = tx.send(response_data);
+                            let idx = u32::from_le_bytes([data[1], data[2], 0, 0]);
+                            match wrapper::decode(&data[3..]) {
+                                Ok((_, response_data)) => {
+                                    let mut pending = pending_clone.lock().await;
+                                    if let Some(tx) = pending.remove(&idx) {
+                                        let _ = tx.send(Ok(response_data));
+                                    } else {
+                                        debug!("Response for unknown idx {}", idx);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to decode response idx {}: {}", idx, e);
+                                    let mut pending = pending_clone.lock().await;
+                                    if let Some(tx) = pending.remove(&idx) {
+                                        let _ = tx.send(Err(format!("decode failed: {e}")));
+                                    }
                                 }
                             }
+                        } else {
+                            // Server-push frame (not a response): log, do not drop silently.
+                            debug!("Server-push frame kind {} ({} bytes)", data[0], data.len());
                         }
                     }
+                    Ok(Message::Binary(data)) => {
+                        debug!("Short binary frame ({} bytes)", data.len());
+                    }
+                    Ok(Message::Text(text)) => {
+                        debug!("Server-push text frame ({} bytes)", text.len());
+                    }
                     Ok(Message::Close(_)) => {
-                        debug!("WebSocket closed");
+                        debug!("WebSocket closed; draining {} pendings", pending_clone.lock().await.len());
+                        let mut pending = pending_clone.lock().await;
+                        for (_, tx) in pending.drain() {
+                            let _ = tx.send(Err("connection closed".to_string()));
+                        }
                         break;
                     }
                     Err(e) => {
-                        warn!("WebSocket error: {}", e);
+                        warn!("WebSocket error: {}; draining pendings", e);
+                        let mut pending = pending_clone.lock().await;
+                        for (_, tx) in pending.drain() {
+                            let _ = tx.send(Err("connection closed".to_string()));
+                        }
                         break;
                     }
                     _ => {}
@@ -326,47 +423,100 @@ impl MajsoulRpc {
         Ok(Self {
             write,
             pending,
-            req_idx: AtomicU16::new(1),
+            req_idx: AtomicU32::new(1),
             _read_task: read_task,
         })
     }
 
+    /// Number of in-flight RPCs (test hook).
+    /// Kept for the D4 demux invariant (forced timeout leaves `pending` empty);
+    /// never called in production, so the dead-code lint is suppressed here.
+    #[allow(dead_code)]
+    pub async fn pending_len(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
     pub async fn call(&self, method: &str, request_data: &[u8]) -> Result<Vec<u8>> {
-        let idx = self.req_idx.fetch_add(1, Ordering::SeqCst) % 60007;
+        // Allocate a non-zero, currently-unused index (insert-if-absent retry).
+        let (idx, rx) = {
+            let mut chosen: Option<(u32, PendingRx)> = None;
+            for _ in 0..1024 {
+                let cand = self.req_idx.fetch_add(1, Ordering::SeqCst);
+                // Gateway request index lives in 1..60007 (0 is never a valid in-flight key); wrap + skip 0 keeps the demux map sound.
+                let id = cand % 60007;
+                if id == 0 {
+                    continue;
+                }
+                let (tx, rx) = oneshot::channel();
+                {
+                    let mut guard = self.pending.lock().await;
+                    if guard.contains_key(&id) {
+                        continue;
+                    }
+                    guard.insert(id, tx);
+                }
+                chosen = Some((id, rx));
+                break;
+            }
+            match chosen {
+                Some(v) => v,
+                None => anyhow::bail!("RPC index space exhausted"),
+            }
+        };
+        // `idx` is `cand % 60007`, so it always fits `u16`; the checked
+        // conversion only guards future changes to the modulus.
+        let idx_bytes = u16::try_from(idx)
+            .map_err(|_| anyhow::anyhow!("RPC index out of range: {idx}"))?
+            .to_le_bytes();
 
         let wrapped = wrapper::encode(method, request_data);
         let mut packet = vec![0x02];
-        packet.extend_from_slice(&idx.to_le_bytes());
+        packet.extend_from_slice(&idx_bytes);
         packet.extend_from_slice(&wrapped);
 
-        let (tx, rx) = oneshot::channel();
+        if let Err(e) = self
+            .write
+            .lock()
+            .await
+            .send(Message::Binary(packet.into()))
+            .await
         {
-            self.pending.lock().await.insert(idx, tx);
-        }
-        {
-            self.write
-                .lock()
-                .await
-                .send(Message::Binary(packet.into()))
-                .await?;
+            self.pending.lock().await.remove(&idx);
+            return Err(e).context("WebSocket send failed");
         }
 
         debug!("Sent RPC: {} (idx={})", method, idx);
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), rx)
-            .await
-            .context("RPC timeout")?
-            .context("RPC channel closed")?;
+        let response = Self::await_response(&self.pending, idx, rx, std::time::Duration::from_secs(30)).await?;
         Ok(response)
     }
 
+    async fn await_response(
+        pending: &Arc<Mutex<PendingMap>>,
+        idx: u32,
+        rx: PendingRx,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>> {
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(e))) => anyhow::bail!("{e}"),
+            Ok(Err(_)) => {
+                pending.lock().await.remove(&idx);
+                anyhow::bail!("connection closed");
+            }
+            Err(_) => {
+                pending.lock().await.remove(&idx);
+                anyhow::bail!("RPC timeout");
+            }
+        }
+    }
     pub async fn fetch_game_record(&self, uuid: &str, version: &str) -> Result<Vec<u8>> {
         let request = requests::fetch_game_record(uuid, version);
         let response = self.call(".lq.Lobby.fetchGameRecord", &request).await?;
         // Check for error: direct (08 XX) or nested (0a LL 08 XX)
         if let Some(code) = Self::extract_error_code(&response) {
             if code != 0 {
-                anyhow::bail!("fetchGameRecord error {}: {}", code, uuid);
+                anyhow::bail!("fetchGameRecord error {code}: {uuid}");
             }
         }
         debug!("Fetched game record: {} ({} bytes)", uuid, response.len());
@@ -374,12 +524,14 @@ impl MajsoulRpc {
     }
 
     /// Fetch public game list from ranked rooms (Throne, Jade, Gold, etc.)
-    /// room_type: 0=all, 1=Bronze, 2=Silver, 3=Gold, 4=Jade, 5=Throne
+    /// `room_type`: 0=all, 1=Bronze, 2=Silver, 3=Gold, 4=Jade, 5=Throne
     pub async fn fetch_game_record_list(&self, start: u32, count: u32, room_type: u32) -> Result<Vec<u8>> {
         let request = requests::fetch_game_record_list(start, count, room_type);
         let response = self.call(".lq.Lobby.fetchGameRecordList", &request).await?;
-        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
-            anyhow::bail!("fetchGameRecordList error {}", response[1]);
+        if let Some(code) = Self::extract_error_code(&response) {
+            if code != 0 {
+                anyhow::bail!("fetchGameRecordList error {code}");
+            }
         }
         debug!("Fetched game record list ({} bytes)", response.len());
         Ok(response)
@@ -389,8 +541,10 @@ impl MajsoulRpc {
     pub async fn fetch_game_live_list(&self, filter_id: u32) -> Result<Vec<u8>> {
         let request = requests::fetch_game_live_list(filter_id);
         let response = self.call(".lq.Lobby.fetchGameLiveList", &request).await?;
-        if response.len() >= 2 && response[0] == 0x08 && response[1] != 0 {
-            anyhow::bail!("fetchGameLiveList error {}", response[1]);
+        if let Some(code) = Self::extract_error_code(&response) {
+            if code != 0 {
+                anyhow::bail!("fetchGameLiveList error {code}");
+            }
         }
         debug!("Fetched live game list ({} bytes)", response.len());
         Ok(response)
@@ -400,21 +554,25 @@ impl MajsoulRpc {
     pub async fn route_connect(&self, route_id: &str) -> Result<()> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        // Current epoch millis always fits `u64`; saturate rather than fail
+        // if the clock ever reports otherwise.
+        let timestamp = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         debug!("Sending route connection (route_id: {}, timestamp: {})", route_id, timestamp);
 
         let request = requests::build_request_connection(route_id, timestamp);
         let response = self.call(".lq.Route.requestConnection", &request).await?;
 
-        // Check for error
-        if response.len() >= 4 && response[0] == 0x0a && response[2] == 0x08 {
-            let err_code = response[3];
-            if err_code != 0 {
-                anyhow::bail!("Route connection failed (error {})", err_code);
+        // Check for error via numeric decode (multi-byte safe).
+        if let Some(code) = Self::extract_error_code(&response) {
+            if code != 0 {
+                anyhow::bail!("Route connection failed (error {code})");
             }
         }
 
@@ -436,11 +594,13 @@ impl MajsoulRpc {
 
         // Step 2: Heartbeat via Lobby service (like original implementation)
         debug!("Sending heartbeat");
+        // Server's literal method name is "heatbeat" (missing "r"); do not "fix" the typo — login fails otherwise.
         let hb_response = self.call(".lq.Lobby.heatbeat", &[0x08, 0x00]).await?;
         debug!("Heartbeat response: {} bytes", hb_response.len());
 
         let password_hash = hash_password(password);
         let random_key = Uuid::new_v4().to_string();
+        // version.json "X.Y.w" -> login/fetch "web-X.Y" (see gateway.rs).
         let version_string = format!("web-{}", version.replace(".w", ""));
 
         debug!("Authenticating with native login (account={})", username);
@@ -464,7 +624,7 @@ impl MajsoulRpc {
         // Check for error
         if let Some(error_code) = Self::extract_error_code(&response) {
             if error_code != 0 {
-                anyhow::bail!("CN native login failed with error code: {}", error_code);
+                anyhow::bail!("CN native login failed with error code: {error_code}");
             }
         }
 
@@ -479,6 +639,7 @@ impl MajsoulRpc {
         self.call(".lq.Lobby.loginSuccess", &[]).await?;
 
         // Send loginBeat with contract
+        // Opaque contract token the server's loginBeat expects verbatim; not a secret to rotate — altering it breaks login.
         let contract = "DF2vkXCnfeXp4WoGSBGNcJBufZiMN3UP";
         let beat_req = requests::build_login_beat_request(contract);
         self.call(".lq.Lobby.loginBeat", &beat_req).await?;
@@ -486,55 +647,111 @@ impl MajsoulRpc {
         Ok(())
     }
 
-    /// Extract error code from protobuf response
-    /// Handles both nested (0a <len> 08 <code>) and direct (08 <code>) formats
-    fn extract_error_code(data: &[u8]) -> Option<u8> {
-        if data.len() >= 4 && data[0] == 0x0a && data[2] == 0x08 {
-            // Nested error in field 1
-            Some(data[3])
-        } else if data.len() >= 2 && data[0] == 0x08 {
-            // Direct error code
-            Some(data[1])
-        } else {
-            None
+    /// Extract error code from protobuf response (multi-byte tag/varint safe).
+    /// Handles both nested (field 1 len-delim containing field 1 varint) and
+    /// direct (field 1 varint) formats. Codes >= 128 decode correctly.
+    fn extract_error_code(data: &[u8]) -> Option<i64> {
+        let mut pos = 0;
+        while pos < data.len() {
+            let (tag, tag_len) = wrapper::decode_varint(&data[pos..]).ok()?;
+            pos += tag_len;
+            let field_num = u32::try_from(tag >> 3).ok()?;
+            let wire_type = (tag & 0x07) as u8;
+            match (field_num, wire_type) {
+                (1, 0) => {
+                    let (code, _) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    return i64::try_from(code).ok();
+                }
+                (1, 2) => {
+                    let (len, n) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    pos += n;
+                    let end = pos + usize::try_from(len).ok()?;
+                    if end > data.len() {
+                        return None;
+                    }
+                    let inner = &data[pos..end];
+                    let mut ipos = 0;
+                    while ipos < inner.len() {
+                        let (sub_tag, sub_used) = wrapper::decode_varint(&inner[ipos..]).ok()?;
+                        ipos += sub_used;
+                        let inum = u32::try_from(sub_tag >> 3).ok()?;
+                        let iw = (sub_tag & 0x07) as u8;
+                        if inum == 1 && iw == 0 {
+                            let (code, _) = wrapper::decode_varint(&inner[ipos..]).ok()?;
+                            return i64::try_from(code).ok();
+                        }
+                        // Skip inner field.
+                        match iw {
+                            0 => {
+                                let (_, n) = wrapper::decode_varint(&inner[ipos..]).ok()?;
+                                ipos += n;
+                            }
+                            1 => ipos += 8,
+                            2 => {
+                                let (l, n) = wrapper::decode_varint(&inner[ipos..]).ok()?;
+                                ipos += n + usize::try_from(l).ok()?;
+                            }
+                            5 => ipos += 4,
+                            _ => return None,
+                        }
+                    }
+                    pos = end;
+                }
+                (_, 0) => {
+                    let (_, n) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    pos += n;
+                }
+                (_, 1) => pos += 8,
+                (_, 2) => {
+                    let (len, n) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    pos += n + usize::try_from(len).ok()?;
+                }
+                (_, 5) => pos += 4,
+                _ => return None,
+            }
         }
+        None
     }
 
     /// Extract string field from protobuf response by field number
+    /// (multi-byte tag safe via varint decode; handles fields >= 16).
     fn extract_string_field(data: &[u8], target_field: u32) -> Option<String> {
         let mut pos = 0;
         while pos < data.len() {
-            let tag = data[pos];
-            pos += 1;
-            let field_num = (tag >> 3) as u32;
-            let wire_type = tag & 0x07;
-
-            if wire_type == 2 {
-                // Length-delimited
-                let mut len: usize = 0;
-                let mut shift = 0;
-                while pos < data.len() {
-                    let b = data[pos];
-                    pos += 1;
-                    len |= ((b & 0x7f) as usize) << shift;
-                    if b & 0x80 == 0 {
-                        break;
+            let (tag, tag_len) = wrapper::decode_varint(&data[pos..]).ok()?;
+            pos += tag_len;
+            let field_num = u32::try_from(tag >> 3).ok()?;
+            let wire_type = (tag & 0x07) as u8;
+            match wire_type {
+                2 => {
+                    let (len, n) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    pos += n;
+                    let end = pos + usize::try_from(len).ok()?;
+                    if end > data.len() {
+                        return None;
                     }
-                    shift += 7;
+                    if field_num == target_field {
+                        return Some(String::from_utf8_lossy(&data[pos..end]).to_string());
+                    }
+                    pos = end;
                 }
-                if field_num == target_field && pos + len <= data.len() {
-                    return Some(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                0 => {
+                    let (_, n) = wrapper::decode_varint(&data[pos..]).ok()?;
+                    pos += n;
                 }
-                pos += len;
-            } else if wire_type == 0 {
-                // Varint - skip
-                while pos < data.len() && data[pos] & 0x80 != 0 {
-                    pos += 1;
+                1 => {
+                    if pos + 8 > data.len() {
+                        return None;
+                    }
+                    pos += 8;
                 }
-                pos += 1;
-            } else {
-                // Unknown wire type, stop parsing
-                break;
+                5 => {
+                    if pos + 4 > data.len() {
+                        return None;
+                    }
+                    pos += 4;
+                }
+                _ => return None,
             }
         }
         None
@@ -560,7 +777,7 @@ fn skip_field(data: &[u8], wire_type: u8) -> Result<usize> {
         2 => {
             // Length-delimited
             let (len, varint_bytes) = wrapper::decode_varint(data)?;
-            Ok(varint_bytes + len as usize)
+            Ok(varint_bytes + usize_checked(len)?)
         }
         5 => {
             // 32-bit fixed
@@ -569,29 +786,28 @@ fn skip_field(data: &[u8], wire_type: u8) -> Result<usize> {
             }
             Ok(4)
         }
-        _ => anyhow::bail!("Unsupported wire type {}", wire_type),
+        _ => anyhow::bail!("Unsupported wire type {wire_type}"),
     }
 }
 
 /// Extract full UUID from fetchGameRecord response
 /// Response structure: Field 2 (head) contains Field 1 (uuid)
+/// Tags decoded as multi-byte varints so fields >= 16 work.
 pub fn extract_full_uuid_from_record(data: &[u8]) -> Result<String> {
     let mut pos = 0;
-
     while pos < data.len() {
-        let tag = data[pos];
-        pos += 1;
+        let (tag, tag_len) = wrapper::decode_varint(&data[pos..])?;
+        pos += tag_len;
         let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-
+        let wire_type = (tag & 0x07) as u8;
         if wire_type == 2 {
-            // Length-delimited
             let (len, varint_bytes) = wrapper::decode_varint(&data[pos..])?;
             pos += varint_bytes;
-            let len = len as usize;
-
-            if field_num == 2 && pos + len <= data.len() {
-                // Field 2 is head - parse nested message for uuid (field 1)
+            let len = usize_checked(len)?;
+            if pos + len > data.len() {
+                anyhow::bail!("Buffer overflow");
+            }
+            if field_num == 2 {
                 let head_data = &data[pos..pos + len];
                 if let Ok(uuid) = extract_uuid_from_head(head_data) {
                     return Ok(uuid);
@@ -599,7 +815,6 @@ pub fn extract_full_uuid_from_record(data: &[u8]) -> Result<String> {
             }
             pos += len;
         } else {
-            // Skip field based on wire type
             let skip = skip_field(&data[pos..], wire_type)?;
             pos += skip;
         }
@@ -609,26 +824,23 @@ pub fn extract_full_uuid_from_record(data: &[u8]) -> Result<String> {
 
 fn extract_uuid_from_head(data: &[u8]) -> Result<String> {
     let mut pos = 0;
-
     while pos < data.len() {
-        let tag = data[pos];
-        pos += 1;
+        let (tag, tag_len) = wrapper::decode_varint(&data[pos..])?;
+        pos += tag_len;
         let field_num = tag >> 3;
-        let wire_type = tag & 0x07;
-
+        let wire_type = (tag & 0x07) as u8;
         if wire_type == 2 {
-            // Length-delimited
             let (len, varint_bytes) = wrapper::decode_varint(&data[pos..])?;
             pos += varint_bytes;
-            let len = len as usize;
-
-            if field_num == 1 && pos + len <= data.len() {
-                // Field 1 is uuid
+            let len = usize_checked(len)?;
+            if pos + len > data.len() {
+                anyhow::bail!("Buffer overflow");
+            }
+            if field_num == 1 {
                 return Ok(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
             }
             pos += len;
         } else {
-            // Skip field based on wire type
             let skip = skip_field(&data[pos..], wire_type)?;
             pos += skip;
         }
@@ -692,5 +904,72 @@ mod tests {
         // This should work - parser must skip wire types 1 and 5 correctly
         let result = extract_full_uuid_from_record(&response).unwrap();
         assert_eq!(result, uuid);
+    }
+
+    #[test]
+    fn test_decode_field16_tag_and_code200() {
+        // Field 16, wire type 2: tag = (16 << 3) | 2 = 130 => varint 0x82 0x01.
+        let mut buf = Vec::new();
+        wrapper::encode_varint(&mut buf, (16u64 << 3) | 2);
+        wrapper::encode_varint(&mut buf, 2);
+        buf.extend_from_slice(b"hi");
+        let (name, data) = wrapper::decode(&buf).unwrap();
+        assert_eq!(name, "");
+        assert!(data.is_empty());
+        let s = MajsoulRpc::extract_string_field(&buf, 16).unwrap();
+        assert_eq!(s, "hi");
+        // Error code 200 (multi-byte varint) direct: tag 0x08 + C8 01.
+        let mut err = vec![0x08];
+        wrapper::encode_varint(&mut err, 200);
+        let code = MajsoulRpc::extract_error_code(&err).unwrap();
+        assert_eq!(code, 200);
+        assert_eq!(classify_error(200), MajsoulError::Fatal(200));
+        // Nested code 200.
+        let mut inner = vec![0x08];
+        wrapper::encode_varint(&mut inner, 200);
+        let mut nested = vec![0x0a];
+        wrapper::encode_varint(&mut nested, inner.len() as u64);
+        nested.extend_from_slice(&inner);
+        assert_eq!(MajsoulRpc::extract_error_code(&nested).unwrap(), 200);
+    }
+
+    #[test]
+    fn test_classify_and_parse_error_codes() {
+        assert_eq!(classify_error(151), MajsoulError::VersionMismatch);
+        assert_eq!(classify_error(103), MajsoulError::RateLimited);
+        assert_eq!(classify_error(42), MajsoulError::Fatal(42));
+        assert_eq!(
+            parse_error_code_from_message("fetchGameRecord error 151: abc").unwrap(),
+            151
+        );
+        assert_eq!(
+            parse_error_code_from_message("fetchGameRecord error 200: abc").unwrap(),
+            200
+        );
+        let v = parse_error_code_from_message("oops 2151").unwrap();
+        assert_eq!(v, 2151);
+        assert_eq!(classify_error(v), MajsoulError::Fatal(2151));
+        assert!(parse_error_code_from_message("no code here").is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pending_empty_after_timeout() {
+        use std::sync::Arc;
+        use tokio::sync::{oneshot, Mutex};
+        let pending: Arc<Mutex<PendingMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let idx = 7u32;
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(idx, tx);
+        assert_eq!(pending.lock().await.len(), 1);
+        let err = MajsoulRpc::await_response(
+            &pending,
+            idx,
+            rx,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("timeout"));
+        assert_eq!(pending.lock().await.len(), 0);
     }
 }

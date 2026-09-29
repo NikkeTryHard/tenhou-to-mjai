@@ -3,17 +3,20 @@
 //! This module provides the conversion logic to transform Majsoul's protobuf-encoded
 //! game records into the tenhou.net/6 JSON format, which is compatible with existing
 //! Tenhou log viewers and analysis tools like Mortal.
-
+// Documents the target shape until real protobuf parsing lands (E1 gate).
+#![allow(dead_code)]
+#[allow(unused_imports)]
 use super::tenhou_format::{PlayerMapping, TenhouLog, TenhouRule, TensoulOutput};
 use anyhow::Result;
 use serde_json::Value;
+#[allow(unused_imports)]
 use std::collections::HashMap;
 
 // =============================================================================
 // Room/Mode Mappings
 // =============================================================================
 
-/// Room name mappings from mode_id to Japanese display name
+/// Room name mappings from `mode_id` to Japanese display name
 /// These match the tensoul cfg.json format
 pub fn get_room_name(mode_id: u32) -> String {
     match mode_id {
@@ -36,13 +39,13 @@ pub fn get_room_name(mode_id: u32) -> String {
         25 => "金の間東喰(三人)".to_string(),
         26 => "金の間南喰(三人)".to_string(),
         // Default
-        _ => format!("Mode {}", mode_id),
+        _ => format!("Mode {mode_id}"),
     }
 }
 
 /// Check if mode is 3-player
 pub fn is_sanma(mode_id: u32) -> bool {
-    mode_id >= 21 && mode_id <= 26
+    (21..=26).contains(&mode_id)
 }
 
 /// Check if mode is hanchan (south round)
@@ -54,7 +57,7 @@ pub fn is_hanchan(mode_id: u32) -> bool {
 // Dan/Rank Mappings
 // =============================================================================
 
-/// Dan/rank name mappings from level_id to Japanese display name
+/// Dan/rank name mappings from `level_id` to Japanese display name
 pub fn get_dan_name(level_id: u32) -> String {
     // Level ID format: 1XXYY where XX is major rank, YY is stars
     // 101xx = 初心 (Novice)
@@ -82,7 +85,7 @@ pub fn get_dan_name(level_id: u32) -> String {
         10503 => "雀聖★3".to_string(),
         10601 => "魂天".to_string(),
         // Celestial with levels (魂天Lv1, Lv2, etc.)
-        l if l >= 10602 && l <= 10620 => format!("魂天Lv{}", l - 10600),
+        l if (10602..=10620).contains(&l) => format!("魂天Lv{}", l - 10600),
         // 3-player ranks (20xxx series)
         20101 => "初心★1".to_string(),
         20102 => "初心★2".to_string(),
@@ -100,9 +103,9 @@ pub fn get_dan_name(level_id: u32) -> String {
         20502 => "雀聖★2".to_string(),
         20503 => "雀聖★3".to_string(),
         20601 => "魂天".to_string(),
-        l if l >= 20602 && l <= 20620 => format!("魂天Lv{}", l - 20600),
+        l if (20602..=20620).contains(&l) => format!("魂天Lv{}", l - 20600),
         // Unknown
-        _ => format!("Rank {}", level_id),
+        _ => format!("Rank {level_id}"),
     }
 }
 
@@ -128,7 +131,7 @@ pub fn get_dan_name(level_id: u32) -> String {
 /// - 53: red 5s
 ///
 /// The `tile_instance` is used to detect red fives:
-/// - For 5m/5p/5s, if tile_instance == 0, it's the red five
+/// - For 5m/5p/5s, if `tile_instance` == 0, it's the red five
 pub fn majsoul_tile_to_tenhou(tile_id: u32, tile_instance: u32) -> u32 {
     let suit = tile_id / 9;
     let num = tile_id % 9;
@@ -184,7 +187,7 @@ pub fn tenhou_tile_to_string(tile: u32) -> String {
         52 => "0p".to_string(), // Red 5p
         53 => "0s".to_string(), // Red 5s
         60 => "?".to_string(),  // Tsumogiri marker
-        _ => format!("?{}", tile),
+        _ => format!("?{tile}"),
     }
 }
 
@@ -195,7 +198,7 @@ pub fn tenhou_tile_to_string(tile: u32) -> String {
 /// Encode a riichi declaration in Tenhou format.
 /// Format: "r{tile}" where tile is the discarded tile
 pub fn encode_riichi(tile: u32) -> String {
-    format!("r{}", tile)
+    format!("r{tile}")
 }
 
 /// Encode a chi (chii) call in Tenhou format.
@@ -208,7 +211,7 @@ pub fn encode_chi(called_tile: u32, hand_tiles: &[u32]) -> String {
 
 /// Encode a pon call in Tenhou format.
 /// Format: "p{tile}{tile}{tile}" or "{tile}p{tile}{tile}" depending on caller
-pub fn encode_pon(called_tile: u32, hand_tiles: &[u32], from_player: u32) -> String {
+pub fn encode_pon(called_tile: u32, hand_tiles: &[u32], _from_player: u32) -> String {
     // The position of 'p' indicates which player the tile was called from
     // For simplicity, we use the standard format
     format!("p{}{}{}", hand_tiles[0], hand_tiles[1], called_tile)
@@ -223,7 +226,7 @@ pub fn encode_daiminkan(tiles: &[u32]) -> String {
 /// Encode an ankan (concealed kan) in Tenhou format.
 /// Format: "{tile}{tile}k{tile}{tile}" - the k is in the middle
 pub fn encode_ankan(tile: u32) -> String {
-    format!("{}{}k{}{}", tile, tile, tile, tile)
+    format!("{tile}{tile}k{tile}{tile}")
 }
 
 /// Encode a kakan (added kan) in Tenhou format.
@@ -304,41 +307,22 @@ pub fn encode_ryuukyoku(reason: &str, score_changes: &[i32]) -> Vec<Value> {
 
 /// Convert a Majsoul game record to Tenhou JSON format.
 ///
-/// This is a skeleton implementation that will be filled in as we implement
-/// the protobuf parsing in later batches.
+/// Gated skeleton: real protobuf parsing has not landed yet, so this always
+/// returns an error output (callers treat `is_error` as a download failure and
+/// never write files). The skeleton builders below are kept because they
+/// document the target Tenhou shape.
+#[allow(dead_code)]
+// The `Result` wrapper is intentional: real protobuf parsing (gated) will be
+// fallible, and callers already handle `Err`.
+#[allow(clippy::unnecessary_wraps)]
 pub fn convert_to_tenhou(
     _record_data: &[u8],
     uuid: &str,
-    mode_id: u32,
+    _mode_id: u32,
 ) -> Result<TensoulOutput> {
-    tracing::warn!(
-        "Protobuf parsing not yet implemented - returning skeleton data for {}",
-        uuid
-    );
-    let num_players = if is_sanma(mode_id) { 3 } else { 4 };
-
-    let mut log = TenhouLog::new(uuid.to_string(), num_players);
-
-    // Set rule based on mode
-    log.rule = if num_players == 3 {
-        TenhouRule::default_3p()
-    } else {
-        TenhouRule::default_4p()
-    };
-    log.rule.disp = get_room_name(mode_id);
-
-    // Title contains room name and timestamp
-    log.title = vec![
-        Value::String(get_room_name(mode_id)),
-        Value::from(0), // Timestamp will be filled from record
-    ];
-
-    // TODO: Parse protobuf record data and fill in:
-    // - Player names, dan, rate from header
-    // - Kyoku data from game events
-    // - Final scores
-
-    Ok(TensoulOutput::success(log))
+    Ok(TensoulOutput::error(format!(
+        "protobuf parsing not yet implemented for {uuid}"
+    )))
 }
 
 #[cfg(test)]
@@ -538,24 +522,14 @@ mod tests {
     #[test]
     fn test_convert_to_tenhou_skeleton() {
         let result = convert_to_tenhou(&[], "231124-test-uuid", 16).unwrap();
-        assert!(!result.is_error);
-
-        let log = result.log.unwrap();
-        assert_eq!(log.ver, "2.3");
-        assert_eq!(log.ref_, "231124-test-uuid");
-        assert_eq!(log.ratingc, "PF4");
-        assert_eq!(log.rule.disp, "王座の間南喰");
-        assert_eq!(log.dan.len(), 4);
+        assert!(result.is_error);
+        assert!(result.log.is_none());
+        assert!(result.error_msg.unwrap().contains("231124-test-uuid"));
     }
 
     #[test]
     fn test_convert_to_tenhou_3p() {
         let result = convert_to_tenhou(&[], "test-uuid", 26).unwrap();
-        let log = result.log.unwrap();
-
-        assert_eq!(log.ratingc, "PF3");
-        assert_eq!(log.dan.len(), 3);
-        assert_eq!(log.rule.aka51, 0); // No red 5m in 3p
-        assert_eq!(log.rule.aka52, 2); // Two red 5p in 3p
+        assert!(result.is_error);
     }
 }

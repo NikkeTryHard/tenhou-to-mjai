@@ -18,8 +18,8 @@ pub mod types;
 pub use api::AmaeKoromoClient;
 pub use convert::MajsoulConverter;
 pub use download::MajsoulDownloader;
-pub use parallel_download::{ParallelDownloader, WorkDistributor};
-pub use tenhou_format::{PlayerMapping, TenhouLog, TenhouRule, TensoulOutput};
-pub use to_tenhou::{convert_to_tenhou, get_dan_name, get_room_name, majsoul_tile_to_tenhou};
-pub use types::{GameRecord, PlayerSearchResult};
+// Only re-exports with live `crate::majsoul::Name` callers are kept here;
+// sibling modules import each other by module path (e.g. `super::to_tenhou::…`,
+// `crate::majsoul::parallel_download::ParallelDownloader`).
+pub use types::GameRecord;
 

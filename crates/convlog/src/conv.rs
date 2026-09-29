@@ -48,6 +48,8 @@ pub enum ConvertError {
         honba: u8,
         actor: u8,
     },
+    #[error("invalid bakaze for kyoku {0}: expected kyoku_num/4 in 0..=3")]
+    InvalidBakaze(u8),
 }
 
 pub type Result<T> = std::result::Result<T, ConvertError>;
@@ -88,19 +90,23 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
         .into_iter()
         .unzip();
 
-    // Prepare for backtracks.
-    let mut backtracks = AHashMap::new();
+    // Prepare for backtracks, keyed by (discarded tile, discarder, next
+    // discard index of the discarder) so two identical pon candidates from
+    // different actors/positions do not collide.
+    let mut backtracks: AHashMap<(Tile, u8, usize), BackTrack> = AHashMap::new();
 
     // Then emit the events in order.
     let oya = kyoku.meta.kyoku_num % 4;
+    // kyoku_num is an absolute counter (wind = num/4); values >15 are corrupt meta, not an extended game — reject instead of misclassifying (e.g. 200/4=50).
     let bakaze = match kyoku.meta.kyoku_num / 4 {
         0 => t!(E),
         1 => t!(S),
         2 => t!(W),
-        _ => t!(N),
+        3 => t!(N),
+        n => return Err(ConvertError::InvalidBakaze(n)),
     };
 
-    let attempt = |backtracks: &mut AHashMap<Tile, BackTrack>| -> Result<Vec<Event>> {
+    let attempt = |backtracks: &mut AHashMap<(Tile, u8, usize), BackTrack>| -> Result<Vec<Event>> {
         let mut events = vec![];
 
         let mut dora_feed = kyoku.dora_indicators.clone().into_iter();
@@ -155,9 +161,9 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
             )?;
             take_idxs[actor] += 1;
 
-            if let Some((target, pai)) = take.naki_info() {
-                if pai != last_discard
-                    || last_actor.is_some_and(|a| a != target || a == actor as u8)
+            if let Some((target, pai)) = take.naki_info()
+                && (pai != last_discard
+                    || last_actor.is_some_and(|a| a != target || a == actor as u8))
                 {
                     return Err(ConvertError::UnexpectedNaki {
                         action: take.clone(),
@@ -168,7 +174,6 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
                         actor: actor as u8,
                     });
                 }
-            }
 
             // If a reach event was emitted before, set it as accepted now.
             if let Some(actor) = reach_flag.take() {
@@ -334,13 +339,11 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
                 // First pass, filter the naki that takes the specific tile from the
                 // specific target.
                 .filter_map(|a| {
-                    if let Some(take) = take_events[a].get(take_idxs[a]) {
-                        if let Some((target, pai)) = take.naki_info() {
-                            if target == (actor as u8) && pai == last_discard {
+                    if let Some(take) = take_events[a].get(take_idxs[a])
+                        && let Some((target, pai)) = take.naki_info()
+                            && target == (actor as u8) && pai == last_discard {
                                 return Some((a, take.naki_to_ord()));
                             }
-                        }
-                    }
 
                     None
                 })
@@ -385,7 +388,7 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
                         return Some(a);
                     }
 
-                    match backtracks.entry(last_discard) {
+                    match backtracks.entry((last_discard, actor as u8, discard_idxs[actor])) {
                         Entry::Vacant(v) => {
                             // Try taking the first dahai as the real naki.
                             v.insert(BackTrack {
@@ -428,7 +431,9 @@ fn tenhou_kyoku_to_mjai_events(kyoku: &Kyoku) -> Result<Vec<Event>> {
             Err(err) => {
                 first_error = first_error.or(Some(err));
                 if backtracks.is_empty() {
-                    return Err(first_error.unwrap());
+                    // Infallible by construction: `first_error` was just set from
+                    // this iteration's `err` above, so it is always `Some` here.
+                    return Err(first_error.expect("attempt failed, so first_error is set"));
                 }
             }
         };
@@ -452,19 +457,24 @@ fn parse_takes_and_discards_to_mjai(
 fn finalize_discards(takes: &[Event], discards: &mut Vec<Event>) {
     let mut di = 0;
     for take in takes {
-        if di >= discards.len() {
+        let Some(current) = discards.get(di) else {
             break;
-        }
+        };
 
-        if matches!(discards[di], Event::Reach { .. }) {
+        if matches!(current, Event::Reach { .. }) {
             di += 1;
         }
+        // The Reach skip above may have advanced past the end on truncated
+        // kyokus; break instead of indexing out of bounds.
+        let Some(current) = discards.get(di) else {
+            break;
+        };
 
         if let Event::Dahai {
             pai,
             tsumogiri,
             actor,
-        } = discards[di]
+        } = *current
         {
             if tsumogiri {
                 if let Event::Tsumo { pai: tsumo, .. } = *take {
@@ -486,6 +496,13 @@ fn finalize_discards(takes: &[Event], discards: &mut Vec<Event>) {
     }
 }
 
+fn expect_naki_len(s: &str, n: usize) -> Result<()> {
+    if s.len() != n {
+        return Err(ConvertError::InvalidNaki(s.to_owned()));
+    }
+    Ok(())
+}
+
 fn take_action_to_events(actor: u8, takes: &[ActionItem]) -> Result<Vec<Event>> {
     takes
         .iter()
@@ -499,9 +516,7 @@ fn take_action_to_events(actor: u8, takes: &[ActionItem]) -> Result<Vec<Event>> 
                     // chi
                     // you can only chi from kamicha right...?
 
-                    if naki_string.len() != 7 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 7)?;
 
                     // e.g. "c275226" => chi 7p with 06p from kamicha
                     Ok(Event::Chi {
@@ -516,9 +531,7 @@ fn take_action_to_events(actor: u8, takes: &[ActionItem]) -> Result<Vec<Event>> 
                 } else if let Some(idx) = naki_string.find('p') {
                     // pon
 
-                    if naki_string.len() != 7 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 7)?;
 
                     match idx {
                         // from kamicha
@@ -563,9 +576,7 @@ fn take_action_to_events(actor: u8, takes: &[ActionItem]) -> Result<Vec<Event>> 
                 } else if let Some(idx) = naki_string.find('m') {
                     // daiminkan
 
-                    if naki_string.len() != 9 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 9)?;
 
                     match idx {
                         // from kamicha
@@ -650,9 +661,7 @@ fn discard_action_to_events(actor: u8, discards: &[ActionItem]) -> Result<Vec<Ev
                 if let Some(idx) = naki_string.find('k') {
                     // kakan
 
-                    if naki_string.len() != 9 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 9)?;
 
                     let ev = match idx {
                         // previously pon from toimen
@@ -703,9 +712,7 @@ fn discard_action_to_events(actor: u8, discards: &[ActionItem]) -> Result<Vec<Ev
                     // for ankan, 'a' can only appear at [6]
                     // e.g. "424242a42" => ankan 2z
 
-                    if naki_string.len() != 9 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 9)?;
 
                     let pai = tiles_from_tenhou_bytes(&naki[7..9])?;
                     let ev = Event::Ankan {
@@ -723,10 +730,9 @@ fn discard_action_to_events(actor: u8, discards: &[ActionItem]) -> Result<Vec<Ev
                     // reach
                     // e.g. "r35" => discard 5s to reach
 
-                    if naki_string.len() != 3 {
-                        return Err(ConvertError::InvalidNaki(naki_string.clone()));
-                    }
+                    expect_naki_len(naki_string, 3)?;
 
+                    // 60/0/r60 wire codes (see tenhou-json parser).
                     let pai = if &naki[1..3] == b"60" {
                         t!(?)
                     } else {
@@ -778,4 +784,51 @@ pub fn tiles_from_tenhou_bytes(b: &[u8]) -> Result<Tile> {
         TenhouTile::try_from(id).map_err(|_| ConvertError::InvalidTile(s.clone().into_owned()))?;
     let tile = Tile::from(tenhou_tile);
     Ok(tile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tenhou::Log;
+    use crate::t;
+
+    #[test]
+    fn truncated_discards_do_not_panic() {
+        // A Reach with no following Dahai (truncated kyoku) must break
+        // instead of indexing out of bounds.
+        let takes = vec![Event::Tsumo {
+            actor: 0,
+            pai: t!(1m),
+        }];
+        let mut discards = vec![Event::Reach { actor: 0 }];
+        finalize_discards(&takes, &mut discards);
+        assert_eq!(discards.len(), 1);
+    }
+
+    /// Kyoku where actors 0 and 2 each discard 1m twice and actors 1 and 3
+    /// each pon 1m once. The two divergence points share the same tile but
+    /// must backtrack independently.
+    const DOUBLE_PON: &str = r#"{"name":["A","B","C","D"],"rule":{"disp":"特南喰赤","aka":1},"log":[[[0,0,0],[25000,25000,25000,25000],[37],[37],[11,12,13,14,15,16,17,18,19,21,22,23,24],[12,13],[11,14],[11,12,13,14,15,16,17,18,19,21,22,23,24],["p111111",25],[15,26],[11,12,13,14,15,16,17,18,19,21,22,23,24],[27,28],[11,29],[11,12,13,14,15,16,17,18,19,21,22,23,24],["p111111",31],[16],["流局"]]]}"#;
+
+    #[test]
+    fn same_tile_pons_attribute_to_each_discarder() {
+        let log = Log::from_json_str(DOUBLE_PON).expect("fixture must parse");
+        let events = tenhou_to_mjai(&log).expect("fixture must convert");
+        let pons: Vec<(u8, u8)> = events
+            .iter()
+            .filter_map(|e| match *e {
+                Event::Pon { actor, target, .. } => Some((actor, target)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pons, vec![(1, 0), (3, 2)]);
+    }
+
+    #[test]
+    fn corrupt_bakaze_is_rejected() {
+        let mut log = Log::from_json_str(DOUBLE_PON).expect("fixture must parse");
+        log.kyokus[0].meta.kyoku_num = 200;
+        let err = tenhou_to_mjai(&log).expect_err("corrupt bakaze must fail");
+        assert!(matches!(err, ConvertError::InvalidBakaze(50)));
+    }
 }

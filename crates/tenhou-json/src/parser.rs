@@ -56,6 +56,10 @@ pub enum TenhouJsonErrorKind {
     InvalidAgariFormat,
     #[error("Invalid letter position")]
     InvalidLetterPosition,
+    #[error("Invalid direction")]
+    InvalidDirection,
+    #[error("Invalid player count: {0}")]
+    InvalidPlayerCount(usize),
 }
 
 trait WithContext {
@@ -151,7 +155,17 @@ fn parse_decorated_tile(s: &str) -> TenhouJsonResult<(Vec<Tile>, u8, usize)> {
         return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidMeld));
     }
 
-    let tiles = numbers.chunks(2).map(|c| conv_tile_from_ascii(c[0], c[1])).collect::<TenhouJsonResult<Vec<_>>>()?;
+    let mut tiles = Vec::with_capacity(numbers.len() / 2);
+    // Allow: meld digits are format-pinned to 2-element chunks.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let chunks = numbers.chunks_exact(2);
+    // A non-empty remainder means a truncated/corrupt array, not a short-but-valid one — fail the whole log.
+    if !chunks.remainder().is_empty() {
+        return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidMeld));
+    }
+    for c in chunks {
+        tiles.push(conv_tile_from_ascii(c[0], c[1])?);
+    }
 
     Ok((tiles, *letter, letter_pos))
 }
@@ -169,9 +183,15 @@ fn conv_incoming_tile(v: &Value) -> TenhouJsonResult<IncomingTile> {
                 if letter_pos != 0 {
                     return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidLetterPosition));
                 }
+                if tiles.len() != 3 {
+                    return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidMeld));
+                }
                 Ok(IncomingTile::Chii { combination: (tiles[0], tiles[1], tiles[2]) })
             }
             b'p' => {
+                if tiles.len() != 3 {
+                    return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidMeld));
+                }
                 let dir = match letter_pos {
                     0 => Direction::Kamicha,
                     2 => Direction::Toimen,
@@ -184,6 +204,9 @@ fn conv_incoming_tile(v: &Value) -> TenhouJsonResult<IncomingTile> {
                 })
             }
             b'm' => {
+                if tiles.len() != 4 {
+                    return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidMeld));
+                }
                 let dir = match letter_pos {
                     0 => Direction::Kamicha,
                     2 => Direction::Toimen,
@@ -203,6 +226,7 @@ fn conv_incoming_tile(v: &Value) -> TenhouJsonResult<IncomingTile> {
 fn conv_outgoing_tile(v: &Value) -> TenhouJsonResult<OutgoingTile> {
     if v.is_i64() {
         // normal discard
+        // Tenhou wire encoding: 60 = tsumogiri placeholder, 0 = dummy post-kan slot, r60 = riichi-tsumogiri.
         let x = conv_u8(v)?;
         match x {
             60 => Ok(OutgoingTile::Tsumogiri),
@@ -274,6 +298,9 @@ fn conv_outgoing_tiles(v: &Value) -> TenhouJsonResult<Vec<OutgoingTile>> {
 }
 
 fn conv_round_setting(vs: &[Value]) -> TenhouJsonResult<RoundSettings> {
+    if vs.len() < 4 {
+        return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidArrayLength));
+    }
     let h1 = conv_i32_array(&vs[0])?;
     if h1.len() != 3 {
         return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidArrayLength));
@@ -290,6 +317,9 @@ fn conv_round_setting(vs: &[Value]) -> TenhouJsonResult<RoundSettings> {
 }
 
 fn conv_round_player(vs: &[Value]) -> TenhouJsonResult<RoundPlayer> {
+    if vs.len() < 3 {
+        return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidArrayLength));
+    }
     Ok(RoundPlayer {
         hand: conv_tiles(&vs[0])?,
         incoming: conv_incoming_tiles(&vs[1])?,
@@ -298,7 +328,14 @@ fn conv_round_player(vs: &[Value]) -> TenhouJsonResult<RoundPlayer> {
 }
 
 fn conv_round_players(vs: &[Value]) -> TenhouJsonResult<Vec<RoundPlayer>> {
-    vs.chunks(3).map(conv_round_player).collect()
+    // Allow: round players are format-pinned to 3-element chunks.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let chunks = vs.chunks_exact(3);
+    // remainder = truncation (see above).
+    if !chunks.remainder().is_empty() {
+        return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidArrayLength));
+    }
+    chunks.map(conv_round_player).collect()
 }
 
 fn conv_extra_ryuukyoku_reason(s: &str) -> TenhouJsonResult<ExtraRyuukyokuReason> {
@@ -336,7 +373,14 @@ fn conv_agari(chunk0: &Value, chunk1: &Value) -> TenhouJsonResult<Agari> {
 }
 
 fn conv_agari_array(vs: &[Value]) -> TenhouJsonResult<Vec<Agari>> {
-    vs.chunks(2).map(|chunk| conv_agari(&chunk[0], &chunk[1])).collect()
+    // Allow: agari entries are format-pinned to 2-element chunks.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
+    let chunks = vs.chunks_exact(2);
+    // remainder = truncation (see above).
+    if !chunks.remainder().is_empty() {
+        return Err(TenhouJsonError::new(TenhouJsonErrorKind::InvalidAgariFormat));
+    }
+    chunks.map(|chunk| conv_agari(&chunk[0], &chunk[1])).collect()
 }
 
 fn conv_round_result(v: &Value) -> TenhouJsonResult<RoundResult> {
@@ -406,24 +450,28 @@ fn conv_tenhou_json(v: &Value) -> TenhouJsonResult<TenhouJson> {
     })
 }
 
+fn conv_each<T>(v: &Value, f: impl Fn(&Value) -> TenhouJsonResult<T>) -> TenhouJsonResult<Vec<T>> {
+    conv_array(v)?.iter().enumerate().map(|(i, x)| f(x).index_context(i)).collect()
+}
+
 fn conv_string_array(v: &Value) -> TenhouJsonResult<Vec<String>> {
-    conv_array(v)?.iter().enumerate().map(|(i, x)| conv_string(x).index_context(i)).collect()
+    conv_each(v, conv_string)
 }
 
 fn conv_f64_array(v: &Value) -> TenhouJsonResult<Vec<f64>> {
-    conv_array(v)?.iter().enumerate().map(|(i, x)| conv_f64(x).index_context(i)).collect()
+    conv_each(v, conv_f64)
 }
 
 fn conv_i32_array(v: &Value) -> TenhouJsonResult<Vec<i32>> {
-    conv_array(v)?.iter().enumerate().map(|(i, x)| conv_i32(x).index_context(i)).collect()
+    conv_each(v, conv_i32)
 }
 
 fn conv_round_array(v: &Value) -> TenhouJsonResult<Vec<Round>> {
-    conv_array(v)?.iter().enumerate().map(|(i, x)| conv_round(x).index_context(i)).collect()
+    conv_each(v, conv_round)
 }
 
 fn conv_connection_array(v: &Value) -> TenhouJsonResult<Vec<Connection>> {
-    conv_array(v)?.iter().enumerate().map(|(i, x)| conv_connection(x).index_context(i)).collect()
+    conv_each(v, conv_connection)
 }
 
 fn get_field<I: Index + ToString>(json: &Value, index: I) -> TenhouJsonResult<&Value> {
@@ -490,4 +538,40 @@ fn get_partition_even_odd<T: Clone>(v: &[T]) -> (Vec<T>, Vec<T>) {
 pub fn parse_tenhou_json(text: &str) -> TenhouJsonResult<TenhouJson> {
     let json: Value = serde_json::from_str(text).map_err(|_| TenhouJsonError::new(TenhouJsonErrorKind::JsonParseError))?;
     conv_tenhou_json(&json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn odd_agari_tail_is_invalid() {
+        // Agari entries must pair [deltas, detail]; a 3-item tail leaves a remainder.
+        let vs = vec![json!([0, 0, 0, 0]), json!(["x"]), json!([0])];
+        let err = conv_agari_array(&vs).expect_err("odd agari tail must fail");
+        assert!(matches!(err.kind, TenhouJsonErrorKind::InvalidAgariFormat));
+    }
+
+    #[test]
+    fn short_round_setting_is_invalid() {
+        let vs = vec![json!([0, 0, 0])];
+        let err = conv_round_setting(&vs).expect_err("short setting must fail");
+        assert!(matches!(err.kind, TenhouJsonErrorKind::InvalidArrayLength));
+    }
+
+    #[test]
+    fn short_player_chunk_is_invalid() {
+        let vs = vec![json!([11])];
+        let err = conv_round_player(&vs).expect_err("short player chunk must fail");
+        assert!(matches!(err.kind, TenhouJsonErrorKind::InvalidArrayLength));
+    }
+
+    #[test]
+    fn ragged_player_list_is_invalid() {
+        // 4 values cannot split into player triples.
+        let vs = vec![json!([11]), json!([11]), json!([11]), json!([11])];
+        let err = conv_round_players(&vs).expect_err("ragged players must fail");
+        assert!(matches!(err.kind, TenhouJsonErrorKind::InvalidArrayLength));
+    }
 }

@@ -5,12 +5,10 @@
 //! tools like Mortal.
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::path::Path;
 use tracing::{info, warn};
 
-use super::gateway::discover_gateway;
-use super::rpc::MajsoulRpc;
+use super::gateway::{FetchOutcome, classify_outcome, discover_and_connect};
 use super::to_tenhou::convert_to_tenhou;
 use crate::db::Database;
 
@@ -26,7 +24,10 @@ use crate::db::Database;
 /// * `server` - Server region (en, jp)
 ///
 /// # Returns
-/// Tuple of (success_count, failed_count)
+/// Tuple of (`success_count`, `failed_count`)
+// Length is gateway/login/retry boilerplate around one per-uuid loop (D2
+// error policy); splitting would churn the verified retry behavior.
+#[allow(clippy::too_many_lines)]
 pub async fn download_as_json(
     db: &Database,
     output_dir: &Path,
@@ -50,18 +51,18 @@ pub async fn download_as_json(
     info!("Using native login for {}", username);
 
     // Connect to Majsoul gateway
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-        .build()?;
+    let client = crate::util::http_client()?;
 
-    let (endpoint, version, route_id) = {
+    // Discover gateway, connect, and login with retry (per-server Origin
+    // handled inside the helper).
+    let (rpc, version) = {
         let mut attempts = 0;
         loop {
-            match discover_gateway(&client, server).await {
+            match discover_and_connect(&client, server, username, password).await {
                 Ok(result) => break result,
                 Err(e) if attempts < 3 => {
                     attempts += 1;
-                    warn!("Gateway discovery failed (attempt {}): {}", attempts, e);
+                    warn!("Gateway connect failed (attempt {}): {}", attempts, e);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
                 Err(e) => return Err(e),
@@ -69,48 +70,34 @@ pub async fn download_as_json(
         }
     };
 
-    // Connect with retry
-    let rpc = {
-        let mut attempts = 0;
-        loop {
-            match MajsoulRpc::connect(&endpoint).await {
-                Ok(rpc) => break rpc,
-                Err(e) if attempts < 3 => {
-                    attempts += 1;
-                    warn!("Connection failed (attempt {}): {}", attempts, e);
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    };
-
-    // Login with native credentials
-    rpc.login_native(username, password, &version, &route_id).await?;
+    // version.json "X.Y.w" -> login/fetch "web-X.Y" (see gateway.rs).
+    let client_version = format!("web-{}", version.replace(".w", ""));
 
     info!("Downloading {} game records to {:?}", uuids.len(), output_dir);
 
-    let pb = ProgressBar::new(uuids.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
-            .progress_chars("#>-"),
-    );
+    let pb = crate::util::progress_bar(uuids.len() as u64)?;
 
     let mut success = 0;
     let mut failed = 0;
+    let mut version_retries = 0u32;
 
     for uuid in &uuids {
-        match rpc.fetch_game_record(uuid, "").await {
+        match rpc.fetch_game_record(uuid, &client_version).await {
             Ok(data) => {
-                // Get mode_id from database for this UUID
-                let mode_id = db.get_majsoul_mode_id(uuid).unwrap_or(16);
+                // Get mode_id from database for this UUID (propagate DB errors).
+                let mode_id = db.get_majsoul_mode_id(uuid)?;
+                let mode_u32 = u32::try_from(mode_id)
+                    .map_err(|_| anyhow::anyhow!("mode_id out of range: {mode_id}"))?;
 
                 // Convert to Tenhou JSON format
-                match convert_to_tenhou(&data, uuid, mode_id as u32) {
+                match convert_to_tenhou(&data, uuid, mode_u32) {
                     Ok(tensoul_output) => {
                         if tensoul_output.is_error {
+                            // Gate: error output is a download failure, never written.
                             warn!("Conversion error for {}: {:?}", uuid, tensoul_output.error_msg);
+                            if let Err(db_err) = db.mark_majsoul_download_error(uuid) {
+                                warn!("Failed to mark error for {}: {}", uuid, db_err);
+                            }
                             failed += 1;
                         } else if let Some(log) = tensoul_output.log {
                             // Save as JSON file
@@ -147,20 +134,32 @@ pub async fn download_as_json(
                 }
             }
             Err(e) => {
-                let err_str = e.to_string();
-                warn!("Failed to fetch {}: {}", uuid, err_str);
-
-                // Check for rate limiting
-                if err_str.contains("151") {
-                    pb.finish_with_message("Rate limited");
-                    rpc.close().await?;
-                    return Err(anyhow::anyhow!(
-                        "Rate limited (error 151). Try again later."
-                    ));
+                warn!("Failed to fetch {}: {}", uuid, e);
+                match classify_outcome(&e) {
+                    FetchOutcome::Done => {
+                        if version_retries >= 3 {
+                            pb.finish_with_message("Version mismatch");
+                            rpc.close().await?;
+                            anyhow::bail!("Version mismatch persists after 3 gateway rediscoveries");
+                        }
+                        version_retries += 1;
+                        warn!("Version mismatch, sleeping 60s (retry {})", version_retries);
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        if let Err(db_err) = db.mark_majsoul_download_error(uuid) {
+                            warn!("Failed to mark error for {}: {}", uuid, db_err);
+                        }
+                        failed += 1;
+                    }
+                    FetchOutcome::Abort(err) => {
+                        pb.finish_with_message("Rate limited");
+                        rpc.close().await?;
+                        return Err(err);
+                    }
+                    FetchOutcome::MarkAndContinue => {
+                        db.mark_majsoul_download_error(uuid)?;
+                        failed += 1;
+                    }
                 }
-
-                db.mark_majsoul_download_error(uuid)?;
-                failed += 1;
             }
         }
 

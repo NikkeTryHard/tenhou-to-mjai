@@ -3,6 +3,10 @@ name = "convlog"
 version = "0.2.0"
 authors = ["Equim <sayaka@ekyu.moe>"]
 edition = "2024"
+description = "Transform tenhou.net/6 logs into mjai format"
+repository = "https://github.com/tsubakisakura/mjlog2json/"
+documentation = "https://docs.rs/convlog"
+license = "Apache-2.0 OR MIT"
 
 [dependencies]
 serde_json = "1"

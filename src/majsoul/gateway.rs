@@ -10,7 +10,7 @@ pub fn server_base_url(server: &str) -> &'static str {
     match server {
         "cn" => "https://game.maj-soul.com",
         "en" | "jp" => "https://mahjongsoul.game.yo-star.com",
-        _ => "https://mahjongsoul.game.yo-star.com",
+        _ => unreachable!("clap ValueEnum guarantees en|jp|cn"),
     }
 }
 
@@ -62,86 +62,144 @@ struct RoutesResponse {
     data: RoutesData,
 }
 
-/// Discover gateway endpoint, version, and route_id for Majsoul server
+/// Discover gateway endpoint, version, and `route_id` for Majsoul server
 ///
-/// Returns (endpoint, version, route_id) tuple needed for connection
+/// Returns (endpoint, version, `route_id`) tuple needed for connection
 pub async fn discover_gateway(client: &reqwest::Client, server: &str) -> Result<(String, String, String)> {
     let ms_host = server_base_url(server);
     let prefix = server_path_prefix(server);
     info!("Using {} server: {}", server, ms_host);
 
-    // Step 1: Get version
-    let version_url = format!("{}{}/version.json", ms_host, prefix);
+    // Step 1: Get version (check HTTP status before .json(), bail non-2xx).
+    let version_url = format!("{ms_host}{prefix}/version.json");
     let version_info: VersionInfo = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        client
-            .get(&version_url)
-            .send()
-            .await?
-            .json()
-            .await
-            .context("Failed to parse version.json")
+        let resp = client.get(&version_url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("version.json HTTP {status}");
+        }
+        resp.json().await.context("Failed to parse version.json")
     })
     .await
     .context("Timeout fetching version.json")??;
 
     let version = &version_info.version;
+    // version.json reports e.g. "X.Y.w"; login/fetch expect "web-X.Y" — strip ".w", never forward verbatim.
     let version_clean = version.replace(".w", "");
     info!("Majsoul version: {}", version);
 
-    // Step 2: Get config to find gateway URL
-    let config_url = format!("{}{}/v{}/config.json", ms_host, prefix, version);
+    // Step 2: Get config to find gateway URLs.
+    let config_url = format!("{ms_host}{prefix}/v{version}/config.json");
     let config: Config = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        client
-            .get(&config_url)
-            .send()
-            .await?
-            .json()
-            .await
-            .context("Failed to parse config.json")
+        let resp = client.get(&config_url).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("config.json HTTP {status}");
+        }
+        resp.json().await.context("Failed to parse config.json")
     })
     .await
     .context("Timeout fetching config.json")??;
 
-    // Gateway URL is like "https://route-2.maj-soul.com"
-    let gateway = config
+    // Collect all gateway base URLs (ips -> gateways) for failover.
+    let gateway_bases: Vec<String> = config
         .ip
-        .first()
-        .and_then(|ip| ip.gateways.first())
-        .context("No gateway found in config")?;
+        .iter()
+        .flat_map(|ip| ip.gateways.iter())
+        .map(|g| g.url.trim_end_matches('/').to_string())
+        .collect();
+    if gateway_bases.is_empty() {
+        anyhow::bail!("No gateway found in config");
+    }
 
-    let gateway_base = gateway.url.trim_end_matches('/');
-    debug!("Gateway base URL: {}", gateway_base);
+    // Step 3: Iterate gateways -> routes with fallback instead of .first().
+    let mut last_err: Option<anyhow::Error> = None;
+    for gateway_base in &gateway_bases {
+        debug!("Gateway base URL: {}", gateway_base);
+        let routes_url = format!(
+            "{gateway_base}/api/clientgate/routes?platform=Web&version={version}"
+        );
+        let routes_response: Result<RoutesResponse> = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let resp = client.get(&routes_url).send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("routes HTTP {status}");
+            }
+            resp.json().await.context("Failed to parse routes response")
+        })
+        .await
+        .context("Timeout fetching routes")
+        .and_then(|r| r);
+        let routes_response = match routes_response {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        if let Some(route) = routes_response.data.routes.first() {
+            let route_id = route.id.clone();
+            let route_domain = &route.domain;
+            debug!("Route: domain={}, id={}", route_domain, route_id);
+            let endpoint = format!("wss://{route_domain}/gateway");
+            info!("Discovered gateway: {} (route_id: {})", endpoint, route_id);
+            return Ok((endpoint, version_clean.clone(), route_id));
+        }
+        last_err = Some(anyhow::anyhow!("No routes found in response from {gateway_base}"));
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("No gateway/route available")))
+}
 
-    // Step 3: Fetch routes to get route_id
-    let routes_url = format!(
-        "{}/api/clientgate/routes?platform=Web&version={}",
-        gateway_base, version
-    );
-    let routes_response: RoutesResponse = tokio::time::timeout(REQUEST_TIMEOUT, async {
-        client
-            .get(&routes_url)
-            .send()
-            .await?
-            .json()
-            .await
-            .context("Failed to parse routes response")
-    })
-    .await
-    .context("Timeout fetching routes")??;
+/// Discover the gateway, connect, and log in with native credentials.
+///
+/// Single attempt, no retry: callers keep their own retry loops and call this
+/// once per attempt. Returns the logged-in RPC handle plus the discovered
+/// version string (`.w` suffix already stripped by [`discover_gateway`];
+/// format as `web-{version}` for fetch calls).
+pub async fn discover_and_connect(
+    client: &reqwest::Client,
+    server: &str,
+    username: &str,
+    password: &str,
+) -> Result<(super::rpc::MajsoulRpc, String)> {
+    let (endpoint, version, route_id) = discover_gateway(client, server).await?;
+    // The gateway validates the WS Origin against its own host (see rpc.rs).
+    let origin = super::rpc::origin_for_server(server);
+    let rpc = super::rpc::MajsoulRpc::connect(&endpoint, origin).await?;
+    rpc.login_native(username, password, &version, &route_id).await?;
+    Ok((rpc, version))
+}
 
-    let route = routes_response
-        .data
-        .routes
-        .first()
-        .context("No routes found in response")?;
+/// Verdict for a failed `fetch_game_record`.
+///
+/// The 60s sleep and the bounded-3 version-retry counter live at the call
+/// sites (loop shapes differ per caller), so this returns the verdict only.
+/// Close semantics also stay at the call site (keep-rpc vs close-and-bail).
+pub enum FetchOutcome {
+    /// Version rejected (code 151): caller runs its bounded rediscovery flow
+    /// inline (counter + 60s sleep), marks the uuid failed, and continues.
+    Done,
+    /// Generic/transient failure: caller marks the uuid error and continues.
+    MarkAndContinue,
+    /// Rate limited (code 103): caller finishes progress, closes the RPC
+    /// handle per its own semantics, and returns the carried error.
+    Abort(anyhow::Error),
+}
 
-    let route_id = route.id.clone();
-    let route_domain = &route.domain;
-    debug!("Route: domain={}, id={}", route_domain, route_id);
-
-    // Build WebSocket endpoint from route domain
-    let endpoint = format!("wss://{}/gateway", route_domain);
-    info!("Discovered gateway: {} (route_id: {})", endpoint, route_id);
-
-    Ok((endpoint, version_clean, route_id))
+/// Classify a `fetch_game_record` failure into a batch verdict.
+///
+/// `VersionMismatch` → [`FetchOutcome::Done`], `RateLimited` →
+/// [`FetchOutcome::Abort`] (carrying the shared rate-limit message),
+/// anything else (fatal code or unparsable message) →
+/// [`FetchOutcome::MarkAndContinue`].
+pub fn classify_outcome(e: &anyhow::Error) -> FetchOutcome {
+    match super::rpc::classify_fetch_error(e) {
+        Some(super::rpc::MajsoulError::VersionMismatch) => FetchOutcome::Done,
+        Some(super::rpc::MajsoulError::RateLimited) => {
+            FetchOutcome::Abort(anyhow::anyhow!(
+                "Rate limited by Majsoul; lower your request rate and retry later."
+            ))
+        }
+        _ => FetchOutcome::MarkAndContinue,
+    }
 }

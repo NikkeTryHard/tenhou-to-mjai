@@ -1,24 +1,19 @@
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::gateway::discover_gateway;
+use super::gateway::{FetchOutcome, classify_outcome, discover_and_connect};
 use super::rpc::MajsoulRpc;
 use crate::db::Database;
 
-/// Gateway info discovered once and shared across workers.
-#[derive(Clone)]
-struct GatewayInfo {
-    endpoint: String,
-    version: String,
-    route_id: String,
-}
-
 /// Distributes work across multiple workers.
+/// Round-robin chunking exercised by unit tests only; the production bulk
+/// path streams UUIDs directly, so the dead-code lint is suppressed here.
+#[allow(dead_code)]
 pub struct WorkDistributor;
 
+#[allow(dead_code)]
 impl WorkDistributor {
     /// Divide UUIDs evenly across workers by moving ownership.
     ///
@@ -43,6 +38,7 @@ impl WorkDistributor {
 pub struct ParallelDownloader {
     delay_ms: u64,
     restart_every: usize,
+    version: String,
 }
 
 impl ParallelDownloader {
@@ -55,12 +51,26 @@ impl ParallelDownloader {
         Self {
             delay_ms,
             restart_every,
+            version: String::new(),
         }
+    }
+
+    /// Override the gateway-discovered client version (setter chosen to
+    /// minimize callsite edits; empty means "use discovered version").
+    /// No production caller wires an override yet (that needs a main.rs
+    /// callsite, D1); kept as the intended override seam.
+    #[allow(dead_code)]
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = version.into();
+        self
     }
 
     /// Download logs using native login (username/password).
     ///
-    /// Returns (success_count, failed_count).
+    /// Returns (`success_count`, `failed_count`).
+    // Length is gateway/login/retry boilerplate around one per-uuid loop (D2
+    // error policy); splitting would churn the verified retry behavior.
+    #[allow(clippy::too_many_lines)]
     pub async fn download_with_credentials(
         &self,
         db: Arc<Mutex<Database>>,
@@ -83,44 +93,42 @@ impl ParallelDownloader {
         info!("Downloading {} game records", uuids.len());
 
         // Discover gateway
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-            .build()?;
+        let client = crate::util::http_client()?;
 
-        let (endpoint, version, route_id) = discover_gateway_with_retry(&client, server).await?;
-        let gateway = GatewayInfo { endpoint, version, route_id };
-        info!("Discovered gateway: {} (version {})", gateway.endpoint, gateway.version);
-
-        // Connect and login
-        let rpc = connect_and_login_native(&gateway, username, password).await?;
+        // Discover, connect, and login with retry.
+        let (rpc, version) = connect_with_retry(&client, server, username, password).await?;
+        let mut current_version =
+            if self.version.is_empty() { version } else { self.version.clone() };
+        info!("Connected to {} server (version {})", server, current_version);
 
         // Set up progress bar
-        let pb = ProgressBar::new(uuids.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
-                .progress_chars("#>-"),
-        );
+        let pb = crate::util::progress_bar(uuids.len() as u64)?;
 
         let mut success = 0;
         let mut failed = 0;
         let mut processed_since_restart = 0;
         let mut current_rpc = rpc;
-        let mut current_gateway = gateway;
+        let mut version_retries = 0u32;
 
         for uuid in uuids {
             // Check if we need to restart connection
             if self.restart_every > 0 && processed_since_restart >= self.restart_every {
                 info!("Restarting connection after {} records", processed_since_restart);
                 let _ = current_rpc.close().await;
-                current_rpc = connect_and_login_native(&current_gateway, username, password).await?;
+                let (new_rpc, new_version) =
+                    connect_with_retry(&client, server, username, password).await?;
+                current_rpc = new_rpc;
+                current_version =
+                    if self.version.is_empty() { new_version } else { self.version.clone() };
                 processed_since_restart = 0;
             }
 
             // Use Database::normalize_uuid for consistent key
             let short_uuid = Database::normalize_uuid(&uuid).to_string();
+            // version.json "X.Y.w" -> login/fetch "web-X.Y" (see gateway.rs).
+            let client_version = format!("web-{}", current_version.replace(".w", ""));
 
-            match current_rpc.fetch_game_record(&uuid, "").await {
+            match current_rpc.fetch_game_record(&uuid, &client_version).await {
                 Ok(data) => {
                     let db_guard = db.lock().await;
                     if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
@@ -131,55 +139,62 @@ impl ParallelDownloader {
                     }
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    warn!("Failed to fetch {}: {}", uuid, err_str);
-
-                    if err_str.contains("151") {
-                        // Error 151 = version mismatch - re-discover gateway
-                        warn!("Version mismatch (error 151), re-discovering gateway");
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-
-                        // Re-discover gateway to get fresh version
-                        let (new_endpoint, new_version, new_route_id) =
-                            discover_gateway_with_retry(&client, server).await?;
-                        current_gateway = GatewayInfo {
-                            endpoint: new_endpoint,
-                            version: new_version,
-                            route_id: new_route_id,
-                        };
-                        info!("Re-discovered gateway version {}", current_gateway.version);
-
-                        // Reconnect with new gateway info
-                        let _ = current_rpc.close().await;
-                        current_rpc = connect_and_login_native(&current_gateway, username, password).await?;
-                        processed_since_restart = 0;
-
-                        // Retry this UUID
-                        match current_rpc.fetch_game_record(&uuid, "").await {
-                            Ok(data) => {
-                                let db_guard = db.lock().await;
-                                if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
-                                    warn!("Failed to save {}: {}", uuid, e);
+                    warn!("Failed to fetch {}: {}", uuid, e);
+                    match classify_outcome(&e) {
+                        FetchOutcome::Abort(err) => {
+                            pb.finish_with_message("Rate limited");
+                            let _ = current_rpc.close().await;
+                            return Err(err);
+                        }
+                        FetchOutcome::Done => {
+                            if version_retries >= 3 {
+                                pb.finish_with_message("Version mismatch");
+                                let _ = current_rpc.close().await;
+                                anyhow::bail!("Version mismatch persists after 3 gateway rediscoveries");
+                            }
+                            version_retries += 1;
+                            warn!("Version mismatch, re-discovering gateway (retry {})", version_retries);
+                            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                            let _ = current_rpc.close().await;
+                            let (new_rpc, new_version) =
+                                connect_with_retry(&client, server, username, password).await?;
+                            current_rpc = new_rpc;
+                            current_version = if self.version.is_empty() {
+                                new_version
+                            } else {
+                                self.version.clone()
+                            };
+                            info!("Re-discovered gateway version {}", current_version);
+                            processed_since_restart = 0;
+                            let retry_version =
+                                format!("web-{}", current_version.replace(".w", ""));
+                            match current_rpc.fetch_game_record(&uuid, &retry_version).await {
+                                Ok(data) => {
+                                    let db_guard = db.lock().await;
+                                    if let Err(e) = db_guard.mark_majsoul_downloaded(&short_uuid, &data) {
+                                        warn!("Failed to save {}: {}", uuid, e);
+                                        failed += 1;
+                                    } else {
+                                        success += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to fetch {} after retry: {}", uuid, e);
+                                    let db_guard = db.lock().await;
+                                    if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
+                                        warn!("Failed to mark error for {}: {}", uuid, db_err);
+                                    }
                                     failed += 1;
-                                } else {
-                                    success += 1;
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to fetch {} after retry: {}", uuid, e);
-                                let db_guard = db.lock().await;
-                                if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
-                                    warn!("Failed to mark error for {}: {}", uuid, db_err);
-                                }
-                                failed += 1;
+                        }
+                        FetchOutcome::MarkAndContinue => {
+                            let db_guard = db.lock().await;
+                            if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
+                                warn!("Failed to mark error for {}: {}", uuid, db_err);
                             }
+                            failed += 1;
                         }
-                    } else {
-                        let db_guard = db.lock().await;
-                        if let Err(db_err) = db_guard.mark_majsoul_download_error(&short_uuid) {
-                            warn!("Failed to mark error for {}: {}", uuid, db_err);
-                        }
-                        failed += 1;
                     }
                 }
             }
@@ -199,41 +214,25 @@ impl ParallelDownloader {
     }
 }
 
-/// Discover gateway with retry logic.
-async fn discover_gateway_with_retry(
+/// Discover, connect, and login with retry.
+///
+/// Thin retry loop around the shared [`discover_and_connect`] single-attempt
+/// helper. The version-mismatch path keeps its own rediscover -> reconnect ->
+/// retry-same-uuid flow around this (the helper alone does not cover the
+/// same-uuid retry).
+async fn connect_with_retry(
     client: &reqwest::Client,
     server: &str,
-) -> Result<(String, String, String)> {
+    username: &str,
+    password: &str,
+) -> Result<(MajsoulRpc, String)> {
     let mut attempts = 0;
     loop {
-        match discover_gateway(client, server).await {
+        match discover_and_connect(client, server, username, password).await {
             Ok(result) => return Ok(result),
             Err(e) if attempts < 3 => {
                 attempts += 1;
-                warn!("Gateway discovery failed (attempt {}): {}", attempts, e);
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Connect to gateway and login with native credentials.
-async fn connect_and_login_native(
-    gateway: &GatewayInfo,
-    username: &str,
-    password: &str,
-) -> Result<MajsoulRpc> {
-    let mut attempts = 0;
-    loop {
-        match MajsoulRpc::connect(&gateway.endpoint).await {
-            Ok(rpc) => {
-                rpc.login_native(username, password, &gateway.version, &gateway.route_id).await?;
-                return Ok(rpc);
-            }
-            Err(e) if attempts < 3 => {
-                attempts += 1;
-                warn!("Connection failed (attempt {}): {}", attempts, e);
+                warn!("Gateway connect failed (attempt {}): {}", attempts, e);
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             Err(e) => return Err(e),
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn test_work_distributor() {
-        let uuids: Vec<String> = (0..10).map(|i| format!("uuid-{}", i)).collect();
+        let uuids: Vec<String> = (0..10).map(|i| format!("uuid-{i}")).collect();
         let chunks = WorkDistributor::chunk_work(uuids, 3);
 
         assert_eq!(chunks.len(), 3);
@@ -258,7 +257,7 @@ mod tests {
         assert_eq!(chunks[2].len(), 3); // 2, 5, 8
 
         // Verify total count
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let total: usize = chunks.iter().map(std::vec::Vec::len).sum();
         assert_eq!(total, 10);
 
         // Verify round-robin assignment
@@ -271,7 +270,7 @@ mod tests {
     #[test]
     fn test_work_distributor_uneven() {
         // Test with fewer items than workers
-        let uuids: Vec<String> = (0..2).map(|i| format!("uuid-{}", i)).collect();
+        let uuids: Vec<String> = (0..2).map(|i| format!("uuid-{i}")).collect();
         let chunks = WorkDistributor::chunk_work(uuids, 5);
 
         assert_eq!(chunks.len(), 5);
@@ -284,7 +283,7 @@ mod tests {
         assert_eq!(chunks[4].len(), 0);
 
         // Verify total count
-        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let total: usize = chunks.iter().map(std::vec::Vec::len).sum();
         assert_eq!(total, 2);
     }
 
@@ -294,7 +293,7 @@ mod tests {
         let chunks = WorkDistributor::chunk_work(uuids, 3);
 
         assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|c| c.is_empty()));
+        assert!(chunks.iter().all(std::vec::Vec::is_empty));
     }
 
     #[test]

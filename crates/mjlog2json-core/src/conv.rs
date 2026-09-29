@@ -27,6 +27,20 @@ pub enum ConvError {
     InvalidRoundFormat,
     #[error("Invalid tile format")]
     InvalidTileFormat,
+    #[error("Empty round slice")]
+    EmptyRoundSlice,
+    #[error("Expected INIT action")]
+    ExpectedInit,
+    #[error("Empty yaku")]
+    EmptyYaku,
+    #[error("Invalid called position: {0}")]
+    InvalidCalledPosition(u8),
+    #[error("Invalid meld direction")]
+    InvalidMeldDirection,
+    #[error("Unexpected action: {0}")]
+    UnexpectedAction(&'static str),
+    #[error("Unexpected end action")]
+    UnexpectedEndAction,
 }
 
 type ConvResult<T> = Result<T, ConvError>;
@@ -125,7 +139,7 @@ fn get_ura_dora(end_action: &Action) -> ConvResult<Vec<Tile>> {
     match end_action {
         Action::AGARI(ActionAGARI { dora_hai_ura, .. }) => dora_hai_ura.iter().map(|x| conv_hai_to_tile(*x, true)).collect(),
         Action::RYUUKYOKU(_) => Ok(vec![]),
-        _ => panic!("unexpected end action"),
+        _ => Err(ConvError::UnexpectedEndAction),
     }
 }
 
@@ -165,10 +179,8 @@ fn conv_rule(settings: &GameSettings) -> ConvResult<Rule> {
 }
 
 fn conv_round_setting(actions: &[Action]) -> ConvResult<RoundSettings> {
-    let start_action = &actions[0];
-    assert!(start_action.is_init());
-
-    let init = start_action.as_init().unwrap();
+    let start_action = actions.first().ok_or(ConvError::EmptyRoundSlice)?;
+    let init = start_action.as_init().ok_or(ConvError::ExpectedInit)?;
     let end_actions: Vec<&Action> = actions.iter().filter(|x| x.is_agari() || x.is_ryuukyoku()).collect();
 
     if end_actions.is_empty() {
@@ -319,7 +331,7 @@ fn conv_agari(v: &ActionAGARI, oya: Player) -> ConvResult<Agari> {
         let num = yaku.iter().fold(0, |sum, YakuPair { level, .. }| sum + level.get_number());
         (yaku, conv_ranked_score_yakuman(v, num, oya))
     } else {
-        panic!("unexpected");
+        return Err(ConvError::EmptyYaku);
     };
 
     Ok(Agari {
@@ -365,7 +377,7 @@ fn conv_round_result_from_ryuukyoku(v: &ActionRYUUKYOKU) -> ConvResult<RoundResu
 }
 
 fn conv_round_result(actions: &[Action]) -> ConvResult<RoundResult> {
-    let init_action = actions[0].as_init().unwrap();
+    let init_action = actions.first().ok_or(ConvError::EmptyRoundSlice)?.as_init().ok_or(ConvError::ExpectedInit)?;
 
     let ryuukyoku_actions: Vec<&ActionRYUUKYOKU> = actions.iter().filter_map(|x| x.as_ryuukyoku()).collect();
     if ryuukyoku_actions.len() == 1 {
@@ -462,7 +474,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
                             0 => combination,
                             1 => (combination.1, combination.0, combination.2),
                             2 => (combination.2, combination.0, combination.1),
-                            _ => panic!("unexpected called position"),
+                            n => return Err(ConvError::InvalidCalledPosition(n)),
                         };
 
                         let incoming_tile = IncomingTile::Chii {
@@ -486,7 +498,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
                                     tenhou_json::model::Direction::Kamicha => (called_tile, tile, tile),
                                     tenhou_json::model::Direction::Toimen => (tile, called_tile, tile),
                                     tenhou_json::model::Direction::Shimocha => (tile, tile, called_tile),
-                                    _ => panic!("unexpected"),
+                                    tenhou_json::model::Direction::SelfSeat => return Err(ConvError::InvalidMeldDirection),
                                 };
                                 incoming.push(IncomingTile::Pon { dir, combination });
                             } else {
@@ -523,7 +535,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
                                     tenhou_json::model::Direction::Kamicha => (called_tile, tile, tile),
                                     tenhou_json::model::Direction::Toimen => (tile, called_tile, tile),
                                     tenhou_json::model::Direction::Shimocha => (tile, tile, called_tile),
-                                    _ => panic!("unexpected"),
+                                    tenhou_json::model::Direction::SelfSeat => return Err(ConvError::InvalidMeldDirection),
                                 };
                                 outgoing.push(OutgoingTile::Kakan { dir, combination, added: added_tile });
                             } else {
@@ -554,7 +566,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
                                     tenhou_json::model::Direction::Kamicha => (called_tile, tile, tile, tile),
                                     tenhou_json::model::Direction::Toimen => (tile, called_tile, tile, tile),
                                     tenhou_json::model::Direction::Shimocha => (tile, tile, tile, called_tile),
-                                    _ => panic!("unexpected"),
+                                    tenhou_json::model::Direction::SelfSeat => return Err(ConvError::InvalidMeldDirection),
                                 };
                                 incoming.push(IncomingTile::Daiminkan { combination, dir });
                             } else {
@@ -577,7 +589,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
                     }
                 }
             }
-            _ => panic!("unexpected"),
+            _ => return Err(ConvError::UnexpectedAction("non-player action in replay")),
         }
     }
 
@@ -590,7 +602,7 @@ fn replay_actions(actions: &[&Action]) -> ConvResult<(Vec<IncomingTile>, Vec<Out
 }
 
 fn conv_round_players(actions: &[Action]) -> ConvResult<Vec<RoundPlayer>> {
-    let init_action = actions[0].as_init().unwrap();
+    let init_action = actions.first().ok_or(ConvError::EmptyRoundSlice)?.as_init().ok_or(ConvError::ExpectedInit)?;
 
     let mut players = vec![];
     for (i, h) in init_action.hai.iter().enumerate() {
@@ -710,4 +722,118 @@ pub fn conv_to_tenhou_json(mjlog: &Mjlog) -> ConvResult<TenhouJson> {
         final_results,
         names: action_un1.names.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shuffle_action() -> Action {
+        Action::SHUFFLE(ActionSHUFFLE {
+            seed: String::new(),
+        })
+    }
+
+    #[test]
+    fn empty_round_slice_is_rejected() {
+        let empty: Vec<Action> = vec![];
+        assert!(matches!(conv_round_setting(&empty).unwrap_err(), ConvError::EmptyRoundSlice));
+        assert!(matches!(conv_round_result(&empty).unwrap_err(), ConvError::EmptyRoundSlice));
+        assert!(matches!(conv_round_players(&empty).unwrap_err(), ConvError::EmptyRoundSlice));
+    }
+
+    #[test]
+    fn non_init_first_action_is_rejected() {
+        let actions = vec![shuffle_action()];
+        assert!(matches!(
+            conv_round_setting(&actions).unwrap_err(),
+            ConvError::ExpectedInit
+        ));
+        assert!(matches!(
+            conv_round_result(&actions).unwrap_err(),
+            ConvError::ExpectedInit
+        ));
+        assert!(matches!(
+            conv_round_players(&actions).unwrap_err(),
+            ConvError::ExpectedInit
+        ));
+    }
+
+    #[test]
+    fn unexpected_end_action_is_rejected() {
+        let action = shuffle_action();
+        assert!(matches!(get_ura_dora(&action).unwrap_err(), ConvError::UnexpectedEndAction));
+    }
+
+    #[test]
+    fn unexpected_replay_action_is_rejected() {
+        let action = shuffle_action();
+        assert!(matches!(
+            replay_actions(&[&action]).unwrap_err(),
+            ConvError::UnexpectedAction(_)
+        ));
+    }
+
+    #[test]
+    fn bad_called_position_is_rejected() {
+        let meld = Meld::Chii {
+            combination: (Hai::new(0), Hai::new(1), Hai::new(2)),
+            called_position: 9,
+        };
+        let action = Action::N(ActionN {
+            who: Player::new(0),
+            m: meld,
+        });
+        assert!(matches!(
+            replay_actions(&[&action]).unwrap_err(),
+            ConvError::InvalidCalledPosition(9)
+        ));
+    }
+
+    #[test]
+    fn self_seat_meld_direction_is_rejected() {
+        // Pon of a red 5 from SelfSeat reaches the direction match.
+        let meld = Meld::Pon {
+            dir: mjlog::model::Direction::SelfSeat,
+            combination: (Hai::new(16), Hai::new(16), Hai::new(16)),
+            called: Hai::new(16),
+            unused: Hai::new(1),
+        };
+        let action = Action::N(ActionN {
+            who: Player::new(0),
+            m: meld,
+        });
+        assert!(matches!(
+            replay_actions(&[&action]).unwrap_err(),
+            ConvError::InvalidMeldDirection
+        ));
+    }
+
+    #[test]
+    fn empty_yaku_is_rejected() {
+        let agari = ActionAGARI {
+            honba: 0,
+            kyoutaku: 0,
+            hai: vec![],
+            m: vec![],
+            machi: Hai::new(0),
+            fu: 30,
+            net_score: 8000,
+            score_rank: mjlog::model::ScoreRank::Mangan,
+            yaku: vec![],
+            yakuman: vec![],
+            dora_hai: vec![],
+            dora_hai_ura: vec![],
+            who: Player::new(0),
+            from_who: Player::new(0),
+            pao_who: None,
+            before_points: vec![25000, 25000, 25000, 25000],
+            delta_points: vec![8000, -8000, 0, 0],
+            owari: None,
+        };
+        assert!(matches!(
+            conv_agari(&agari, Player::new(0)).unwrap_err(),
+            ConvError::EmptyYaku
+        ));
+    }
 }

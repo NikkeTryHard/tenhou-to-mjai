@@ -11,12 +11,14 @@ pub struct AccountToken {
 }
 
 /// A thread-safe pool of account tokens with round-robin selection.
+#[allow(dead_code)] // planned multi-account seam; no production caller yet
 #[derive(Debug)]
 pub struct TokenPool {
     tokens: Vec<AccountToken>,
     index: AtomicUsize,
 }
 
+#[allow(dead_code)] // planned multi-account seam; no production caller yet
 impl TokenPool {
     /// Create a new token pool from a vector of tokens.
     pub fn new(tokens: Vec<AccountToken>) -> Self {
@@ -81,18 +83,18 @@ impl TokenPool {
 
     /// Get the next token using round-robin selection.
     ///
-    /// # Panics
-    /// Panics if the pool is empty.
-    pub fn next(&self) -> AccountToken {
-        assert!(!self.tokens.is_empty(), "TokenPool is empty");
-
+    /// Returns an error when the pool is empty (never panics).
+    pub fn next(&self) -> Result<AccountToken> {
+        if self.tokens.is_empty() {
+            anyhow::bail!("token pool exhausted");
+        }
         let idx = self.index.fetch_add(1, Ordering::Relaxed) % self.tokens.len();
-        self.tokens[idx].clone()
+        Ok(self.tokens[idx].clone())
     }
 
     /// Get the next token using round-robin selection, or None if pool is empty.
     ///
-    /// This is a safe alternative to `next()` that doesn't panic on empty pools.
+    /// This is a safe alternative to `next()` that doesn't fail on empty pools.
     pub fn try_next(&self) -> Option<AccountToken> {
         if self.tokens.is_empty() {
             return None;
@@ -140,17 +142,17 @@ mod tests {
         let pool = TokenPool::new(tokens);
 
         // First round
-        assert_eq!(pool.next().uid, 1);
-        assert_eq!(pool.next().uid, 2);
-        assert_eq!(pool.next().uid, 3);
+        assert_eq!(pool.next().unwrap().uid, 1);
+        assert_eq!(pool.next().unwrap().uid, 2);
+        assert_eq!(pool.next().unwrap().uid, 3);
 
         // Should wrap around
-        assert_eq!(pool.next().uid, 1);
-        assert_eq!(pool.next().uid, 2);
-        assert_eq!(pool.next().uid, 3);
+        assert_eq!(pool.next().unwrap().uid, 1);
+        assert_eq!(pool.next().unwrap().uid, 2);
+        assert_eq!(pool.next().unwrap().uid, 3);
 
         // And continue wrapping
-        assert_eq!(pool.next().uid, 1);
+        assert_eq!(pool.next().unwrap().uid, 1);
     }
 
     #[test]
@@ -169,17 +171,18 @@ mod tests {
         assert_eq!(pool.len(), 3);
         assert!(!pool.is_empty());
 
-        let t1 = pool.next();
+
+        let t1 = pool.next().unwrap();
         assert_eq!(t1.uid, 12345);
         assert_eq!(t1.token, "abc123token");
         assert_eq!(t1.server, "en");
 
-        let t2 = pool.next();
+        let t2 = pool.next().unwrap();
         assert_eq!(t2.uid, 67890);
         assert_eq!(t2.token, "def456token");
         assert_eq!(t2.server, "jp");
 
-        let t3 = pool.next();
+        let t3 = pool.next().unwrap();
         assert_eq!(t3.uid, 11111);
         assert_eq!(t3.token, "ghi789token");
         assert_eq!(t3.server, "en");
@@ -190,6 +193,7 @@ mod tests {
         let pool = TokenPool::new(vec![]);
         assert!(pool.is_empty());
         assert_eq!(pool.len(), 0);
+        assert!(pool.next().is_err());
     }
 
     #[test]

@@ -60,12 +60,12 @@ pub struct TenhouLog {
     /// Points are integers, deltas are floats
     pub sc: Vec<Value>,
 
-    /// Title: [room_name, end_timestamp]
+    /// Title: [`room_name`, `end_timestamp`]
     pub title: Vec<Value>,
 
     /// Game log data - one entry per kyoku (round)
     /// Each kyoku is an array of arrays representing:
-    /// [round_info, scores, dora, ura_dora, hand0, hand1, hand2, hand3,
+    /// [`round_info`, scores, dora, `ura_dora`, hand0, hand1, hand2, hand3,
     ///  draws0, discards0, draws1, discards1, draws2, discards2, draws3, discards3,
     ///  result]
     pub log: Vec<Vec<Value>>,
@@ -77,20 +77,23 @@ pub struct TenhouLog {
 }
 
 impl TenhouLog {
-    /// Create a new empty TenhouLog with default values
+    /// Create a new empty `TenhouLog` with default values
+    /// Exercised by unit tests only; production emits only `error()` until
+    /// real protobuf parsing lands (E1 gate).
+    #[allow(dead_code)]
     pub fn new(ref_uuid: String, num_players: usize) -> Self {
         Self {
             ver: "2.3".to_string(),
             ref_: ref_uuid,
-            ratingc: format!("PF{}", num_players),
+            ratingc: format!("PF{num_players}"),
             rule: TenhouRule::default_4p(),
             lobby: 0,
-            dan: vec!["".to_string(); num_players],
+            dan: vec![String::new(); num_players],
             rate: vec![0; num_players],
             sx: vec!["C".to_string(); num_players],
-            name: vec!["".to_string(); num_players],
+            name: vec![String::new(); num_players],
             sc: vec![Value::from(0); num_players * 2],
-            title: vec![Value::String("".to_string()), Value::from(0)],
+            title: vec![Value::String(String::new()), Value::from(0)],
             log: vec![],
             player_mapping: None,
         }
@@ -115,9 +118,11 @@ pub struct TenhouRule {
 
 impl TenhouRule {
     /// Default rule for 4-player games (1 red 5 of each suit)
+    /// Exercised by unit tests (and `TenhouLog::new`) only; see E1 gate note.
+    #[allow(dead_code)]
     pub fn default_4p() -> Self {
         Self {
-            disp: "".to_string(),
+            disp: String::new(),
             aka53: 1,
             aka52: 1,
             aka51: 1,
@@ -125,9 +130,11 @@ impl TenhouRule {
     }
 
     /// Default rule for 3-player games (no manzu 2-8, 2 red 5p)
+    /// Exercised by unit tests only; see E1 gate note on `TenhouLog::new`.
+    #[allow(dead_code)]
     pub fn default_3p() -> Self {
         Self {
-            disp: "".to_string(),
+            disp: String::new(),
             aka53: 1,
             aka52: 2,
             aka51: 0,
@@ -149,17 +156,20 @@ pub struct TensoulOutput {
     /// Whether an error occurred during conversion
     pub is_error: bool,
 
-    /// Error message if is_error is true
+    /// Error message if `is_error` is true
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_msg: Option<String>,
 
-    /// The converted log if is_error is false
+    /// The converted log if `is_error` is false
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log: Option<TenhouLog>,
 }
 
 impl TensoulOutput {
     /// Create a successful output with the given log
+    /// Exercised by unit tests only; production emits only `error()` until
+    /// real protobuf parsing lands (E1 gate).
+    #[allow(dead_code)]
     pub fn success(log: TenhouLog) -> Self {
         Self {
             is_error: false,
@@ -221,17 +231,17 @@ mod tests {
             ],
             title: vec![
                 Value::String("王座の間南喰".to_string()),
-                Value::from(1700816360),
+                Value::from(1_700_816_360),
             ],
             log: vec![],
             player_mapping: Some(vec![
                 PlayerMapping {
                     nickname: "朔月灰".to_string(),
-                    account_id: 434208,
+                    account_id: 434_208,
                 },
                 PlayerMapping {
                     nickname: "kikou".to_string(),
-                    account_id: 72059462,
+                    account_id: 72_059_462,
                 },
             ]),
         };

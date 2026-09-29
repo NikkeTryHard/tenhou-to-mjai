@@ -5,7 +5,7 @@ use anyhow::Result;
 /// Convert Majsoul tile string (e.g., "5s", "0s", "1z") to MJAI format.
 pub fn tile_str_to_mjai(s: &str) -> Result<String> {
     if s.len() < 2 {
-        anyhow::bail!("Invalid tile string: {}", s);
+        anyhow::bail!("Invalid tile string: {s}");
     }
 
     let chars: Vec<char> = s.chars().collect();
@@ -16,9 +16,9 @@ pub fn tile_str_to_mjai(s: &str) -> Result<String> {
         'm' | 'p' | 's' => {
             if num == '0' {
                 // Red five
-                format!("5{}r", suit)
+                format!("5{suit}r")
             } else {
-                format!("{}{}", num, suit)
+                format!("{num}{suit}")
             }
         }
         'z' => {
@@ -31,16 +31,19 @@ pub fn tile_str_to_mjai(s: &str) -> Result<String> {
                 '5' => "P".to_string(), // Haku (white dragon)
                 '6' => "F".to_string(), // Hatsu (green dragon)
                 '7' => "C".to_string(), // Chun (red dragon)
-                _ => anyhow::bail!("Invalid honor tile: {}", s),
+                _ => anyhow::bail!("Invalid honor tile: {s}"),
             }
         }
-        _ => anyhow::bail!("Invalid suit: {}", suit),
+        _ => anyhow::bail!("Invalid suit: {suit}"),
     };
 
     Ok(result)
 }
 
 /// Convert a list of Majsoul tile strings to MJAI tile strings.
+/// Exercised by unit tests only; production parses tiles one at a time via
+/// `tile_str_to_mjai`, so the dead-code lint is suppressed here.
+#[allow(dead_code)]
 pub fn tiles_to_mjai(tiles: &[String]) -> Result<Vec<String>> {
     tiles.iter().map(|t| tile_str_to_mjai(t)).collect()
 }
@@ -58,7 +61,7 @@ pub fn mjai_to_tile_str(s: &str) -> Result<String> {
         "C" => "7z".to_string(),
         _ => {
             if s.len() < 2 {
-                anyhow::bail!("Invalid MJAI tile: {}", s);
+                anyhow::bail!("Invalid MJAI tile: {s}");
             }
             let chars: Vec<char> = s.chars().collect();
             if s.ends_with('r') && chars.len() == 3 {

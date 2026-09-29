@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -11,28 +10,24 @@ use zip::ZipWriter;
 pub fn package_directory(input: &Path, output: &Path) -> Result<usize> {
     let file = File::create(output).context("Failed to create zip file")?;
     let mut zip = ZipWriter::new(file);
+    // Stored, not Deflated: inputs are already .mjson.gz; recompressing burns CPU for ~zero bytes.
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 
     // Count files first for progress bar
     let files: Vec<_> = WalkDir::new(input)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "gz"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "gz"))
         .collect();
 
     if files.is_empty() {
-        anyhow::bail!("No .mjson.gz files found in {:?}", input);
+        anyhow::bail!("No .mjson.gz files found in {}", input.display());
     }
 
     info!("Packaging {} files into {:?}", files.len(), output);
 
-    let pb = ProgressBar::new(files.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
-            .progress_chars("#>-"),
-    );
+    let pb = crate::util::progress_bar(files.len() as u64)?;
 
     let mut count = 0;
     for entry in files {

@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
+use indicatif::ParallelProgressIterator;
 use rayon::prelude::*;
 use serde_json::{json, Value};
 use std::fs::{self, File};
@@ -17,9 +17,7 @@ use crate::db::Database;
 use super::events::{
     parse_record_action, AnGangAddGangType, ChiPengGangType, GameEvent,
 };
-use super::proto::decode_game_record;
-
-pub use self::convert_raw_files as convert_raw;
+use super::proto::{RecordAction, decode_game_record};
 
 pub struct MajsoulConverter {
     output_dir: PathBuf,
@@ -49,30 +47,26 @@ impl MajsoulConverter {
 
         tracing::info!("Converting {} Majsoul logs in parallel", logs.len());
 
-        let pb = ProgressBar::new(logs.len() as u64);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")?
-                .progress_chars("#>-"),
-        );
+        let pb = crate::util::progress_bar(logs.len() as u64)?;
 
         let success = AtomicUsize::new(0);
         let failed = AtomicUsize::new(0);
 
-        // Collect UUIDs that succeeded for later DB update
-        let successful_uuids: Vec<String> = logs
+        // Collect per-item outcomes; failures are persisted below so corrupt rows
+        // quarantine instead of slowing every batch (same policy as Tenhou convert).
+        let outcomes: Vec<(String, bool)> = logs
             .into_par_iter()
             .progress_with(pb.clone())
-            .filter_map(|(uuid, raw_data)| {
+            .map(|(uuid, raw_data)| {
                 match self.convert_single(&uuid, &raw_data) {
-                    Ok(_) => {
+                    Ok(()) => {
                         success.fetch_add(1, Ordering::Relaxed);
-                        Some(uuid)
+                        (uuid, true)
                     }
                     Err(e) => {
                         warn!("Failed to convert {}: {}", uuid, e);
                         failed.fetch_add(1, Ordering::Relaxed);
-                        None
+                        (uuid, false)
                     }
                 }
             })
@@ -80,10 +74,14 @@ impl MajsoulConverter {
 
         pb.finish_with_message("Done");
 
-        // Mark converted in DB (sequential, but fast)
-        for uuid in &successful_uuids {
-            if let Err(e) = db.mark_majsoul_converted(uuid) {
-                warn!("Failed to mark {} as converted: {}", uuid, e);
+        // Mark outcomes in DB (sequential, but fast)
+        for (uuid, ok) in &outcomes {
+            if *ok {
+                if let Err(e) = db.mark_majsoul_converted(uuid) {
+                    warn!("Failed to mark {} as converted: {}", uuid, e);
+                }
+            } else if let Err(e) = db.mark_majsoul_convert_error(uuid) {
+                warn!("Failed to mark {} convert error: {}", uuid, e);
             }
         }
 
@@ -97,7 +95,11 @@ impl MajsoulConverter {
     fn convert_single(&self, uuid: &str, raw_data: &[u8]) -> Result<()> {
         // Decode the protobuf game record
         let record = decode_game_record(raw_data)
-            .with_context(|| format!("Failed to decode game record: {}", uuid))?;
+            .with_context(|| format!("Failed to decode game record: {uuid}"))?;
+
+        if record.records.is_empty() {
+            anyhow::bail!("No game records found in {uuid}");
+        }
 
         debug!(
             "Decoding {}: {} players, {} records",
@@ -106,25 +108,22 @@ impl MajsoulConverter {
             record.records.len()
         );
 
-        // Parse all record actions into game events
-        let mut events: Vec<GameEvent> = Vec::new();
-        for action in &record.records {
-            if let Some(event) = parse_record_action(&action.name, &action.data)? {
-                events.push(event);
-            }
+        let (events, unknown) = collect_events(&record.records)?;
+        if unknown > 0 {
+            warn!("{}: skipped {} unknown Record actions", uuid, unknown);
         }
 
         // Convert game events to MJAI format
         let mjai_events = self.events_to_mjai(&record.player_names, &events)?;
 
         // Write gzipped MJAI output
-        let output_path = self.output_dir.join(format!("{}.mjson.gz", uuid));
+        let output_path = self.output_dir.join(format!("{uuid}.mjson.gz"));
         let file = File::create(&output_path)?;
         let mut encoder = GzEncoder::new(file, Compression::default());
 
         for event in mjai_events {
             let line = serde_json::to_string(&event)?;
-            writeln!(encoder, "{}", line)?;
+            writeln!(encoder, "{line}")?;
         }
 
         encoder.finish()?;
@@ -132,6 +131,12 @@ impl MajsoulConverter {
     }
 
     /// Convert parsed game events to MJAI JSON events
+    // Length is one match arm per event type (E3-verified emission); splitting
+    // the arms across helpers would churn the exact-MJAI golden fixtures.
+    #[allow(clippy::too_many_lines)]
+    // Method for API symmetry with `convert_single`/`convert_logs` (future
+    // instance config would use `self`); the unused receiver is intentional.
+    #[allow(clippy::unused_self)]
     fn events_to_mjai(
         &self,
         player_names: &[String],
@@ -146,23 +151,29 @@ impl MajsoulConverter {
             "names": player_names,
         }));
 
-        // Track state for reach_accepted
+        // Track state for reach_accepted (only on reacher's next DealTile).
         let mut pending_reach: Option<u32> = None;
-        // Track last discarder for ron target calculation
+        let mut dropped_reach = 0usize;
+        // Last discarder for ron; reset each kyoku. Kakan sets it (chankan).
         let mut last_discarder: Option<u32> = None;
+        let mut oya: u32 = 0;
 
         for event in events {
             match event {
                 GameEvent::NewRound(nr) => {
-                    // Emit reach_accepted if pending from previous round
-                    pending_reach = None;
+                    if pending_reach.take().is_some() {
+                        dropped_reach += 1;
+                    }
+                    last_discarder = None;
+                    oya = nr.ju;
 
-                    // Calculate bakaze (round wind)
+                    // Bakaze: 0->E,1->S,2->W,3->N, else corrupt.
                     let bakaze = match nr.chang {
                         0 => "E",
                         1 => "S",
                         2 => "W",
-                        _ => "N",
+                        3 => "N",
+                        n => anyhow::bail!("Invalid bakaze: {n}"),
                     };
 
                     // Collect tehais (starting hands)
@@ -170,7 +181,7 @@ impl MajsoulConverter {
                         .tiles
                         .iter()
                         .take(num_players)
-                        .map(|t| t.iter().map(|s| s.as_str()).collect())
+                        .map(|t| t.iter().map(std::string::String::as_str).collect())
                         .collect();
 
                     mjai_events.push(json!({
@@ -187,11 +198,12 @@ impl MajsoulConverter {
                 }
 
                 GameEvent::DealTile(dt) => {
-                    // If there was a pending reach, emit reach_accepted
-                    if let Some(actor) = pending_reach.take() {
+                    // reach_accepted only when the reacher draws next.
+                    if pending_reach == Some(dt.seat) {
+                        pending_reach = None;
                         mjai_events.push(json!({
                             "type": "reach_accepted",
-                            "actor": actor,
+                            "actor": dt.seat,
                         }));
                     }
 
@@ -224,24 +236,24 @@ impl MajsoulConverter {
                 }
 
                 GameEvent::ChiPengGang(cpg) => {
-                    // If there was a pending reach, emit reach_accepted
-                    if let Some(actor) = pending_reach.take() {
-                        mjai_events.push(json!({
-                            "type": "reach_accepted",
-                            "actor": actor,
-                        }));
-                    }
+                    let target = cpg
+                        .froms
+                        .first()
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("empty chi/pon tiles"))?;
+                    let pai = cpg
+                        .tiles
+                        .last()
+                        .ok_or_else(|| anyhow::anyhow!("empty chi/pon tiles"))?;
 
-                    // Determine who the call was made from
-                    let target = cpg.froms.first().copied().unwrap_or(0);
-
+                    // saturating: empty tiles already bailed via first/last above, so 0-len here is unreachable; take(0) stays a safe no-op.
                     match cpg.call_type {
                         ChiPengGangType::Chi => {
                             mjai_events.push(json!({
                                 "type": "chi",
                                 "actor": cpg.seat,
                                 "target": target,
-                                "pai": cpg.tiles.last().unwrap_or(&String::new()),
+                                "pai": pai,
                                 "consumed": cpg.tiles.iter().take(cpg.tiles.len().saturating_sub(1)).collect::<Vec<_>>(),
                             }));
                         }
@@ -250,7 +262,7 @@ impl MajsoulConverter {
                                 "type": "pon",
                                 "actor": cpg.seat,
                                 "target": target,
-                                "pai": cpg.tiles.last().unwrap_or(&String::new()),
+                                "pai": pai,
                                 "consumed": cpg.tiles.iter().take(cpg.tiles.len().saturating_sub(1)).collect::<Vec<_>>(),
                             }));
                         }
@@ -259,7 +271,7 @@ impl MajsoulConverter {
                                 "type": "daiminkan",
                                 "actor": cpg.seat,
                                 "target": target,
-                                "pai": cpg.tiles.last().unwrap_or(&String::new()),
+                                "pai": pai,
                                 "consumed": cpg.tiles.iter().take(cpg.tiles.len().saturating_sub(1)).collect::<Vec<_>>(),
                             }));
                         }
@@ -269,7 +281,9 @@ impl MajsoulConverter {
                 GameEvent::AnGangAddGang(ag) => {
                     match ag.gang_type {
                         AnGangAddGangType::Ankan => {
-                            let consumed = generate_ankan_tiles(&ag.tiles);
+                            // Passthrough: record's real tile repeated; 0m/0p/0s
+                            // already map to 5Xr via tile_str_to_mjai.
+                            let consumed = vec![ag.tiles.clone(); 4];
                             mjai_events.push(json!({
                                 "type": "ankan",
                                 "actor": ag.seat,
@@ -277,7 +291,8 @@ impl MajsoulConverter {
                             }));
                         }
                         AnGangAddGangType::Kakan => {
-                            // Kakan: only the added tile, the pon is already on the table
+                            // Chankan needs the kakan actor as discarder.
+                            last_discarder = Some(ag.seat);
                             mjai_events.push(json!({
                                 "type": "kakan",
                                 "actor": ag.seat,
@@ -288,32 +303,40 @@ impl MajsoulConverter {
                 }
 
                 GameEvent::Hule(h) => {
-                    // If there was a pending reach, emit reach_accepted
-                    if let Some(actor) = pending_reach.take() {
-                        mjai_events.push(json!({
-                            "type": "reach_accepted",
-                            "actor": actor,
-                        }));
+                    if pending_reach.take().is_some() {
+                        dropped_reach += 1;
                     }
 
+                    // One hora per winner (double-ron shares the discarder); bail instead of defaulting target to seat 0.
                     for hule in &h.hules {
-                        if hule.zimo {
-                            mjai_events.push(json!({
-                                "type": "hora",
-                                "actor": hule.seat,
-                                "target": hule.seat,
-                                "pai": hule.hu_tile,
-                            }));
+                        let target = if hule.zimo {
+                            hule.seat
                         } else {
-                            // Ron - use the tracked last discarder as target
-                            let target = last_discarder.unwrap_or(0);
-                            mjai_events.push(json!({
-                                "type": "hora",
-                                "actor": hule.seat,
-                                "target": target,
-                                "pai": hule.hu_tile,
-                            }));
-                        }
+                            match last_discarder {
+                                Some(d) => d,
+                                None => anyhow::bail!("ron without preceding discard"),
+                            }
+                        };
+                        // Majsoul splits tsumo income: dealer collects qin x 3, non-dealer collects qin + 2 x xian (oya is the dealer seat).
+                        let points = if hule.zimo {
+                            if hule.seat == oya {
+                                hule.point_zimo_qin * 3
+                            } else {
+                                hule.point_zimo_qin + hule.point_zimo_xian * 2
+                            }
+                        } else {
+                            hule.point_rong
+                        };
+                        mjai_events.push(json!({
+                            "type": "hora",
+                            "actor": hule.seat,
+                            "target": target,
+                            "pai": hule.hu_tile,
+                            "fu": hule.fu,
+                            "points": points,
+                            "deltas": h.delta_scores,
+                            "scores": h.scores,
+                        }));
                     }
 
                     mjai_events.push(json!({
@@ -321,47 +344,38 @@ impl MajsoulConverter {
                     }));
                 }
 
-                GameEvent::NoTile(_nt) => {
-                    // If there was a pending reach, emit reach_accepted
-                    if let Some(actor) = pending_reach.take() {
-                        mjai_events.push(json!({
-                            "type": "reach_accepted",
-                            "actor": actor,
-                        }));
+                // NoTile = exhaustive draw carrying tenpai settlement scores; LiuJu = abortive draw carrying reason only, no scores.
+                GameEvent::NoTile(nt) => {
+                    if pending_reach.take().is_some() {
+                        dropped_reach += 1;
                     }
-
+                    if nt.scores.is_empty() && nt.delta_scores.is_empty() {
+                        anyhow::bail!("NoTile with no scores");
+                    }
                     mjai_events.push(json!({
                         "type": "ryukyoku",
+                        "scores": nt.scores,
+                        "deltas": nt.delta_scores,
                     }));
 
                     mjai_events.push(json!({
                         "type": "end_kyoku",
                     }));
                 }
+
 
                 GameEvent::LiuJu(lj) => {
-                    // If there was a pending reach, emit reach_accepted
-                    if let Some(actor) = pending_reach.take() {
-                        mjai_events.push(json!({
-                            "type": "reach_accepted",
-                            "actor": actor,
-                        }));
+                    if pending_reach.take().is_some() {
+                        dropped_reach += 1;
                     }
-
-                    // Abortive draw with reason
-                    let reason = match lj.liuju_type {
-                        1 => "yao9", // 9 terminals
-                        2 => "reach4", // 4 riichi
-                        3 => "kan4", // 4 kan
-                        4 => "kaze4", // 4 same wind
-                        5 => "ron3", // Triple ron
-                        _ => "unknown",
-                    };
-
-                    mjai_events.push(json!({
-                        "type": "ryukyoku",
-                        "reason": reason,
-                    }));
+                    match lj.liuju_type {
+                        1 => mjai_events.push(json!({"type": "ryukyoku", "reason": "yao9"})),
+                        2 => mjai_events.push(json!({"type": "ryukyoku", "reason": "reach4"})),
+                        3 => mjai_events.push(json!({"type": "ryukyoku", "reason": "kan4"})),
+                        4 => mjai_events.push(json!({"type": "ryukyoku", "reason": "kaze4"})),
+                        5 => mjai_events.push(json!({"type": "ryukyoku", "reason": "ron3"})),
+                        _ => mjai_events.push(json!({"type": "ryukyoku"})),
+                    }
 
                     mjai_events.push(json!({
                         "type": "end_kyoku",
@@ -379,6 +393,12 @@ impl MajsoulConverter {
             }
         }
 
+        if pending_reach.take().is_some() {
+            dropped_reach += 1;
+        }
+        if dropped_reach > 0 {
+            warn!("dropped {} pending reach declarations without acceptance", dropped_reach);
+        }
         // End game event
         mjai_events.push(json!({
             "type": "end_game",
@@ -386,23 +406,6 @@ impl MajsoulConverter {
 
         Ok(mjai_events)
     }
-}
-
-/// Generate 4 tiles for ankan, including one red 5 if applicable
-fn generate_ankan_tiles(tile: &str) -> Vec<String> {
-    // If it's a 5 of a numbered suit, include one red variant
-    if tile.len() >= 2 {
-        let chars: Vec<char> = tile.chars().collect();
-        let num = chars[0];
-        let suit = chars[1];
-
-        if num == '5' && (suit == 'm' || suit == 'p' || suit == 's') {
-            let regular = format!("5{}", suit);
-            let red = format!("5{}r", suit);
-            return vec![red, regular.clone(), regular.clone(), regular];
-        }
-    }
-    vec![tile.to_string(); 4]
 }
 
 /// Convert raw .pb files from a directory to MJAI format (no database needed)
@@ -418,9 +421,9 @@ pub fn convert_raw_files(
 
     // Collect all .pb files
     let pb_files: Vec<PathBuf> = fs::read_dir(input_dir)?
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "pb"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "pb"))
         .collect();
 
     if pb_files.is_empty() {
@@ -433,7 +436,7 @@ pub fn convert_raw_files(
         .into_iter()
         .filter(|p| {
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-            let mjai_path = output_dir.join(format!("{}.mjai.json", stem));
+            let mjai_path = output_dir.join(format!("{stem}.mjai.json"));
             !mjai_path.exists()
         })
         .collect();
@@ -445,12 +448,7 @@ pub fn convert_raw_files(
 
     tracing::info!("Converting {} .pb files to MJAI", pending.len());
 
-    let pb = ProgressBar::new(pending.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) ({eta})")?
-            .progress_chars("#>-"),
-    );
+    let pb = crate::util::progress_bar_with(pending.len() as u64, "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) ({eta})", "#>-")?;
 
     let success = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
@@ -468,10 +466,12 @@ pub fn convert_raw_files(
                 .to_string();
 
             match convert_single_file(&converter, pb_path, output_dir) {
-                Ok(_) => {
+                Ok(()) => {
                     success.fetch_add(1, Ordering::Relaxed);
                     if delete_after {
-                        let _ = fs::remove_file(pb_path);
+                        if let Err(e) = fs::remove_file(pb_path) {
+                            warn!("Failed to remove {}: {}", pb_path.display(), e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -487,6 +487,19 @@ pub fn convert_raw_files(
         success.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
     ))
+}
+
+/// Parse all record actions into game events, counting unknown skips.
+fn collect_events(records: &[RecordAction]) -> Result<(Vec<GameEvent>, usize)> {
+    let mut events = Vec::new();
+    let mut unknown = 0usize;
+    for action in records {
+        match parse_record_action(&action.name, &action.data)? {
+            Some(event) => events.push(event),
+            None => unknown += 1,
+        }
+    }
+    Ok((events, unknown))
 }
 
 /// Convert a single .pb file to MJAI .mjai.json
@@ -509,30 +522,26 @@ fn convert_single_file(
 
     // Decode the protobuf game record
     let record = decode_game_record(&raw_data)
-        .with_context(|| format!("Failed to decode: {}", stem))?;
+        .with_context(|| format!("Failed to decode: {stem}"))?;
 
     if record.records.is_empty() {
-        anyhow::bail!("No game records found in {}", stem);
+        anyhow::bail!("No game records found in {stem}");
     }
 
-    // Parse all record actions into game events
-    let mut events: Vec<GameEvent> = Vec::new();
-    for action in &record.records {
-        if let Some(event) = parse_record_action(&action.name, &action.data)? {
-            events.push(event);
-        }
+    let (events, unknown) = collect_events(&record.records)?;
+    if unknown > 0 {
+        warn!("{}: skipped {} unknown Record actions", stem, unknown);
     }
 
-    // Convert game events to MJAI format
     let mjai_events = converter.events_to_mjai(&record.player_names, &events)?;
 
     // Write plain MJAI output (not gzipped - easier to work with)
-    let output_path = output_dir.join(format!("{}.mjai.json", stem));
+    let output_path = output_dir.join(format!("{stem}.mjai.json"));
     let mut file = File::create(&output_path)?;
 
     for event in mjai_events {
         let line = serde_json::to_string(&event)?;
-        writeln!(file, "{}", line)?;
+        writeln!(file, "{line}")?;
     }
 
     Ok(())
@@ -549,5 +558,167 @@ mod tests {
         assert!(converter.output_dir.exists());
         // Cleanup
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    fn test_names() -> Vec<String> {
+        vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+    }
+
+    fn test_round() -> crate::majsoul::events::NewRound {
+        crate::majsoul::events::NewRound {
+            chang: 0,
+            ju: 0,
+            ben: 0,
+            liqibang: 0,
+            dora_marker: "5m".to_string(),
+            scores: vec![25000, 25000, 25000, 25000],
+            tiles: vec![vec!["1m".to_string(); 13]; 4],
+        }
+    }
+
+    fn converter_for_test() -> MajsoulConverter {
+        let dir = std::env::temp_dir().join("majsoul_golden_test");
+        MajsoulConverter::new(&dir).unwrap()
+    }
+
+    fn assert_no_seat0_fallback(events: &[serde_json::Value]) {
+        // No hora may carry a defaulted target: every hora must have explicit
+        // actor/target/pai, and no ryukyoku may carry reason "unknown".
+        for e in events {
+            if e.get("type").and_then(|v| v.as_str()) == Some("hora") {
+                assert!(e.get("actor").is_some());
+                assert!(e.get("target").is_some());
+                assert!(e.get("pai").is_some());
+            }
+            if let Some(reason) = e.get("reason").and_then(|v| v.as_str()) {
+                assert_ne!(reason, "unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn test_golden_ron() {
+        use crate::majsoul::events::{DiscardTile, GameEvent, Hule, HuleInfo};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::DiscardTile(DiscardTile { seat: 0, tile: "5m".to_string(), is_liqi: false, moqie: false, is_wliqi: false }),
+            GameEvent::Hule(Hule {
+                hules: vec![HuleInfo { seat: 1, zimo: false, hand: vec![], hu_tile: "5m".to_string(), fu: 30, point_rong: 8000, point_zimo_qin: 0, point_zimo_xian: 0 }],
+                delta_scores: vec![-8000, 8000, 0, 0],
+                scores: vec![17000, 33000, 25000, 25000],
+            }),
+        ];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let hora = out.iter().find(|e| e.get("type").and_then(|v| v.as_str()) == Some("hora")).unwrap();
+        assert_eq!(hora.get("actor").and_then(serde_json::Value::as_u64).unwrap(), 1);
+        assert_eq!(hora.get("target").and_then(serde_json::Value::as_u64).unwrap(), 0);
+        assert_eq!(hora.get("fu").and_then(serde_json::Value::as_u64).unwrap(), 30);
+        assert_eq!(hora.get("points").and_then(serde_json::Value::as_i64).unwrap(), 8000);
+        assert_no_seat0_fallback(&out);
+    }
+
+    #[test]
+    fn test_golden_ankan5_passthrough() {
+        use crate::majsoul::events::{AnGangAddGang, AnGangAddGangType, GameEvent};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::AnGangAddGang(AnGangAddGang { seat: 0, gang_type: AnGangAddGangType::Ankan, tiles: "5pr".to_string() }),
+        ];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let ankan = out.iter().find(|e| e.get("type").and_then(|v| v.as_str()) == Some("ankan")).unwrap();
+        let consumed = ankan.get("consumed").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(consumed.len(), 4);
+        // Passthrough only: all four equal the record tile, no red injection.
+        for t in consumed {
+            assert_eq!(t.as_str().unwrap(), "5pr");
+        }
+    }
+
+    #[test]
+    fn test_golden_double_ron_split_targets() {
+        use crate::majsoul::events::{DiscardTile, GameEvent, Hule, HuleInfo};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::DiscardTile(DiscardTile { seat: 2, tile: "3s".to_string(), is_liqi: false, moqie: false, is_wliqi: false }),
+            GameEvent::Hule(Hule {
+                hules: vec![
+                    HuleInfo { seat: 0, zimo: false, hand: vec![], hu_tile: "3s".to_string(), fu: 30, point_rong: 4000, point_zimo_qin: 0, point_zimo_xian: 0 },
+                    HuleInfo { seat: 1, zimo: false, hand: vec![], hu_tile: "3s".to_string(), fu: 40, point_rong: 4000, point_zimo_qin: 0, point_zimo_xian: 0 },
+                ],
+                delta_scores: vec![4000, 4000, -8000, 0],
+                scores: vec![29000, 29000, 17000, 25000],
+            }),
+        ];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let horas: Vec<_> = out.iter().filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("hora")).collect();
+        assert_eq!(horas.len(), 2);
+        // Per-winner targets (both the discarder here, computed per winner).
+        assert_eq!(horas[0].get("target").and_then(serde_json::Value::as_u64).unwrap(), 2);
+        assert_eq!(horas[1].get("target").and_then(serde_json::Value::as_u64).unwrap(), 2);
+        assert_eq!(horas[0].get("fu").and_then(serde_json::Value::as_u64).unwrap(), 30);
+        assert_eq!(horas[1].get("fu").and_then(serde_json::Value::as_u64).unwrap(), 40);
+        assert_no_seat0_fallback(&out);
+    }
+
+    #[test]
+    fn test_golden_scored_ryukyoku() {
+        use crate::majsoul::events::{GameEvent, NoTile};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::NoTile(NoTile { scores: vec![26000, 24000, 25000, 25000], delta_scores: vec![1000, -1000, 0, 0] }),
+        ];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let ryu = out.iter().find(|e| e.get("type").and_then(|v| v.as_str()) == Some("ryukyoku")).unwrap();
+        assert_eq!(ryu.get("scores").and_then(|v| v.as_array()).unwrap().len(), 4);
+        assert!(ryu.get("deltas").and_then(|v| v.as_array()).unwrap().iter().any(|v| v.as_i64().unwrap() != 0));
+    }
+
+    #[test]
+    fn test_golden_chankan_uses_kakan_actor() {
+        use crate::majsoul::events::{AnGangAddGang, AnGangAddGangType, DiscardTile, GameEvent, Hule, HuleInfo};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::DiscardTile(DiscardTile { seat: 1, tile: "2m".to_string(), is_liqi: false, moqie: false, is_wliqi: false }),
+            GameEvent::AnGangAddGang(AnGangAddGang { seat: 2, gang_type: AnGangAddGangType::Kakan, tiles: "3m".to_string() }),
+            GameEvent::Hule(Hule {
+                hules: vec![HuleInfo { seat: 0, zimo: false, hand: vec![], hu_tile: "3m".to_string(), fu: 30, point_rong: 8000, point_zimo_qin: 0, point_zimo_xian: 0 }],
+                delta_scores: vec![8000, 0, -8000, 0],
+                scores: vec![33000, 25000, 17000, 25000],
+            }),
+        ];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let hora = out.iter().find(|e| e.get("type").and_then(|v| v.as_str()) == Some("hora")).unwrap();
+        // Chankan target is the kakan actor (2), not the earlier discarder (1).
+        assert_eq!(hora.get("target").and_then(serde_json::Value::as_u64).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_ron_without_discard_bails() {
+        use crate::majsoul::events::{GameEvent, Hule, HuleInfo};
+        let c = converter_for_test();
+        let events = vec![
+            GameEvent::NewRound(test_round()),
+            GameEvent::Hule(Hule {
+                hules: vec![HuleInfo { seat: 1, zimo: false, hand: vec![], hu_tile: "5m".to_string(), fu: 30, point_rong: 8000, point_zimo_qin: 0, point_zimo_xian: 0 }],
+                delta_scores: vec![],
+                scores: vec![],
+            }),
+        ];
+        assert!(c.events_to_mjai(&test_names(), &events).is_err());
+    }
+
+    #[test]
+    fn test_liuju_unknown_has_no_reason_key() {
+        use crate::majsoul::events::{GameEvent, LiuJu};
+        let c = converter_for_test();
+        let events = vec![GameEvent::NewRound(test_round()), GameEvent::LiuJu(LiuJu { liuju_type: 99 })];
+        let out = c.events_to_mjai(&test_names(), &events).unwrap();
+        let ryu = out.iter().find(|e| e.get("type").and_then(|v| v.as_str()) == Some("ryukyoku")).unwrap();
+        assert!(ryu.get("reason").is_none());
     }
 }

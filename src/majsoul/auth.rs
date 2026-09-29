@@ -2,13 +2,14 @@
 //!
 //! CN server uses native login with HMAC-SHA256 password hashing.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Hash password using HMAC-SHA256 with key "lailai" (Majsoul CN auth)
 pub fn hash_password(password: &str) -> String {
+    // "lailai" is the CN client's hardcoded HMAC salt (reverse-engineered, not a placeholder); changing it breaks login.
     let mut mac =
         HmacSha256::new_from_slice(b"lailai").expect("HMAC can take key of any size");
     mac.update(password.as_bytes());

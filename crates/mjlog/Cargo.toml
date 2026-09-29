@@ -8,10 +8,10 @@ documentation = "https://docs.rs/mjlog"
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-num-derive = "0.4.2"
+num-derive = "0.5"
 num-traits = "0.2.19"
 percent-encoding = "2.3.1"
-quick-xml = "0.37"
+quick-xml = "0.42"
 serde = "1.0.219"
 serde_derive = "1.0.219"
 thiserror = "2.0.11"

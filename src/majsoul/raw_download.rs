@@ -11,54 +11,73 @@
 //! - indicatif progress bar
 
 use anyhow::{Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use std::collections::HashSet;
 use std::io::{BufRead, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::gateway::discover_gateway;
 use super::rpc::MajsoulRpc;
 
-/// Load UUIDs from todo.txt, subtract completed.log, return remaining
+/// Load UUIDs from todo.txt, subtract completed.log, return remaining.
+///
+/// Both files are read via `BufRead::lines()` with trim + nonempty filter,
+/// which fixes CRLF, missing-trailing-newline, and the old O(n^2) `contains`
+/// resume check.
 fn load_remaining_uuids(
     todo_file: &Path,
     completed_file: &Path,
     output_dir: &Path,
     limit: Option<usize>,
 ) -> Result<Vec<String>> {
-    // Load todo list
-    let todo = std::fs::read_to_string(todo_file)
-        .with_context(|| format!("Failed to read {}", todo_file.display()))?;
-    let all_uuids: Vec<String> = todo.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    // Load todo list (trimmed, nonempty).
+    let todo_file_handle =
+        std::fs::File::open(todo_file).with_context(|| format!("Failed to read {}", todo_file.display()))?;
+    let mut all_uuids: Vec<String> = Vec::new();
+    for line in std::io::BufReader::new(todo_file_handle).lines() {
+        match line {
+            Ok(l) => {
+                let l = l.trim().to_string();
+                if !l.is_empty() {
+                    all_uuids.push(l);
+                }
+            }
+            // Skip (not abort on) unreadable lines; same as the old
+            // `filter_map(Result::ok)`, but surfaced instead of silent.
+            Err(e) => warn!("skipping unreadable todo line: {e}"),
+        }
+    }
     info!("Total UUIDs in todo: {}", all_uuids.len());
 
-    // Load completed set
-    let mut done = HashSet::new();
+    // Load completed set (trimmed, nonempty).
+    let mut done: HashSet<String> = HashSet::new();
     if completed_file.exists() {
-        let content = std::fs::read_to_string(completed_file)?;
-        for line in content.split('\n') {
-            let trimmed = line.trim();
-            // Only accept lines that had a proper newline (crash-safe)
-            if !trimmed.is_empty() && content.contains(&format!("{}\n", line)) {
-                done.insert(trimmed.to_string());
+        let handle = std::fs::File::open(completed_file)?;
+        for line in std::io::BufReader::new(handle).lines() {
+            match line {
+                Ok(l) => {
+                    let l = l.trim().to_string();
+                    if !l.is_empty() {
+                        done.insert(l);
+                    }
+                }
+                Err(e) => warn!("skipping unreadable completed line: {e}"),
             }
         }
     }
 
-    // Also scan existing .pb files on disk
+    // Also scan existing .pb files on disk (uuid stems stored verbatim).
     if output_dir.exists() {
         for entry in std::fs::read_dir(output_dir)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.ends_with(".pb") {
-                let uuid = name[..name.len() - 3].replace('_', "-");
-                done.insert(uuid);
+            if let Some(stem) = name.strip_suffix(".pb") {
+                done.insert(stem.to_string());
             }
         }
     }
@@ -75,6 +94,45 @@ fn load_remaining_uuids(
     Ok(remaining)
 }
 
+/// One-time migration: rename legacy `a_b.pb` stems back to `a-b.pb` when the
+/// underscore stem parses as a UUID once underscores become dashes.
+/// Non-UUID-shaped stems are skipped.
+pub fn migrate_underscore_pb_files(output_dir: &Path) -> Result<usize> {
+    let mut renamed = 0usize;
+    if !output_dir.exists() {
+        return Ok(0);
+    }
+    for entry in std::fs::read_dir(output_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        if ext != "pb" {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !stem.contains('_') {
+            continue;
+        }
+        let candidate = stem.replace('_', "-");
+        // Only rename stems matching UUID shape: try parse as UUID-with-dashes.
+        if candidate.parse::<uuid::Uuid>().is_ok() {
+            let dest = path.with_file_name(format!("{candidate}.pb"));
+            if !dest.exists() {
+                std::fs::rename(&path, &dest)?;
+                renamed += 1;
+            }
+        }
+    }
+    if renamed > 0 {
+        info!("Migrated {} underscore .pb files back to dashed UUIDs", renamed);
+    }
+    Ok(renamed)
+}
+
 /// Stats shared between workers
 struct SharedStats {
     success: AtomicU64,
@@ -84,6 +142,9 @@ struct SharedStats {
 }
 
 /// Worker: owns one RPC connection, pulls UUIDs from receiver, writes .pb files
+// 14 args are the spawned worker's config bundle (D7 fan-out); bundling them
+// in a struct would churn the spawn site for no behavior gain.
+#[allow(clippy::too_many_arguments)]
 async fn worker(
     worker_id: usize,
     username: String,
@@ -91,6 +152,7 @@ async fn worker(
     endpoint: String,
     version: String,
     route_id: String,
+    origin: String,
     rx: Arc<Mutex<mpsc::Receiver<String>>>,
     output_dir: PathBuf,
     journal_tx: mpsc::Sender<String>,
@@ -99,8 +161,8 @@ async fn worker(
     error_tx: mpsc::Sender<(String, String)>,
     delay_ms: u64,
 ) {
-    // Connect and login
-    let rpc = match MajsoulRpc::connect(&endpoint).await {
+    // Connect and login (per-server Origin).
+    let rpc = match MajsoulRpc::connect(&endpoint, &origin).await {
         Ok(r) => r,
         Err(e) => {
             debug!("[{}] Connection failed: {}", worker_id, e);
@@ -118,7 +180,8 @@ async fn worker(
 
     stats.logged_in.fetch_add(1, Ordering::Relaxed);
 
-    let client_version = format!("web-{}", version);
+    // version.json "X.Y.w" -> login/fetch "web-X.Y" (see gateway.rs).
+    let client_version = format!("web-{}", version.replace(".w", ""));
 
     // Download loop
     loop {
@@ -127,19 +190,17 @@ async fn worker(
             guard.recv().await
         };
 
-        let uuid = match uuid {
-            Some(u) => u,
-            None => break, // Channel closed, no more work
-        };
+        // Channel closed, no more work.
+        let Some(uuid) = uuid else { break };
 
         match rpc.fetch_game_record(&uuid, &client_version).await {
             Ok(data) => {
-                // Write raw bytes to disk
-                let filename = format!("{}.pb", uuid.replace('-', "_"));
+                // Write {uuid}.pb directly (no dash/underscore mapping).
+                let filename = format!("{uuid}.pb");
                 let filepath = output_dir.join(&filename);
 
                 // Atomic write via temp file
-                let tmp_path = output_dir.join(format!(".tmp_{}", filename));
+                let tmp_path = output_dir.join(format!(".tmp_{filename}"));
                 match std::fs::write(&tmp_path, &data) {
                     Ok(()) => {
                         if let Err(e) = std::fs::rename(&tmp_path, &filepath) {
@@ -181,37 +242,63 @@ async fn worker(
 async fn journal_writer(
     mut rx: mpsc::Receiver<String>,
     completed_file: PathBuf,
-) {
-    let mut file = std::fs::OpenOptions::new()
+) -> Result<()> {
+    let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&completed_file)
-        .expect("Failed to open completed.log");
+    {
+        Ok(f) => f,
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", completed_file.display())),
+    };
 
     while let Some(uuid) = rx.recv().await {
-        let _ = writeln!(file, "{}", uuid);
+        if let Err(e) = writeln!(file, "{uuid}") {
+            warn!("journal write failed: {}", e);
+            return Err(e).context("journal writeln failed");
+        }
         // Line-buffered: flush after each line for crash safety
-        let _ = file.flush();
+        if let Err(e) = file.flush() {
+            warn!("journal flush failed: {}", e);
+            return Err(e).context("journal flush failed");
+        }
     }
+    Ok(())
 }
 
 /// Error logger: receives (uuid, error) pairs and writes to failed.log
 async fn error_logger(
     mut rx: mpsc::Receiver<(String, String)>,
     output_dir: PathBuf,
-) {
-    let mut file = std::fs::OpenOptions::new()
+) -> Result<()> {
+    let failed_path = output_dir.join("failed.log");
+    let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(output_dir.join("failed.log"))
-        .expect("Failed to open failed.log");
+        .open(&failed_path)
+    {
+        Ok(f) => f,
+        Err(e) => return Err(e).with_context(|| format!("Failed to open {}", failed_path.display())),
+    };
 
     while let Some((uuid, error)) = rx.recv().await {
-        let _ = writeln!(file, "{}\t{}", uuid, error);
+        if let Err(e) = writeln!(file, "{uuid}\t{error}") {
+            warn!("error-log write failed: {}", e);
+            return Err(e).context("error-log writeln failed");
+        }
+        if let Err(e) = file.flush() {
+            warn!("error-log flush failed: {}", e);
+            return Err(e).context("error-log flush failed");
+        }
     }
+    Ok(())
 }
 
 /// Main entry point for multi-account raw download
+// Length is worker/journal fan-out plus resume-set handling (D7); splitting
+// would churn the verified resume/error-log wiring. 8 args are the CLI-passed
+// download config; bundling them would churn every caller for no gain.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn raw_download(
     accounts_file: &Path,
     password: &str,
@@ -224,6 +311,8 @@ pub async fn raw_download(
 ) -> Result<(u64, u64)> {
     // Create output directory
     std::fs::create_dir_all(output_dir)?;
+    // One-time migration of legacy underscore stems.
+    let _ = migrate_underscore_pb_files(output_dir)?;
 
     // Load accounts
     let accounts: Vec<String> = {
@@ -249,19 +338,13 @@ pub async fn raw_download(
     }
 
     // Discover gateway (once, shared by all workers)
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
-        .build()?;
+    let client = crate::util::http_client()?;
     let (endpoint, version, route_id) = discover_gateway(&client, server).await?;
+    let origin = super::rpc::origin_for_server(server).to_string();
     info!("Gateway: {} (route: {})", endpoint, route_id);
 
     // Setup progress bar
-    let pb = ProgressBar::new(remaining.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) ETA {eta}")?
-            .progress_chars("=> "),
-    );
+    let pb = crate::util::progress_bar_with(remaining.len() as u64, "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) ETA {eta}", "=> ")?;
 
     // Setup channels
     let (uuid_tx, uuid_rx) = mpsc::channel::<String>(1024);
@@ -293,6 +376,7 @@ pub async fn raw_download(
             endpoint.clone(),
             version.clone(),
             route_id.clone(),
+            origin.clone(),
             Arc::clone(&uuid_rx),
             output_dir.to_path_buf(),
             journal_tx.clone(),
@@ -326,6 +410,12 @@ pub async fn raw_download(
     if logged_in == 0 {
         info!("No accounts connected, aborting");
         pb.finish_with_message("No workers");
+        drop(uuid_tx);
+        for handle in worker_handles {
+            let _ = handle.await;
+        }
+        let _ = journal_handle.await;
+        let _ = error_handle.await;
         return Ok((0, 0));
     }
 

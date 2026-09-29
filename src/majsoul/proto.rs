@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use std::io::Read;
 
-/// Decode a varint from buffer, return (value, bytes_consumed)
+/// Decode a varint from buffer, return (value, `bytes_consumed`)
 pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift = 0;
@@ -15,7 +15,7 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
         }
         let byte = buf[pos];
         pos += 1;
-        value |= ((byte & 0x7f) as u64) << shift;
+        value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             break;
         }
@@ -25,6 +25,25 @@ pub fn decode_varint(buf: &[u8]) -> Result<(u64, usize)> {
         }
     }
     Ok((value, pos))
+}
+
+/// Checked `u64` → `u32` for hostile wire values (field numbers, versions,
+/// seats); out-of-range values bail instead of truncating.
+pub fn u32_checked(v: u64, what: &'static str) -> Result<u32> {
+    u32::try_from(v).map_err(|_| anyhow::anyhow!("{what} out of range: {v}"))
+}
+
+/// Checked `u64` → `usize` for wire lengths; out-of-range bails (the
+/// bounds check after each site stays the real guard on 64-bit).
+fn usize_checked(v: u64) -> Result<usize> {
+    usize::try_from(v).map_err(|_| anyhow::anyhow!("length out of range: {v}"))
+}
+
+/// Decode a protobuf `int32` varint. Negatives arrive sign-extended to 64
+/// bits, so low-32-bit reinterpretation is the decode, not a lossy cast.
+#[allow(clippy::cast_possible_truncation)]
+pub fn i32_from_varint(v: u64) -> i32 {
+    v as i32
 }
 
 /// Parse a protobuf message, extracting fields by number
@@ -61,7 +80,10 @@ impl<'a> Iterator for FieldIterator<'a> {
         };
         self.pos += tag_len;
 
-        let field_number = (tag >> 3) as u32;
+        let field_number = match u32_checked(tag >> 3, "field number") {
+            Ok(n) => n,
+            Err(e) => return Some(Err(e)),
+        };
         let wire_type = (tag & 0x07) as u8;
 
         let data_start = self.pos;
@@ -89,7 +111,11 @@ impl<'a> Iterator for FieldIterator<'a> {
                 match decode_varint(&self.buf[self.pos..]) {
                     Ok((len, n)) => {
                         self.pos += n;
-                        let end = self.pos + len as usize;
+                        let len = match usize_checked(len) {
+                            Ok(len) => len,
+                            Err(e) => return Some(Err(e)),
+                        };
+                        let end = self.pos + len;
                         if end > self.buf.len() {
                             return Some(Err(anyhow::anyhow!("Buffer overflow in length-delimited")));
                         }
@@ -109,7 +135,7 @@ impl<'a> Iterator for FieldIterator<'a> {
                 &self.buf[data_start..self.pos]
             }
             _ => {
-                return Some(Err(anyhow::anyhow!("Unknown wire type: {}", wire_type)));
+                return Some(Err(anyhow::anyhow!("Unknown wire type: {wire_type}")));
             }
         };
 
@@ -138,7 +164,7 @@ pub fn decode_packed_varints(data: &[u8]) -> Result<Vec<i32>> {
     let mut pos = 0;
     while pos < data.len() {
         let (val, n) = decode_varint(&data[pos..])?;
-        result.push(val as i32);
+        result.push(i32_from_varint(val));
         pos += n;
     }
     Ok(result)
@@ -168,21 +194,26 @@ pub struct RecordAction {
     pub data: Vec<u8>,
 }
 
-/// Decoded ResGameRecord
+/// Decoded `ResGameRecord`
 #[derive(Debug)]
 pub struct GameRecord {
-    pub uuid: String,
-    pub start_time: u32,
+    // Decoded for identity/debugging but never read downstream (callers use
+    // `player_names`/`records`); underscore-prefixed until wired.
+    pub _uuid: String,
+    // u64 preserves the full wire-varint range; values fit Unix seconds so the DB boundary `as i64` cast is lossless.
+    /// Unix seconds (DB boundary converts `as i64`).
+    pub _start_time: u64,
     pub player_names: Vec<String>,
     pub records: Vec<RecordAction>,
 }
 
-/// Decode ResGameRecord from raw protobuf bytes
+/// Decode `ResGameRecord` from raw protobuf bytes
 pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
     let mut uuid = String::new();
-    let mut start_time = 0u32;
+    let mut start_time = 0u64;
     let mut player_names = Vec::new();
     let mut compressed_data: Option<Vec<u8>> = None;
+    let mut data_url: Option<String> = None;
 
     for field in FieldIterator::new(raw) {
         let field = field?;
@@ -195,7 +226,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                         if inner.number == 1 && inner.wire_type == 0 {
                             let code = extract_varint(inner.data)?;
                             if code != 0 {
-                                anyhow::bail!("Game record error code: {}", code);
+                                anyhow::bail!("Game record error code: {code}");
                             }
                         }
                     }
@@ -207,7 +238,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                     let inner = inner?;
                     match inner.number {
                         1 if inner.wire_type == 2 => uuid = extract_string(inner.data),
-                        2 if inner.wire_type == 0 => start_time = extract_varint(inner.data)? as u32,
+                        2 if inner.wire_type == 0 => start_time = extract_varint(inner.data)?,
                         11 if inner.wire_type == 2 => {
                             // accounts (repeated PlayerAccount) - extract nickname (field 3)
                             for acct_field in FieldIterator::new(inner.data) {
@@ -226,8 +257,7 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
                 compressed_data = Some(field.data.to_vec());
             }
             5 if field.wire_type == 2 => {
-                // data_url (string) - alternative way to get data
-                // We skip this for now, as we expect inline data
+                data_url = Some(extract_string(field.data));
             }
             _ => {}
         }
@@ -250,13 +280,13 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
             let field = field?;
             match (field.number, field.wire_type) {
                 (1, 2) => raw_records.push(field.data.to_vec()),
-                (2, 0) => version = extract_varint(field.data)? as u32,
+                (2, 0) => version = u32_checked(extract_varint(field.data)?, "version")?,
                 (3, 2) => actions_data.push(field.data.to_vec()),
                 _ => {}
             }
         }
 
-        if version < 210715 && !raw_records.is_empty() {
+        if version < 210_715 && !raw_records.is_empty() {
             // Old format: each record is a Wrapper (or gzipped Wrapper list)
             decode_old_format_records(&raw_records)?
         } else if !actions_data.is_empty() {
@@ -265,25 +295,38 @@ pub fn decode_game_record(raw: &[u8]) -> Result<GameRecord> {
         } else {
             Vec::new()
         }
+    } else if let Some(url) = data_url {
+        anyhow::bail!("game record {uuid} has no inline data; data_url fallback not implemented: {url}");
     } else {
         Vec::new()
     };
-
     Ok(GameRecord {
-        uuid,
-        start_time,
+        _uuid: uuid,
+        _start_time: start_time,
         player_names,
         records,
     })
 }
 
-/// Decode old-format GameDetailRecords (version < 210715)
-/// Each record in the list is a serialized Wrapper message
+/// Decode old-format `GameDetailRecords` (version < 210715)
+/// Each record in the list is a serialized Wrapper message, possibly gzipped
+/// (magic `1f 8b` raws are gunzipped first via the shared gzip path).
 fn decode_old_format_records(raw_records: &[Vec<u8>]) -> Result<Vec<RecordAction>> {
     let mut records = Vec::new();
     for raw in raw_records {
+        // Gunzip `1f 8b` raws (wires the old gzip helper into this path).
+        let buf: Vec<u8> = if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+            let mut decoder = GzDecoder::new(&raw[..]);
+            let mut decompressed = Vec::new();
+            decoder
+                .read_to_end(&mut decompressed)
+                .context("Failed to decompress game records")?;
+            decompressed
+        } else {
+            raw.clone()
+        };
         // Each record bytes is a Wrapper {name: string, data: bytes}
-        let (name, data) = decode_wrapper(raw)?;
+        let (name, data) = decode_wrapper(&buf)?;
         if !name.is_empty() {
             records.push(RecordAction { name, data });
         }
@@ -291,8 +334,8 @@ fn decode_old_format_records(raw_records: &[Vec<u8>]) -> Result<Vec<RecordAction
     Ok(records)
 }
 
-/// Decode new-format GameDetailRecords (version >= 210715)
-/// Each action is a GameAction message with `result` field containing a Wrapper
+/// Decode new-format `GameDetailRecords` (version >= 210715)
+/// Each action is a `GameAction` message with `result` field containing a Wrapper
 fn decode_new_format_actions(actions_data: &[Vec<u8>]) -> Result<Vec<RecordAction>> {
     let mut records = Vec::new();
     for action_bytes in actions_data {
@@ -317,38 +360,15 @@ fn decode_new_format_actions(actions_data: &[Vec<u8>]) -> Result<Vec<RecordActio
     Ok(records)
 }
 
-/// Decode GameDetailRecords (may be gzipped or raw protobuf)
+/// Decode a fetchGameRecordList-style response into
+/// `(uuid, player_id, start_time, mode)` rows.
 ///
-/// Data from the database is typically gzipped, but raw RPC responses
-/// (saved as .pb files) contain uncompressed protobuf.
-fn decode_game_detail_records(data: &[u8]) -> Result<Vec<RecordAction>> {
-    // Try raw protobuf first (check for gzip magic bytes 1f 8b)
-    let buf = if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
-        // Gzipped — decompress
-        let mut decoder = GzDecoder::new(data);
-        let mut decompressed = Vec::new();
-        decoder
-            .read_to_end(&mut decompressed)
-            .context("Failed to decompress game records")?;
-        decompressed
-    } else {
-        // Already raw protobuf
-        data.to_vec()
-    };
-
-    let mut records = Vec::new();
-
-    // Parse the protobuf — GameDetailRecords has field 1 (repeated Wrapper)
-    for field in FieldIterator::new(&buf) {
-        let field = field?;
-        if field.number == 1 && field.wire_type == 2 {
-            // Each record is a Wrapper message
-            let (name, data) = decode_wrapper(field.data)?;
-            records.push(RecordAction { name, data });
-        }
-    }
-
-    Ok(records)
+/// The exact wire schema for the list endpoint is not yet captured from live
+/// traffic; this stub bails loudly rather than inventing field numbers.
+/// Callers (fetch-public) wire inserts behind it so real parsing flows once
+/// the schema lands.
+pub fn decode_game_record_list(_raw: &[u8]) -> Result<Vec<(String, i64, i64, i32)>> {
+    anyhow::bail!("fetchGameRecordList decoding not implemented: needs live response capture");
 }
 
 #[cfg(test)]
@@ -372,5 +392,71 @@ mod tests {
         let (name, data) = decode_wrapper(&buf).unwrap();
         assert_eq!(name, "test");
         assert_eq!(data, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_decode_packed_varints_negative_int32() {
+        // Protobuf `int32` negatives arrive sign-extended to 64 bits; the
+        // decoder must reinterpret the low 32 bits (checked `try_from`
+        // would wrongly reject them).
+        let neg1000 = 0u64.wrapping_sub(1000);
+        let mut buf = Vec::new();
+        let mut v = neg1000;
+        loop {
+            let mut b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v != 0 {
+                b |= 0x80;
+            }
+            buf.push(b);
+            if v == 0 {
+                break;
+            }
+        }
+        assert_eq!(buf.len(), 10, "negative int32 must be 10-byte varint");
+        assert_eq!(decode_packed_varints(&buf).unwrap(), vec![-1000]);
+        assert_eq!(i32_from_varint(neg1000), -1000);
+    }
+
+    #[test]
+    fn test_decode_packed_varints_nonzero() {
+        // Packed deltas: e.g. [1000, -1000] as varints in one length-delimited blob.
+        // Build via encode: use decode_varint round-trip through FieldIterator path.
+        // Here we test decode_packed_varints directly with known bytes:
+        // 1000 => E8 07, 1 => 01.
+        let packed = vec![0xE8, 0x07, 0x01];
+        let v = decode_packed_varints(&packed).unwrap();
+        assert_eq!(v, vec![1000, 1]);
+        assert!(v.iter().any(|&x| x != 0));
+    }
+
+    #[test]
+    fn test_data_url_only_bails_loudly() {
+        fn push_ld(buf: &mut Vec<u8>, bytes: &[u8]) {
+            let mut n = bytes.len() as u64;
+            loop {
+                let mut b = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    b |= 0x80;
+                }
+                buf.push(b);
+                if n == 0 {
+                    break;
+                }
+            }
+            buf.extend_from_slice(bytes);
+        }
+        let uuid = "test-uuid-123";
+        let url = "https://example.com/data.gz";
+        let mut head = vec![0x0a];
+        push_ld(&mut head, uuid.as_bytes());
+        let mut raw = vec![0x1a];
+        push_ld(&mut raw, &head);
+        raw.push(0x2a);
+        push_ld(&mut raw, url.as_bytes());
+        let err = decode_game_record(&raw).unwrap_err().to_string();
+        assert!(err.contains(uuid), "missing uuid in: {err}");
+        assert!(err.contains(url), "missing url in: {err}");
     }
 }
