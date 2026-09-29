@@ -6,7 +6,7 @@ This repository provides tools and datasets for converting **Tenhou mahjong game
 It also includes preprocessed yearly Tenhou datasets for AI research, data analysis, and mahjong strategy modeling.
 
 > [!NOTE]
-> ## Dataset Torrent (all years, pick files in your client)
+> Dataset Torrent (all years, pick files in your client)
 > Binaries live on P2P, not GitHub Releases.
 >
 > ```text
@@ -14,6 +14,20 @@ It also includes preprocessed yearly Tenhou datasets for AI research, data analy
 > ```
 >
 > Trackers: opentrackr, stealth, torrent.eu, demonii, qu.ax — DHT/PeX on, selective download supported.
+>
+> ### Stay current (one-time, 30 seconds)
+>
+> Trackers die and rotate, so don't rely on the 5 baked into the magnet. In qBittorrent: Options → BitTorrent → check Automatically append trackers from URL to new downloads, paste this URL below it, hit Save:
+>
+> ```text
+> https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt
+> ```
+>
+> This only applies to newly added torrents (it won't rewrite this one's list — that's fine, the 5 above plus DHT already find the swarm). Keep DHT + PeX enabled and you're set forever with zero maintenance.
+>
+> ### Anti-leech note
+>
+> The seed runs PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
 
 ---
 
