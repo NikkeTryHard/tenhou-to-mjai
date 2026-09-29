@@ -24,9 +24,8 @@ It also includes preprocessed yearly Tenhou datasets for AI research, data analy
 > ```
 >
 > This only applies to newly added torrents (it won't rewrite this one's list — that's fine, the 5 above plus DHT already find the swarm). Keep DHT + PeX enabled and you're set forever with zero maintenance.
->
-> ### Anti-leech note
->
+
+> [!CAUTION]
 > The seed runs PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
 
 ---
