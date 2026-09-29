@@ -8,6 +8,9 @@ It also includes preprocessed yearly Tenhou datasets for AI research, data analy
 > [!NOTE]
 > Dataset Torrent (all years, pick files in your client)
 > Binaries live on P2P, not GitHub Releases.
+> HTTP mirror (same files): https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
+>
+> Grabbed from HuggingFace? Please also seed the torrent — HF can take datasets down, the swarm keeps it alive.
 >
 > ```text
 > magnet:?xt=urn:btih:a7256a6a069f75c78da3426295bbfd2c46eb1f25&xt=urn:btmh:12209378f66853cb311836615da4d1bf5d850f7bd8455e7b6838e57f2511260cf2e6&dn=tenhou-to-mjai&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.qu.ax:6969/announce
