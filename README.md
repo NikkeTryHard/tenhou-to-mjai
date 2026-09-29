@@ -1,4 +1,4 @@
-![Total Downloads](https://img.shields.io/github/downloads/NikkeTryHard/tenhou-to-mjai/total?label=Total%20Downloads&color=success)
+![Total Downloads](https://img.shields.io/github/downloads/NikkeTryHard/tenhou-to-mjai/total?label=Total%20Downloads&color=success) [![Dataset on HF](https://img.shields.io/badge/%F0%9F%A4%97_Dataset_on_HF-yellow)](https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai) [![qBittorrent](https://img.shields.io/badge/qBittorrent-torrent-2F67BA?logo=qbittorrent&logoColor=white)](magnet:?xt=urn:btih:a7256a6a069f75c78da3426295bbfd2c46eb1f25&xt=urn:btmh:12209378f66853cb311836615da4d1bf5d850f7bd8455e7b6838e57f2511260cf2e6&dn=tenhou-to-mjai&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.qu.ax:6969/announce)
 
 # Tenhou to MJAI
 
@@ -6,11 +6,8 @@ This repository provides tools and datasets for converting **Tenhou mahjong game
 It also includes preprocessed yearly Tenhou datasets for AI research, data analysis, and mahjong strategy modeling.
 
 > [!NOTE]
-> Dataset Torrent (all years, pick files in your client)
-> Binaries live on P2P, not GitHub Releases.
-> HTTP mirror (same files): https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
->
-> Grabbed from HuggingFace? Please also seed the torrent — HF can take datasets down, the swarm keeps it alive.
+> ## Dataset Torrent
+> All years, pick files in your client. Binaries live on P2P, not GitHub Releases.
 >
 > ```text
 > magnet:?xt=urn:btih:a7256a6a069f75c78da3426295bbfd2c46eb1f25&xt=urn:btmh:12209378f66853cb311836615da4d1bf5d850f7bd8455e7b6838e57f2511260cf2e6&dn=tenhou-to-mjai&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.qu.ax:6969/announce
@@ -28,7 +25,14 @@ It also includes preprocessed yearly Tenhou datasets for AI research, data analy
 >
 > This only applies to newly added torrents (it won't rewrite this one's list — that's fine, the 5 above plus DHT already find the swarm). Keep DHT + PeX enabled and you're set forever with zero maintenance.
 
+> [!NOTE]
+> ## HuggingFace Mirror
+> Same files over HTTP: https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
+>
+> Grabbed from HuggingFace? Please also seed the torrent — HF can take datasets down, the swarm keeps it alive.
+
 > [!CAUTION]
+> ## Anti-Leech
 > The seed runs PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
 
 ---
