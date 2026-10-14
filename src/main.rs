@@ -7,7 +7,7 @@ mod majsoul;
 mod package;
 mod util;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -19,6 +19,19 @@ fn parse_nonzero_usize(s: &str) -> Result<usize, String> {
         Err("must be at least 1".to_string())
     } else {
         Ok(v)
+    }
+}
+
+/// Fixed default: `--workers 0` (or omitted where default 0) means a steady 40.
+/// Core-count autoscaling was removed: it made throughput unpredictable across
+/// machines and restarts, and 64-wide trials underperformed this setting.
+/// Pass an explicit `--workers N` to override.
+fn auto_workers(requested: usize) -> usize {
+    const FIXED: usize = 40;
+    if requested > 0 {
+        requested
+    } else {
+        FIXED
     }
 }
 
@@ -261,7 +274,7 @@ enum Commands {
     },
     /// Mahjong Soul (Majsoul) operations
     #[command(subcommand)]
-    Majsoul(MajsoulCommands),
+    Majsoul(Box<MajsoulCommands>),
 }
 #[derive(Subcommand, Clone)]
 enum MajsoulCommands {
@@ -511,10 +524,9 @@ enum MajsoulCommands {
         #[arg(long, default_value = "completed.log")]
         completed: PathBuf,
         /// Output directory for .pb files
-        #[arg(short, long, default_value = "jade-raw")]
+        #[arg(short, long, default_value = "majsoul-raw")]
         output: PathBuf,
-        /// Server region (defaults to cn: raw downloads target the CN Jade room)
-        // Raw-download accounts and Jade-room history live on the CN gateway; other commands default to EN where the login accounts were created.
+        /// Server region used for native-auth raw downloads.
         #[arg(long, value_enum, default_value_t = Server::Cn)]
         server: Server,
         /// Maximum games to download
@@ -527,11 +539,14 @@ enum MajsoulCommands {
     /// Convert raw .pb files to MJAI format (no database needed)
     ConvertRaw {
         /// Input directory containing .pb files
-        #[arg(short, long, default_value = "jade-raw")]
+        #[arg(short, long, default_value = "majsoul-raw")]
         input: PathBuf,
         /// Output directory for .mjai.json files
-        #[arg(short, long, default_value = "jade-mjai")]
+        #[arg(short, long, default_value = "majsoul-mjai")]
         output: PathBuf,
+        /// Integrity audit SQLite index supplying saved game-time ranks.
+        #[arg(long)]
+        rank_index: Option<PathBuf>,
         /// Delete .pb files after successful conversion
         #[arg(long, action = clap::ArgAction::SetTrue)]
         delete: bool,
@@ -560,13 +575,230 @@ enum MajsoulCommands {
         #[arg(long, default_value = "200")]
         delay_ms: u64,
     },
+    /// Hourly-window uuid harvest (Throne-new + Jade-all): 24x1h JST slices per day,
+    /// browser-solved CAP tokens via CDP, SQLite resume. Ported from `pool_harvest.py`.
+    Harvest {
+        /// Start date (YYYYMMDD)
+        #[arg(long)]
+        start: String,
+        /// End date (YYYYMMDD), defaults to today
+        #[arg(long)]
+        end: Option<String>,
+        /// Room modes to harvest (16=Throne, 12=Jade). Repeat flag or comma list.
+        #[arg(long, default_value = "16,12")]
+        modes: String,
+        /// Concurrent hour workers (0=fixed 40, explicit N overrides).
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
+        /// `Chrome DevTools` URL for CAP solves (e.g. <http://127.0.0.1:9222>)
+        #[arg(long, default_value = "http://127.0.0.1:9222")]
+        cdp_url: String,
+        /// Output JSONL journal (uuid + provenance stamps per line)
+        #[arg(long, default_value = "harvest.jsonl")]
+        journal: PathBuf,
+        /// SQLite state file (seen/done/parked)
+        #[arg(long, default_value = "harvest.db")]
+        state: PathBuf,
+        /// Banked pool.json tokens to preload
+        #[arg(long)]
+        pool_file: Option<PathBuf>,
+        /// Legacy JSONL journals to seed seen-set from (repeatable)
+        #[arg(long)]
+        seed: Vec<PathBuf>,
+        /// Extra door proxies for fetches (repeatable). Spreads per-IP budget.
+        #[arg(long)]
+        doors: Vec<String>,
+    },
+    /// Bulk short->paipu resolution via Koromo `view_game` (unauthenticated 301s).
+    /// Reads a uuid journal, writes `{uuid, paipu, day, mode}` JSONL. Resumable.
+    BulkResolve {
+        /// Input journal (short uuids + `players[].accountId`)
+        #[arg(long)]
+        input: PathBuf,
+        /// Additional journals to union at startup (repeatable).
+        #[arg(long)]
+        extra_inputs: Vec<PathBuf>,
+        /// Output JSONL (`{uuid, paipu, day, mode}` per line)
+        #[arg(long, default_value = "paipu.jsonl")]
+        output: PathBuf,
+        /// Mirror base (default: empty = rotate all 3 hosts, staggered by uuid).
+        /// Limiter may be per-host: rotation spreads budget with zero extra IP load.
+        #[arg(long, default_value = "")]
+        mirror: String,
+        /// Concurrent `view_game` requests (0=fixed 40, explicit N overrides).
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
+        /// Delay per worker between requests (ms)
+        #[arg(long, default_value_t = 500)]
+        delay_ms: u64,
+        /// Extra door proxies (repeatable, e.g. `--doors <http://127.0.0.1:9181>`).
+        /// Each lane (home + every door) resolves sequentially on its own IP.
+        #[arg(long)]
+        doors: Vec<String>,
+        /// Max concurrent lanes (default: all doors + home). Lean mode: 1-2 lanes
+        /// trickles paipu without poisoning shared harvest budgets.
+        #[arg(long)]
+        lanes: Option<usize>,
+        /// Skip the home-IP lane: resolve ONLY via door proxies. Lets bulk run
+        /// all-door lanes at full tilt while harvest/solves keep home budget.
+        #[arg(long, default_value_t = false)]
+        doors_only: bool,
+        /// Max records to resolve (default: all outstanding)
+        #[arg(short, long, value_parser = parse_nonzero_usize)]
+        limit: Option<usize>,
+    },
+    /// Offline paipu-id emission from full-uuid journals (zero requests).
+    /// Derives `paipu` ids locally from fetch-fulls rows: the witnessed account
+    /// is NOT needed since `GameRecord.players[].accountId` rides along in each
+    EmitIds {
+        /// Full-uuid journal (fetch-fulls output: `uuid` + `players[].accountId`)
+        #[arg(long)]
+        input: PathBuf,
+        /// Output JSONL (`{uuid, paipu, day, mode}` per line)
+        #[arg(long, default_value = "paipu.jsonl")]
+        output: PathBuf,
+    },
+    /// Month-bucket coverage audit: per (YYYY-MM, mode) game counts from journals.
+    /// Goal-directed: shows which throne/jade months are thin before sharding.
+    /// Reads `day` (JST harvest stamp), falls back to `startTime` (+9h) when blank.
+    Coverage {
+        /// Input journals (repeatable; unioned, first row per uuid wins).
+        #[arg(long)]
+        input: Vec<PathBuf>,
+    },
+    /// Offline paipu derivation: full game rows -> paipu ids, ZERO network.
+    /// paipu = full UUID plus an encoded seated account share suffix.
+    /// Game-time ranks remain available in the full record journal.
+    /// Reads a fulls journal, appends `{uuid, paipu, day, mode}` rows. Resumable.
+    /// This is why fetch-fulls beats `view_game` 500:1 — one history call fans out
+    /// to 500 games x 4 players of paipu ids with no further requests.
+    DerivePaipu {
+        /// Input full-rows journal (from `pipeline`)
+        #[arg(long)]
+        input: PathBuf,
+        /// Output paipu JSONL
+        #[arg(long, default_value = "paipu.jsonl")]
+        output: PathBuf,
+    },
+    /// Self-contained continuous harvest, token broker, fulls writer and dashboard.
+    Pipeline {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Realtime pipeline dashboard: paipu count, ETA, per-stage throughput.
+    /// Serves a self-contained page plus JSON on localhost (default :8890).
+    Dashboard {
+        /// Local port to serve on (binds 127.0.0.1 only).
+        #[arg(long, default_value_t = 8890)]
+        port: u16,
+        /// JSON dashboard configuration with user-selected journals and campaigns.
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Capture browser OAuth credentials automatically; Enter is a manual fallback.
+    BrowserAuth {
+        #[arg(long, default_value = "http://127.0.0.1:9222")]
+        cdp_url: String,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        #[arg(long, default_value = "https://mahjongsoul.game.yo-star.com")]
+        origin: String,
+        /// Enable a press-Enter retry after automatic capture times out.
+        #[arg(long)]
+        manual: bool,
+    },
+    /// Audit journal counts; pairwise intersections are optional.
+    AuditJournals {
+        #[arg(long, required = true, num_args = 1..)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        overlaps: bool,
+    },
+    /// Measure exact unique journal throughput over a bounded observation window.
+    Throughput {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        log: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        interval_secs: u64,
+        #[arg(long)]
+        duration_secs: u64,
+        #[arg(long, default_value_t = 0.0)]
+        target_per_sec: f64,
+    },
+    /// Download full UUIDs through Unity OAuth, log trials, and convert to MJAI.
+    NetworkReplay {
+        #[arg(long)]
+        auth: PathBuf,
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        raw: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+        #[arg(long)]
+        log: Option<PathBuf>,
+        #[arg(long)]
+        rank_index: Option<PathBuf>,
+        #[arg(long, default_value = "wss://engsbk.mahjongsoul.com/gateway")]
+        endpoint: String,
+        #[arg(long, default_value = "0.16.266")]
+        resource: String,
+        #[arg(long, default_value = "4.0.10")]
+        package: String,
+        #[arg(long, default_value = "WebGL_2022-0.16.266")]
+        version: String,
+        #[arg(long, default_value = "https://mahjongsoul.game.yo-star.com")]
+        origin: String,
+        #[arg(long, default_value = "en-2")]
+        route_id: String,
+        #[arg(long, default_value_t = 22)]
+        oauth_type: u64,
+        #[arg(long, default_value = "en")]
+        tag: String,
+        #[arg(long, default_value_t = 1000)]
+        delay_ms: u64,
+        #[arg(long, default_value_t = 1)]
+        limit: usize,
+    },
+    /// Audit all journals and export canonical rank-aware resolver manifests.
+    AuditPaipu {
+        #[arg(long)]
+        fulls: PathBuf,
+        #[arg(long)]
+        paipu: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Cross-match an on-disk dataset against harvest journals (no decompression).
+    /// Filenames carry game identity; report lands in the output dir as report.json.
+    AuditDataset {
+        /// Dataset root (folders per room-year).
+        #[arg(long)]
+        dataset: PathBuf,
+        /// Harvest full-uuid journal.
+        #[arg(long, default_value = "fulls.jsonl")]
+        fulls: PathBuf,
+        /// Derived paipu journal.
+        #[arg(long, default_value = "paipu.jsonl")]
+        paipu: PathBuf,
+        /// Report output dir (new scratch).
+        #[arg(long, default_value = "dataset-audit")]
+        out: PathBuf,
+    },
 }
-
 // Allow: CLI dispatch is a verified 1157-line match tree; splitting it would churn every arm.
 #[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
+    use std::io::IsTerminal as _;
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "tenhou_scraper=info".into()),
@@ -649,7 +881,7 @@ async fn main() -> Result<()> {
             let count = package::package_directory(&input, &output)?;
             info!("Packaged {} files into {:?}", count, output);
         }
-        Commands::Majsoul(cmd) => match cmd {
+        Commands::Majsoul(cmd) => match *cmd {
             MajsoulCommands::Search { nickname } => {
                 let db = open_db(&cli)?;
                 let client = majsoul::AmaeKoromoClient::new(300)?;
@@ -804,6 +1036,427 @@ async fn main() -> Result<()> {
                     .fetch_room_range(&db, mode_id, start_date, end_date, skip_fetched)
                     .await?;
                 info!("Total new UUIDs stored: {}", total_new);
+            }
+            MajsoulCommands::Harvest {
+                start,
+                end,
+                modes,
+                workers,
+                cdp_url,
+                journal,
+                state,
+                pool_file,
+                seed,
+                doors,
+            } => {
+                use crate::majsoul::koromo_harvest::{run_harvest, HarvestConfig};
+                let (start_date, end_date) = parse_date_range(&start, end, true)?;
+                let mut mode_ids = Vec::new();
+                for part in modes.split(',') {
+                    let m: i32 = part.trim().parse().context("modes must be ints like 16,12")?;
+                    mode_ids.push(m);
+                }
+                // 0=fixed 40 steady workers.
+                let workers = auto_workers(workers);
+                info!(
+                    "Harvesting modes {:?} from {} to {} ({} workers, cdp {})",
+                    mode_ids,
+                    start_date.format("%Y-%m-%d"),
+                    end_date.format("%Y-%m-%d"),
+                    workers,
+                    cdp_url
+                );
+                let journal_out = journal.clone();
+                let n = run_harvest(HarvestConfig {
+                    start: start_date,
+                    end: end_date,
+                    modes: mode_ids,
+                    journal,
+                    db_path: state,
+                    workers,
+                    cdp_url,
+                    pool_file,
+                    seed_files: seed,
+                    doors,
+                })
+                .await?;
+                info!("Harvested {n} records -> {}", journal_out.display());
+            }
+            MajsoulCommands::EmitIds { input, output } => {
+                // Resume: skip uuids already emitted.
+                let mut done = std::collections::HashSet::new();
+                if let Ok(text) = std::fs::read_to_string(&output) {
+                    for line in text.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(u) = v.get("uuid").and_then(|u| u.as_str()) {
+                                done.insert(u.to_owned());
+                            }
+                        }
+                    }
+                }
+                // Emit: walk the fulls journal, join provenance, append new rows.
+                let ftext = std::fs::read_to_string(&input)?;
+                let mut out = String::new();
+                let mut n = 0usize;
+                for line in ftext.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    let (Some(full), Some(ps)) = (
+                        v.get("uuid").and_then(|u| u.as_str()),
+                        v.get("players").and_then(|p| p.as_array()),
+                    ) else {
+                        continue;
+                    };
+                    let m = v.get("modeId").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                    let mode = i32::try_from(m).unwrap_or(0);
+                    let day = v.get("startTime").and_then(serde_json::Value::as_i64).map(|s| {
+                        use chrono::TimeZone as _;
+                        chrono::FixedOffset::east_opt(9 * 3600)
+                            .map(|jst| jst.timestamp_opt(s, 0).unwrap().format("%Y-%m-%d").to_string())
+                            .unwrap_or_default()
+                    }).unwrap_or_default();
+                    for p in ps {
+                        let Some(id) = p.get("accountId").and_then(serde_json::Value::as_i64) else {
+                            continue;
+                        };
+                        let key = format!("{full}_a{}", crate::majsoul::paipu::encoded_account_id(id));
+                        let short = full.to_owned();
+                        if !done.insert(short.clone()) {
+                            continue;
+                        }
+                        out.push_str(&serde_json::json!({
+                            "uuid": short, "paipu": key, "day": day, "mode": mode,
+                        }).to_string());
+                        out.push('\n');
+                        n += 1;
+                    }
+                }
+                {
+                    use std::io::Write as _;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output)?
+                        .write_all(out.as_bytes())?;
+                }
+                info!("emit-ids: +{n} paipu rows -> {}", output.display());
+            }
+            MajsoulCommands::Coverage { input } => {
+                use std::collections::{BTreeMap, HashSet};
+                // Union inputs, first row per uuid wins (same rule as fetch-fulls).
+                let mut seen = HashSet::new();
+                let mut buckets: BTreeMap<(String, i32), usize> = BTreeMap::new();
+                let mut nodate = 0usize;
+                // Malformed-line counter: proves shared-journal appends stay intact
+                // (dual harvest writers) — any torn line lands here, not in buckets.
+                let mut bad = 0usize;
+                for path in &input {
+                    let Ok(text) = std::fs::read_to_string(path) else {
+                        continue;
+                    };
+                    for line in text.lines() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                            bad += 1;
+                            continue;
+                        };
+                        let Some(uuid) = v.get("uuid").and_then(|u| u.as_str()) else {
+                            bad += 1;
+                            continue;
+                        };
+                        if !seen.insert(uuid.to_owned()) {
+                            continue;
+                        }
+                        let mode = v
+                            .get("modeId")
+                            .or_else(|| v.get("mode"))
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|m| i32::try_from(m).ok())
+                            .unwrap_or(-1);
+                        // Month from JST day stamp, else startTime (+9h), else blank.
+                        let month = v
+                            .get("day")
+                            .or_else(|| v.get("_day"))
+                            .and_then(|d| d.as_str())
+                            .filter(|d| d.len() >= 7)
+                            .map(|d| d[..7].to_owned())
+                            .or_else(|| {
+                                v.get("startTime").and_then(serde_json::Value::as_i64).map(
+                                    |start| {
+                                        chrono::DateTime::from_timestamp(start, 0)
+                                            .map(|dt| {
+                                                (dt + chrono::Duration::hours(9))
+                                                    .format("%Y-%m")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_default()
+                                    },
+                                )
+                            })
+                            .unwrap_or_default();
+                        if month.is_empty() {
+                            nodate += 1;
+                            continue;
+                        }
+                        *buckets.entry((month, mode)).or_insert(0) += 1;
+                    }
+                }
+                for ((month, mode), count) in &buckets {
+                    println!("{month} mode={mode} games={count}");
+                }
+                info!(
+                    "coverage: {} games in {} month-modes ({} undated, {} malformed)",
+                    seen.len(),
+                    buckets.len(),
+                    nodate,
+                    bad
+                );
+            }
+            MajsoulCommands::DerivePaipu { input, output } => {
+                use std::collections::HashSet;
+                // Resume: skip uuids already in output.
+                // (No change-detection here: derive-loop.sh owns the mtime poll
+                // and skips quiet cycles before invoking.)
+                let mut done = HashSet::new();
+                if let Ok(text) = std::fs::read_to_string(&output) {
+                    for line in text.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(u) = v.get("uuid").and_then(|u| u.as_str()) {
+                                done.insert(u.to_owned());
+                            }
+                        }
+                    }
+                }
+                let text = std::fs::read_to_string(&input).context("read fulls journal")?;
+                let mut n = 0usize;
+                {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&output)?;
+                    for line in text.lines() {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                            continue;
+                        };
+                        let Some(uuid) = v.get("uuid").and_then(|u| u.as_str()) else {
+                            continue;
+                        };
+                        if done.contains(uuid) {
+                            continue;
+                        }
+                        let mode = v
+                            .get("modeId")
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|m| i32::try_from(m).ok())
+                            .unwrap_or(0);
+                        // startTime rides through: yearly sharding is impossible from
+                        // paipu.jsonl alone without it (derive rows had day:"").
+                        let start = v
+                            .get("startTime")
+                            .and_then(serde_json::Value::as_i64)
+                            .unwrap_or(0);
+                        let day = v
+                            .get("day")
+                            .or_else(|| v.get("_day"))
+                            .and_then(|d| d.as_str())
+                            .map_or_else(
+                                || {
+                                    if start > 0 {
+                                        chrono::DateTime::from_timestamp(start, 0)
+                                            .map(|dt| {
+                                                (dt + chrono::Duration::hours(9))
+                                                    .format("%Y-%m-%d")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_default()
+                                    } else {
+                                        String::new()
+                                    }
+                                },
+                                str::to_owned,
+                            );
+                        let Some(players) = v.get("players").and_then(|p| p.as_array())
+                        else {
+                            continue;
+                        };
+                        // One row per game: any seated accountId makes a valid paipu id
+                        // for fetchGameRecord. First witness wins (4x smaller journal).
+                        let id = players.iter().find_map(|p| {
+                            p.get("accountId").and_then(serde_json::Value::as_i64)
+                        });
+                        let Some(id) = id else { continue };
+                        let paipu = format!("{uuid}_a{}", crate::majsoul::paipu::encoded_account_id(id));
+                        let row = serde_json::json!({
+                            "uuid": uuid, "paipu": paipu, "day": day, "mode": mode,
+                            "startTime": start,
+                        });
+                        f.write_all((row.to_string() + "\n").as_bytes())?;
+                        n += 1;
+                        done.insert(uuid.to_owned());
+                    }
+                    f.flush()?;
+                }
+                info!("derive-paipu: {n} paipu ids -> {}", output.display());
+            }
+            MajsoulCommands::Pipeline { config } => {
+                crate::majsoul::pipeline::run(config).await?;
+            }
+            MajsoulCommands::Dashboard { port, config } => {
+                let config: majsoul::dashboard::DashboardConfig = serde_json::from_slice(&std::fs::read(config)?)?;
+                majsoul::dashboard::run_with_dashboard_config(port, config).await?;
+            }
+            MajsoulCommands::BrowserAuth { cdp_url, output, timeout_secs, origin, manual } => {
+                majsoul::browser_auth::capture(&cdp_url, &output, timeout_secs, &origin, manual).await?;
+            }
+            MajsoulCommands::AuditJournals { inputs, output, overlaps } => {
+                majsoul::journal_audit::run(&inputs, &output, overlaps)?;
+            }
+            MajsoulCommands::Throughput { input, log, interval_secs, duration_secs, target_per_sec } => {
+                majsoul::throughput::run(&input, &log, interval_secs, duration_secs, target_per_sec).await?;
+            }
+            MajsoulCommands::NetworkReplay { auth, input, raw, output, log, rank_index, endpoint, resource, package, version, origin, route_id, oauth_type, tag, delay_ms, limit } => {
+                majsoul::network_replay::run(majsoul::network_replay::Config {
+                    auth: &auth, input: &input, raw: &raw, output: output.as_deref(), log: log.as_deref(),
+                    rank_index: rank_index.as_deref(), endpoint: &endpoint, resource: &resource,
+                    package: &package, version: &version, origin: &origin, route_id: &route_id,
+                    oauth_type, tag: &tag, delay_ms, limit,
+                }).await?;
+            }
+            MajsoulCommands::AuditPaipu { fulls, paipu, out } => {
+                crate::majsoul::paipu_audit::run(&fulls, &paipu, &out)?;
+            }
+            MajsoulCommands::AuditDataset { dataset, fulls, paipu, out } => {
+                crate::majsoul::dataset_audit::run(&dataset, &fulls, &paipu, &out)?;
+            }
+            MajsoulCommands::BulkResolve {
+                input,
+                extra_inputs,
+                output,
+                mirror,
+                workers,
+                delay_ms,
+                doors,
+                lanes,
+                doors_only,
+                limit,
+            } => {
+                use crate::majsoul::koromo_harvest::{
+                    parse_short, resolve_batch, ResolveConfig,
+                };
+                use std::collections::HashSet;
+                // 0=fixed 40 steady workers.
+                let workers = auto_workers(workers);
+                // Resume: skip uuids already in output.
+                let mut done = HashSet::new();
+                if let Ok(text) = std::fs::read_to_string(&output) {
+                    for line in text.lines() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                            if let Some(u) = v.get("uuid").and_then(|u| u.as_str()) {
+                                done.insert(u.to_owned());
+                            }
+                        }
+                    }
+                }
+                info!("bulk-resolve: {} already done", done.len());
+                // NOTE: no fulls-exclusion by (mode,startTime): concurrent games share
+                // seconds, so time-joins silently drop uncovered shorts. Bulk resolves
+                // everything; downstream dedups on paipu full-uuid (cheap, exact).
+                // Explicit one-time union; no hidden workstation environment inputs.
+                let mut combined = std::fs::read_to_string(&input).context("read input journal")?;
+                for path in extra_inputs {
+                    combined.push('\n');
+                    combined.push_str(&std::fs::read_to_string(path).context("read extra input journal")?);
+                }
+                let text = combined;
+                let mut batch = Vec::new();
+                for line in text.lines() {
+                    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    // No fulls-exclusion: (mode,startTime) joins COLLIDE (concurrent
+                    // games share seconds) and silently drop uncovered shorts.
+                    // Bulk resolves everything; downstream dedups on paipu full-uuid
+                    // (cheap, exact). Exhaustive over clever.
+                    if let Some(r) = parse_short(&v) {
+                        // Batch-level dedup: union sources overlap (input holds fleet
+                        // rows AND live journals re-add them). Without this the same
+                        // short queues 2-3x and burns throttled budget on dupes.
+                        if !done.contains(&r.uuid) {
+                            done.insert(r.uuid.clone());
+                            batch.push(r);
+                        }
+                    }
+                    if let Some(lim) = limit {
+                        if batch.len() >= lim {
+                            break;
+                        }
+                    }
+                }
+                info!("bulk-resolve: {} outstanding", batch.len());
+                // No-redirect: the 301 Location IS the paipu id; following lands
+                // on a 200 HTML page. Matches the ResolvePaipu arm's client.
+                let client = reqwest::Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()?;
+                let cfg = ResolveConfig { mirror: mirror.clone(), workers, delay_ms };
+                // Multi-lane: home IP + every door proxy resolve in parallel,
+                // 1 sequential stream per IP (view_game limiter is per-IP global).
+                // --doors-only skips home: bulk runs all-door lanes at full tilt
+                // while harvest/solves keep the home budget.
+                let use_lanes = !doors.is_empty();
+                let mut lane_list: Vec<Option<String>> = if use_lanes {
+                    let mut l: Vec<Option<String>> =
+                        if doors_only { Vec::new() } else { vec![None] };
+                    l.extend(doors.into_iter().map(Some));
+                    if l.is_empty() {
+                        tracing::warn!("bulk-resolve: --doors-only with no doors, home fallback");
+                        l.push(None);
+                    }
+                    l
+                } else {
+                    vec![]
+                };
+                // Lean mode: cap concurrent lanes (default: all). 1-2 lanes trickle
+                // paipu in background without poisoning shared harvest budgets.
+                if let Some(cap) = lanes {
+                    lane_list.truncate(cap.max(1));
+                }
+                // Bounded chunks keep memory flat across 100k+ queues.
+                // Per-lane streaming append: rows land on disk as each lane
+                // finishes its slice (no waiting for stragglers), plus progress.
+                let mut resolved = 0usize;
+                let t0 = std::time::Instant::now();
+                for (ci, chunk) in batch.chunks(2000).enumerate() {
+                    let rows = if use_lanes {
+                        crate::majsoul::koromo_harvest::resolve_multi_lane(&lane_list, &cfg, chunk.to_vec()).await
+                    } else {
+                        resolve_batch(&client, &cfg, chunk.to_vec()).await
+                    };
+                    resolved += rows.len();
+                    let mut out = String::with_capacity(rows.len() * 128);
+                    for (paipu, uuid, day, mode) in &rows {
+                        out.push_str(&serde_json::json!({
+                            "uuid": uuid, "paipu": paipu, "day": day, "mode": mode,
+                        }).to_string());
+                        out.push('\n');
+                    }
+                    {
+                        use std::io::Write as _;
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&output)?
+                            .write_all(out.as_bytes())?;
+                    }
+                    let dt = t0.elapsed().as_secs_f64().max(1.0);
+                    info!(
+                        "bulk-resolve: chunk {ci} +{} rows ({resolved} total, {:.1}/s) -> {}",
+                        rows.len(),
+                        f64::from(u32::try_from(resolved).unwrap_or(u32::MAX)) / dt,
+                        output.display()
+                    );
+                }
             }
             MajsoulCommands::ResolvePaipu { limit, delay_ms } => {
                 let db = open_db(&cli)?;
@@ -1446,8 +2099,8 @@ async fn main() -> Result<()> {
                 ).await?;
                 info!("Raw download complete: {} success, {} failed", success, failed);
             }
-            MajsoulCommands::ConvertRaw { input, output, delete } => {
-                let (success, failed) = majsoul::convert::convert_raw_files(&input, &output, delete)?;
+            MajsoulCommands::ConvertRaw { input, output, delete, rank_index } => {
+                let (success, failed) = majsoul::convert::convert_raw_files(&input, &output, delete, rank_index.as_deref())?;
                 info!("Converted {} .pb files to MJAI ({} failed)", success, failed);
             }
             MajsoulCommands::FetchDays { start, end, delay_ms } => {

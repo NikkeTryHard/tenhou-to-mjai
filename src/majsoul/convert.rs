@@ -416,6 +416,7 @@ pub fn convert_raw_files(
     input_dir: &Path,
     output_dir: &Path,
     delete_after: bool,
+    rank_index: Option<&Path>,
 ) -> Result<(usize, usize)> {
     fs::create_dir_all(output_dir)?;
 
@@ -436,7 +437,8 @@ pub fn convert_raw_files(
         .into_iter()
         .filter(|p| {
             let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-            let mjai_path = output_dir.join(format!("{stem}.mjai.json"));
+            let Ok(name) = ranked_filename(rank_index, &stem) else { return true; };
+            let mjai_path = output_dir.join(name);
             !mjai_path.exists()
         })
         .collect();
@@ -465,7 +467,7 @@ pub fn convert_raw_files(
                 .to_string_lossy()
                 .to_string();
 
-            match convert_single_file(&converter, pb_path, output_dir) {
+            match convert_single_file(&converter, pb_path, output_dir, rank_index) {
                 Ok(()) => {
                     success.fetch_add(1, Ordering::Relaxed);
                     if delete_after {
@@ -502,11 +504,19 @@ fn collect_events(records: &[RecordAction]) -> Result<(Vec<GameEvent>, usize)> {
     Ok((events, unknown))
 }
 
+fn ranked_filename(index: Option<&Path>, uuid: &str) -> Result<String> {
+    let Some(index) = index else { return Ok(format!("{uuid}.mjai.json")); };
+    let db = rusqlite::Connection::open_with_flags(index, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.query_row("SELECT filename FROM games WHERE uuid=?1", [uuid], |row| row.get(0))
+        .with_context(|| format!("missing game-time ranks for {uuid}"))
+}
+
 /// Convert a single .pb file to MJAI .mjai.json
 fn convert_single_file(
     converter: &MajsoulConverter,
     pb_path: &Path,
     output_dir: &Path,
+    rank_index: Option<&Path>,
 ) -> Result<()> {
     let raw_data = fs::read(pb_path).context("Failed to read .pb file")?;
 
@@ -536,7 +546,7 @@ fn convert_single_file(
     let mjai_events = converter.events_to_mjai(&record.player_names, &events)?;
 
     // Write plain MJAI output (not gzipped - easier to work with)
-    let output_path = output_dir.join(format!("{stem}.mjai.json"));
+    let output_path = output_dir.join(ranked_filename(rank_index, &stem)?);
     let mut file = File::create(&output_path)?;
 
     for event in mjai_events {

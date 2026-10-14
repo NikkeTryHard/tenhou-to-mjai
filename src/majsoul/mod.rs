@@ -1,11 +1,24 @@
 pub mod api;
 pub mod auth;
 pub mod browser;
+pub mod browser_auth;
+pub mod network_replay;
+#[cfg(feature = "gpu-pow")]
+mod cap_pow;
+pub mod dashboard;
+pub mod dataset_audit;
 pub mod convert;
 pub mod download;
 pub mod events;
 pub mod gateway;
 pub mod json_download;
+pub mod journal_audit;
+pub mod throughput;
+pub mod koromo_harvest;
+pub mod full_pipeline;
+pub mod pipeline;
+pub mod paipu;
+pub mod paipu_audit;
 pub mod parallel_download;
 pub mod proto;
 pub mod raw_download;
@@ -22,4 +35,3 @@ pub use download::MajsoulDownloader;
 // sibling modules import each other by module path (e.g. `super::to_tenhou::…`,
 // `crate::majsoul::parallel_download::ParallelDownloader`).
 pub use types::GameRecord;
-

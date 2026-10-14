@@ -34,12 +34,17 @@ urlencoding = "2"
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
+wgpu = { version = "=30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
 
 # Vendored crates
 mjlog = { path = "crates/mjlog" }
 tenhou-json = { path = "crates/tenhou-json" }
 mjlog2json-core = { path = "crates/mjlog2json-core" }
 convlog = { path = "crates/convlog" }
+
+[features]
+default = []
+gpu-pow = ["dep:wgpu"]
 
 [workspace]
 members = [
