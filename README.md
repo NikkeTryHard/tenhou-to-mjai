@@ -5,6 +5,14 @@
 This repository provides tools and datasets for converting **Tenhou mahjong game logs** into the **MJAI** format, as well as tools for downloading and converting **Mahjong Soul (雀魂)** game records.
 It also includes preprocessed yearly Tenhou datasets for AI research, data analysis, and mahjong strategy modeling.
 
+> [!IMPORTANT]
+> ## Torrent status: temporarily offline
+> The magnet below is still valid, but **no seeder is running right now**. I took the seed down to reclaim disk space on my machine, so swarm downloads will stall until it returns.
+>
+> Use the [HuggingFace mirror](#huggingface-mirror) below in the meantime — it carries the same files over HTTP.
+>
+> The seed will be restored if the HuggingFace mirror goes down. Until then, treat the torrent as unavailable and don't rely on it.
+
 > [!NOTE]
 > ## Dataset Torrent
 > All years, pick files in your client. Binaries live on P2P, not GitHub Releases.
@@ -29,11 +37,11 @@ It also includes preprocessed yearly Tenhou datasets for AI research, data analy
 > ## HuggingFace Mirror
 > Same files over HTTP: https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
 >
-> Grabbed from HuggingFace? Please also seed the torrent — HF can take datasets down, the swarm keeps it alive.
+> This mirror is the distribution channel while the torrent is offline. If you keep a copy of the data yourself, please seed the torrent once it is back — HF can take datasets down, and the swarm is what keeps the release alive when it does.
 
 > [!CAUTION]
 > ## Anti-Leech
-> The seed runs PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
+> When the seed is running it uses PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
 
 ---
 
