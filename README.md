@@ -5,43 +5,17 @@
 This repository provides tools and datasets for converting **Tenhou mahjong game logs** into the **MJAI** format, as well as tools for downloading and converting **Mahjong Soul (雀魂)** game records.
 It also includes preprocessed yearly Tenhou datasets for AI research, data analysis, and mahjong strategy modeling.
 
-> [!IMPORTANT]
-> ## Torrent status: temporarily offline
-> The magnet below is still valid, but **no seeder is running right now**. I took the seed down to reclaim disk space on my machine, so swarm downloads will stall until it returns.
->
-> Use the [HuggingFace mirror](#huggingface-mirror) below in the meantime — it carries the same files over HTTP.
->
-> The seed will be restored if the HuggingFace mirror goes down. Until then, treat the torrent as unavailable and don't rely on it.
+> [!NOTE]
+> ## Dataset — HuggingFace
+> https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
 
 > [!NOTE]
-> ## Dataset Torrent
-> All years, pick files in your client. Binaries live on P2P, not GitHub Releases.
+> ## Dataset — Torrent
+> The main seeding machine is down right now, so this may not download unless other seeders are online. Selective download supported.
 >
 > ```text
 > magnet:?xt=urn:btih:a7256a6a069f75c78da3426295bbfd2c46eb1f25&xt=urn:btmh:12209378f66853cb311836615da4d1bf5d850f7bd8455e7b6838e57f2511260cf2e6&dn=tenhou-to-mjai&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://open.stealth.si:80/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.qu.ax:6969/announce
 > ```
->
-> Trackers: opentrackr, stealth, torrent.eu, demonii, qu.ax — DHT/PeX on, selective download supported.
->
-> ### Stay current (one-time, 30 seconds)
->
-> Trackers die and rotate, so don't rely on the 5 baked into the magnet. In qBittorrent: Options → BitTorrent → check Automatically append trackers from URL to new downloads, paste this URL below it, hit Save:
->
-> ```text
-> https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_best.txt
-> ```
->
-> This only applies to newly added torrents (it won't rewrite this one's list — that's fine, the 5 above plus DHT already find the swarm). Keep DHT + PeX enabled and you're set forever with zero maintenance.
-
-> [!NOTE]
-> ## HuggingFace Mirror
-> Same files over HTTP: https://huggingface.co/datasets/nikketryhard/tenhou-houou-mjai
->
-> This mirror is the distribution channel while the torrent is offline. If you keep a copy of the data yourself, please seed the torrent once it is back — HF can take datasets down, and the swarm is what keeps the release alive when it does.
-
-> [!CAUTION]
-> ## Anti-Leech
-> When the seed is running it uses PeerBanHelper (https://github.com/PBH-BTN/PeerBanHelper), which auto-bans clients that take without giving: fake-progress reporters, XunLei variants (-XL0012-/-XL0019- and friends), aggressive multi-dialers opening dozens of connections from one IP, and anything on the community blocklists. Normal clients (qBittorrent, Transmission, Deluge, libtorrent-based, aria2) are never touched — just seed honestly and you'll never notice it's there.
 
 ---
 
